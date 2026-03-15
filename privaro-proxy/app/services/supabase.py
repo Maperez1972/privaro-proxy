@@ -108,3 +108,19 @@ async def increment_pipeline_counters(
                 "p_latency_ms": latency_ms,
             },
         )
+
+async def insert_audit_log(payload: Dict[str, Any]) -> Optional[str]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/audit_logs",
+            headers=SUPABASE_HEADERS,
+            json=payload,
+        )
+        print(f"[Supabase] audit_log INSERT status: {response.status_code}")
+        print(f"[Supabase] audit_log INSERT response: {response.text[:200]}")
+        if response.status_code in (200, 201):
+            data = response.json()
+            return data[0]["id"] if data else None
+        else:
+            print(f"[Supabase] audit_log INSERT failed: {response.status_code} {response.text}")
+            return None
