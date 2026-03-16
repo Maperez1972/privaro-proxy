@@ -121,6 +121,18 @@ async def update_audit_log_ibs(
         return response.status_code in (200, 201, 204)
 
 
+async def update_audit_log_ibs_failed(audit_log_id: str, ibs_evidence_id: str) -> bool:
+    """Mark audit_log as ibs_status=failed when signature KO."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/audit_logs",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{audit_log_id}"},
+            json={"ibs_status": "failed", "ibs_evidence_id": ibs_evidence_id},
+        )
+        return response.status_code in (200, 201, 204)
+
+
 async def get_audit_log_id_by_evidence(evidence_id: str, title: str) -> Optional[str]:
     """
     Find audit_log_id from ibs_sync_queue by evidence_id.
