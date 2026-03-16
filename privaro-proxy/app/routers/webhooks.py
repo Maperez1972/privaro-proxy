@@ -1,60 +1,99 @@
 """
-Privaro Proxy API — v0.1.0 (MVP)
-Privacy Infrastructure for Enterprise AI · iCommunity Labs
+Webhook receptor para iBS — 3 endpoints según la configuración real de iBS.
+iBS pasa el secret como query param: ?secret=<IBS_API_KEY>
 """
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request, HTTPException, Query
+from typing import Optional
+from app.services import supabase as db
 
-from app.routers import proxy, health, webhooks
-from app.config import settings
-from app.services import ibs
+router = APIRouter()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    print(f"🚀 Privaro Proxy API starting — env: {settings.ENVIRONMENT}")
-    if settings.IBS_API_KEY:
-        try:
-            registered = await ibs.register_webhook()
-            print(f"[iBS] Webhook: {'✅ registered' if registered else '⚠️ failed (non-critical)'}")
-        except Exception as e:
-            print(f"[iBS] Webhook error (non-critical): {e}")
-    else:
-        print("[iBS] IBS_API_KEY not set — blockchain disabled")
-    yield
-    print("🛑 Privaro Proxy API shutting down")
+def _validate_secret(secret: Optional[str]):
+    from app.config import settings  # lazy import — evita circular import
+    ibs_secret = settings.IBS_API_KEY or ""
+    if not secret or secret != ibs_secret:
+        print(f"[Webhook] Unauthorized — secret no coincide")
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
-app = FastAPI(
-    title="Privaro Proxy API",
-    description="Privacy Infrastructure for Enterprise AI — iCommunity Labs",
-    version="0.2.0",
-    lifespan=lifespan,
-    docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
-    redoc_url=None,
-)
+async def _process_evidence_certified(payload: dict) -> dict:
+    print(f"[Webhook] iBS payload: {str(payload)[:400]}")
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# Routers
-app.include_router(health.router, tags=["Health"])
-app.include_router(proxy.router, prefix="/v1/proxy", tags=["Privacy Proxy"])
-app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"error": "internal_error", "detail": "An unexpected error occurred"},
+    data = payload.get("data", payload)
+    evidence_id = (
+        data.get("evidence_id") or data.get("id") or data.get("_id")
+        or payload.get("evidence_id") or payload.get("id")
     )
+    title = data.get("title") or payload.get("title", "")
+    certification_hash = (
+        data.get("certification_hash") or data.get("certificationHash")
+        or data.get("tx_hash") or data.get("txHash")
+    )
+    network = data.get("network", "polygon")
+    certification_timestamp = (
+        data.get("certification_timestamp") or data.get("certificationTimestamp")
+        or data.get("certified_at")
+    )
+
+    print(f"[Webhook] evidence_id={evidence_id}, title={title}, hash={certification_hash}")
+
+    if not evidence_id:
+        print(f"[Webhook] Missing evidence_id — payload: {payload}")
+        return {"status": "ignored", "reason": "no evidence_id"}
+
+    audit_log_id = await db.get_audit_log_id_by_evidence(evidence_id, title)
+
+    if not audit_log_id:
+        print(f"[Webhook] audit_log not found for evidence_id={evidence_id}")
+        return {"status": "not_found", "evidence_id": evidence_id}
+
+    updated = await db.update_audit_log_ibs(
+        audit_log_id=audit_log_id,
+        ibs_evidence_id=evidence_id,
+        ibs_certification_hash=certification_hash or "",
+        ibs_network=network,
+        ibs_certified_at=certification_timestamp,
+    )
+
+    if updated:
+        await db.delete_ibs_sync_queue(audit_log_id)
+        print(f"[Webhook] ✅ Certified: {audit_log_id} → {certification_hash}")
+        return {"status": "certified", "audit_log_id": audit_log_id}
+    else:
+        print(f"[Webhook] ❌ Update failed for audit_log_id={audit_log_id}")
+        raise HTTPException(status_code=500, detail="Failed to update audit log")
+
+
+@router.post("/ibs")
+async def receive_ibs_webhook(request: Request, secret: Optional[str] = Query(None)):
+    _validate_secret(secret)
+    return await _process_evidence_certified(await request.json())
+
+
+@router.post("/ibs/ibs-webhook")
+async def receive_ibs_webhook_evidence(request: Request, secret: Optional[str] = Query(None)):
+    _validate_secret(secret)
+    return await _process_evidence_certified(await request.json())
+
+
+@router.post("/ibs/ibs-webhook-signature-ok")
+async def receive_ibs_signature_ok(request: Request, secret: Optional[str] = Query(None)):
+    _validate_secret(secret)
+    payload = await request.json()
+    print(f"[Webhook] Signature OK: {str(payload)[:300]}")
+    return await _process_evidence_certified(payload)
+
+
+@router.post("/ibs/ibs-webhook-signature-ko")
+async def receive_ibs_signature_ko(request: Request, secret: Optional[str] = Query(None)):
+    _validate_secret(secret)
+    payload = await request.json()
+    print(f"[Webhook] ⚠️ Signature KO: {str(payload)[:300]}")
+    evidence_id = payload.get("evidence_id") or payload.get("id")
+    if evidence_id:
+        title = payload.get("title", "")
+        audit_log_id = await db.get_audit_log_id_by_evidence(evidence_id, title)
+        if audit_log_id:
+            await db.update_audit_log_ibs_failed(audit_log_id, evidence_id)
+    return {"status": "ko_received"}
