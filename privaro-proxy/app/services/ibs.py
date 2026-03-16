@@ -99,43 +99,21 @@ async def certify_audit_log(
 
 async def register_webhook() -> bool:
     """
-    Registra el endpoint /v1/webhooks/ibs en iBS al arrancar el proxy.
-    Solo registra si no existe ya.
+    Webhooks ya registrados manualmente en panel iBS.
+    Esta función solo verifica que existen.
     """
     if not settings.IBS_API_KEY:
         return False
-
-    webhook_url = "https://privaro-proxy-production.up.railway.app/v1/webhooks/ibs"
-    webhook_secret = settings.IBS_WEBHOOK_SECRET or "privaro_webhook_secret_2026"
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # 1. Listar webhooks existentes
             r = await client.get(f"{IBS_BASE}/webhooks", headers=IBS_HEADERS)
             if r.status_code == 200:
-                existing = r.json()
-                webhooks_list = existing.get("list", existing) if isinstance(existing, dict) else existing
-                if isinstance(webhooks_list, list):
-                    already = any(
-                        w.get("url") == webhook_url
-                        for w in webhooks_list
-                        if isinstance(w, dict)
-                    )
-                    if already:
-                        print(f"[iBS] Webhook ya registrado: {webhook_url}")
-                        return True
-
-            # 2. Registrar webhook
-            payload = {
-                "url": webhook_url,
-                "bearer": webhook_secret,
-                "name": "privaro-evidence-certified",
-                "events": ["evidence.certified"],
-            }
-            r2 = await client.post(f"{IBS_BASE}/webhooks", headers=IBS_HEADERS, json=payload)
-            print(f"[iBS] Register webhook status: {r2.status_code} {r2.text[:200]}")
-            return r2.status_code in (200, 201)
-
+                data = r.json()
+                webhooks = data.get("list", data) if isinstance(data, dict) else data
+                count = len(webhooks) if isinstance(webhooks, list) else 0
+                print(f"[iBS] {count} webhook(s) registrados en iBS")
+                return count > 0
+            return False
     except Exception as e:
-        print(f"[iBS] Exception in register_webhook: {e}")
+        print(f"[iBS] Error verificando webhooks: {e}")
         return False
