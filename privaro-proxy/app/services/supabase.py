@@ -29,6 +29,20 @@ async def insert_token(payload: dict) -> Optional[str]:
             return data[0]["id"] if data else None
         return None
 
+async def insert_tokens_batch(rows: list) -> bool:
+    """Insert multiple tokens in one call."""
+    if not rows:
+        return True
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            json=rows,
+        )
+        if response.status_code not in (200, 201):
+            print(f"[Vault] INSERT tokens failed: {response.status_code} {response.text[:200]}")
+        return response.status_code in (200, 201)
+
 async def insert_audit_log(payload: Dict[str, Any]) -> Optional[str]:
     """
     Insert a new audit_log row and return its UUID.
