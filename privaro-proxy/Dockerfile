@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source — v2.2 iBS lazy headers
+# Copy source — v2.3 tokens vault
 COPY app/ ./app/
 
 # Non-root user for security
