@@ -20,7 +20,6 @@ from app.services import detector
 from app.services.auth import verify_api_key_or_dev
 from app.services import supabase as db
 from app.services import ibs
-from app.config import settings
 
 router = APIRouter()
 
@@ -158,14 +157,13 @@ async def protect_prompt(
         background_tasks.add_task(db.insert_pii_detections, detection_rows)
 
     # ── Step 6 (background): iBS blockchain certification ────────────────────
-    ibs_enabled = bool(getattr(__import__('app.config', fromlist=['settings']).settings, 'IBS_API_KEY', ''))
-    if audit_log_id and ibs_enabled:
+    if audit_log_id and ibs.IBS_HEADERS.get("Authorization", "Bearer ") != "Bearer ":
         background_tasks.add_task(
             ibs.certify_audit_log,
             audit_log_id,
             org_id,
             audit_payload.get("metadata", {}),
-        )
+    )
 
     # ── Step 7 (background): Update pipeline counters ────────────────────────
     background_tasks.add_task(
