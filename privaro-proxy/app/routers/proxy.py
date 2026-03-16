@@ -20,6 +20,7 @@ from app.services import detector
 from app.services.auth import verify_api_key_or_dev
 from app.services import supabase as db
 from app.services import ibs
+from app.config import settings
 
 router = APIRouter()
 
