@@ -139,7 +139,7 @@ async def protect_prompt(
 
     audit_log_id = await db.insert_audit_log(audit_payload)
 
-    # ── Step 5: INSERT pii_detections ────────────────────────────────────────
+    # ── Step 5a: INSERT pii_detections ────────────────────────────────────────
     if detections and audit_log_id:
         detection_rows = [
             {
@@ -157,6 +157,42 @@ async def protect_prompt(
         ]
         background_tasks.add_task(db.insert_pii_detections, detection_rows)
 
+    # ── Step 5b: INSERT tokens_vault (sólo para tokenised + reversible) ───────
+    if detections and audit_log_id and body.options.reversible:
+        import os, base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        enc_key_hex = settings.ENCRYPTION_KEY
+        try:
+            enc_key = bytes.fromhex(enc_key_hex) if enc_key_hex else os.urandom(32)
+        except Exception:
+            enc_key = os.urandom(32)
+
+        token_rows = []
+        for d in detections:
+            if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
+                # Extraer valor original del prompt usando offsets
+                original_value = body.prompt[d.start:d.end]
+                # Cifrar con AES-256-GCM
+                aesgcm = AESGCM(enc_key)
+                nonce = os.urandom(12)
+                ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+                encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+
+                token_rows.append({
+                    "org_id": org_id,
+                    "pipeline_id": body.pipeline_id,
+                    "entity_type": d.type,
+                    "token_value": d.token,
+                    "encrypted_original": encrypted,
+                    "encryption_key_id": "key-v1",
+                    "is_reversible": True,
+                    "access_roles": ["admin", "dpo"],
+                })
+
+        if token_rows:
+            background_tasks.add_task(db.insert_tokens_batch, token_rows)
+    
     # ── Step 6 (background): iBS blockchain certification ────────────────────
     if audit_log_id:
         background_tasks.add_task(
