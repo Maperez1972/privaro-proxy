@@ -1,8 +1,6 @@
 """
 iBS (iCommunity Blockchain Solutions) — Blockchain Evidence Layer
 Certifica cada audit_log en Polygon via POST /v2/evidences.
-Flujo ASYNC: el proxy responde al cliente en ~50ms,
-la certificación llega después vía webhook event evidence.certified.
 """
 import hashlib
 import base64
@@ -14,17 +12,17 @@ from app.config import settings
 from app.services import supabase as db
 
 IBS_BASE = settings.IBS_API_BASE
-IBS_HEADERS = {
-    "Authorization": f"Bearer {settings.IBS_API_KEY}",
-    "Content-Type": "application/json",
-}
+
+
+def _get_ibs_headers() -> dict:
+    """Lee la key en runtime — no al importar el módulo."""
+    return {
+        "Authorization": f"Bearer {settings.IBS_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
 def _build_audit_payload_hash(audit_log_id: str, org_id: str, metadata: Dict) -> str:
-    """
-    SHA-512 del JSON del audit_log serializado, codificado en base64.standard.
-    Este es el payload que enviamos a iBS como evidencia.
-    """
     payload = {
         "audit_log_id": audit_log_id,
         "org_id": org_id,
@@ -41,11 +39,6 @@ async def certify_audit_log(
     org_id: str,
     metadata: Dict[str, Any],
 ) -> bool:
-    """
-    POST /v2/evidences — certifica el audit_log en blockchain Polygon.
-    Devuelve True si el request fue aceptado por iBS (201).
-    La certificación real llega después via webhook.
-    """
     if not settings.IBS_API_KEY:
         print("[iBS] IBS_API_KEY no configurada — skipping certification")
         return False
@@ -56,12 +49,7 @@ async def certify_audit_log(
     ibs_payload = {
         "payload": {
             "title": title,
-            "files": [
-                {
-                    "name": "audit_log.json",
-                    "file": payload_hash,
-                }
-            ],
+            "files": [{"name": "audit_log.json", "file": payload_hash}],
         }
     }
 
@@ -69,7 +57,7 @@ async def certify_audit_log(
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
                 f"{IBS_BASE}/evidences",
-                headers=IBS_HEADERS,
+                headers=_get_ibs_headers(),  # ← lazy, lee key en runtime
                 json=ibs_payload,
             )
             print(f"[iBS] POST /evidences status: {response.status_code}")
@@ -79,8 +67,6 @@ async def certify_audit_log(
                 data = response.json()
                 evidence_id = data.get("id") or data.get("evidence_id") or data.get("_id")
                 print(f"[iBS] Evidence created: {evidence_id}")
-
-                # Guardar en ibs_sync_queue para resiliencia
                 await db.insert_ibs_sync_queue({
                     "audit_log_id": audit_log_id,
                     "org_id": org_id,
@@ -98,15 +84,11 @@ async def certify_audit_log(
 
 
 async def register_webhook() -> bool:
-    """
-    Webhooks ya registrados manualmente en panel iBS.
-    Esta función solo verifica que existen.
-    """
     if not settings.IBS_API_KEY:
         return False
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{IBS_BASE}/webhooks", headers=IBS_HEADERS)
+            r = await client.get(f"{IBS_BASE}/webhooks", headers=_get_ibs_headers())
             if r.status_code == 200:
                 data = r.json()
                 webhooks = data.get("list", data) if isinstance(data, dict) else data
