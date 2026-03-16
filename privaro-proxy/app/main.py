@@ -7,14 +7,23 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import proxy, health
+from app.routers import proxy, health, webhooks
 from app.config import settings
+from app.services import ibs
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     print(f"🚀 Privaro Proxy API starting — env: {settings.ENVIRONMENT}")
+    if settings.IBS_API_KEY:
+        try:
+            registered = await ibs.register_webhook()
+            print(f"[iBS] Webhook: {'✅ registered' if registered else '⚠️ failed (non-critical)'}")
+        except Exception as e:
+            print(f"[iBS] Webhook error (non-critical): {e}")
+    else:
+        print("[iBS] IBS_API_KEY not set — blockchain disabled")
     yield
     print("🛑 Privaro Proxy API shutting down")
 
@@ -22,14 +31,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Privaro Proxy API",
     description="Privacy Infrastructure for Enterprise AI — iCommunity Labs",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
-    # Disable docs in production
     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
     redoc_url=None,
 )
 
-# CORS — allow Lovable frontend + local dev
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,6 +49,7 @@ app.add_middleware(
 # Routers
 app.include_router(health.router, tags=["Health"])
 app.include_router(proxy.router, prefix="/v1/proxy", tags=["Privacy Proxy"])
+app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
 
 
 @app.exception_handler(Exception)
