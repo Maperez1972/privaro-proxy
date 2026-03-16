@@ -86,6 +86,93 @@ async def get_org_settings(org_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def insert_ibs_sync_queue(payload: Dict[str, Any]) -> bool:
+    """Insert into ibs_sync_queue for resilience tracking."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/ibs_sync_queue",
+            headers=SUPABASE_HEADERS,
+            json=payload,
+        )
+        return response.status_code in (200, 201)
+
+
+async def update_audit_log_ibs(
+    audit_log_id: str,
+    ibs_evidence_id: str,
+    ibs_certification_hash: str,
+    ibs_network: str,
+    ibs_certified_at: Optional[str],
+) -> bool:
+    """UPDATE audit_log ibs_* columns when webhook arrives."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/audit_logs",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{audit_log_id}"},
+            json={
+                "ibs_status": "certified",
+                "ibs_evidence_id": ibs_evidence_id,
+                "ibs_certification_hash": ibs_certification_hash,
+                "ibs_network": ibs_network,
+                "ibs_certified_at": ibs_certified_at,
+            },
+        )
+        return response.status_code in (200, 201, 204)
+
+
+async def get_audit_log_id_by_evidence(evidence_id: str, title: str) -> Optional[str]:
+    """
+    Find audit_log_id from ibs_sync_queue by evidence_id.
+    Fallback: search by title prefix in audit_logs metadata.
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        # Try ibs_sync_queue first
+        r = await client.get(
+            f"{SUPABASE_REST}/ibs_sync_queue",
+            headers=SUPABASE_HEADERS,
+            params={
+                "ibs_evidence_id": f"eq.{evidence_id}",
+                "select": "audit_log_id",
+                "limit": "1",
+            },
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return data[0]["audit_log_id"]
+
+        # Fallback: extract from title "privaro_<first16_of_uuid>"
+        # title format: "privaro_67a5583e4ca14f3c"
+        if title.startswith("privaro_"):
+            partial_id = title.replace("privaro_", "")
+            r2 = await client.get(
+                f"{SUPABASE_REST}/audit_logs",
+                headers=SUPABASE_HEADERS,
+                params={
+                    "id": f"like.{partial_id}%",
+                    "select": "id",
+                    "limit": "1",
+                },
+            )
+            if r2.status_code == 200:
+                data2 = r2.json()
+                if data2:
+                    return data2[0]["id"]
+        return None
+
+
+async def delete_ibs_sync_queue(audit_log_id: str) -> bool:
+    """Remove from ibs_sync_queue after successful certification."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.delete(
+            f"{SUPABASE_REST}/ibs_sync_queue",
+            headers=SUPABASE_HEADERS,
+            params={"audit_log_id": f"eq.{audit_log_id}"},
+        )
+        return response.status_code in (200, 204)
+
+
 async def increment_pipeline_counters(
     pipeline_id: str,
     detected: int,
@@ -108,19 +195,3 @@ async def increment_pipeline_counters(
                 "p_latency_ms": latency_ms,
             },
         )
-
-async def insert_audit_log(payload: Dict[str, Any]) -> Optional[str]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.post(
-            f"{SUPABASE_REST}/audit_logs",
-            headers=SUPABASE_HEADERS,
-            json=payload,
-        )
-        print(f"[Supabase] audit_log INSERT status: {response.status_code}")
-        print(f"[Supabase] audit_log INSERT response: {response.text[:200]}")
-        if response.status_code in (200, 201):
-            data = response.json()
-            return data[0]["id"] if data else None
-        else:
-            print(f"[Supabase] audit_log INSERT failed: {response.status_code} {response.text}")
-            return None
