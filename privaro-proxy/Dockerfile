@@ -2,28 +2,15 @@ FROM python:3.11.8-slim
 
 WORKDIR /app
 
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Cache bust — increment to force full rebuild of app layer
+ARG CACHE_BUST=5
 COPY app/ ./app/
 
-# Patch ibs.py directamente en build — garantiza signatures field
-RUN python3 -c "
-import re
-with open('app/services/ibs.py', 'r') as f:
-    content = f.read()
-if '\"signatures\"' not in content:
-    content = content.replace(
-        '\"files\": [{\"name\": \"event.json\", \"file\": payload_hash}],\n        }',
-        '\"files\": [{\"name\": \"event.json\", \"file\": payload_hash}],\n        },\n        \"signatures\": []'
-    )
-    with open('app/services/ibs.py', 'w') as f:
-        f.write(content)
-    print('PATCHED: signatures field added')
-else:
-    print('OK: signatures field already present')
-"
-
+# Non-root user
 RUN adduser --disabled-password --gecos "" appuser
 USER appuser
 
