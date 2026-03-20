@@ -223,3 +223,17 @@ async def update_vault_access_ibs(token_id: str, user_id: str, evidence_id: str)
             json={"ibs_evidence_id": evidence_id},
         )
         return response.status_code in (200, 201, 204)
+
+async def insert_tokens_batch(rows: list) -> bool:
+    """Insert multiple tokens in vault in one call."""
+    if not rows:
+        return True
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            json=rows,
+        )
+        if response.status_code not in (200, 201):
+            print(f"[Vault] INSERT tokens failed: {response.status_code} {response.text[:200]}")
+        return response.status_code in (200, 201)
