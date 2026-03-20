@@ -27,13 +27,15 @@ async def health():
         supabase="connected" if settings.SUPABASE_URL else "not configured",
     )
 
-@router.get("/ibs-test")
+
+@router.get("/health/ibs-test")
 async def ibs_test():
-    from app.services import ibs
-    from app.config import settings
+    """Diagnóstico: verifica que IBS_API_KEY llega al contenedor."""
+    key = settings.IBS_API_KEY or ""
     return {
-        "ibs_api_key_set": bool(settings.IBS_API_KEY),
-        "ibs_api_key_prefix": settings.IBS_API_KEY[:10] + "..." if settings.IBS_API_KEY else "EMPTY",
+        "ibs_api_key_set": bool(key),
+        "ibs_api_key_length": len(key),
+        "ibs_api_key_prefix": key[:12] + "..." if key else "EMPTY",
         "ibs_base": settings.IBS_API_BASE,
-        "headers_preview": ibs._get_ibs_headers().get("Authorization", "")[:20] + "...",
+        "environment": settings.ENVIRONMENT,
     }
