@@ -29,7 +29,7 @@ def _build_hash(payload: Dict) -> str:
     return base64.b64encode(sha512_bytes).decode("utf-8")
 
 
-async def _post_evidence(title: str, payload_hash: str, signature_id: Optional[str] = None) -> str | None:
+async def _post_evidence(title: str, payload_hash: str, file_name: str = "audit_log.json") -> str | None:
     """POST /v2/evidences. Devuelve evidence_id o None si falla."""
     # signatures requiere al menos {"id": "..."} — array vacío no válido
     signatures = [{"id": signature_id}] if signature_id else [{"id": "privaro"}]
@@ -37,7 +37,7 @@ async def _post_evidence(title: str, payload_hash: str, signature_id: Optional[s
     ibs_payload = {
         "payload": {
             "title": title,
-            "files": [{"name": "event.json", "file": payload_hash}],
+            "files": [{"name": file_name, "file": payload_hash}],
         },
         "signatures": signatures,
     }
@@ -86,8 +86,10 @@ async def certify_audit_log(
     }
     payload_hash = _build_hash(payload)
     title = f"privaro_{audit_log_id[:16]}"
-
-    evidence_id = await _post_evidence(title, payload_hash, signature_id)
+    entity_type = metadata.get("by_type", {})
+    entity_types = "_".join(list(entity_type.keys())[:2]) if entity_type else "pii"
+    evidence_id = await _post_evidence(title, payload_hash, f"pii_audit_{entity_types}.json")
+    
     if evidence_id:
         await db.insert_ibs_sync_queue({
             "audit_log_id": audit_log_id,
