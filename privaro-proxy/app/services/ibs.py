@@ -35,7 +35,7 @@ async def _post_evidence(title: str, payload_hash: str) -> str | None:
             "title": title,
             "files": [{"name": "event.json", "file": payload_hash}],
         },
-        "signatures": []
+        "signatures": [{"id": "Privaro"}]
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
