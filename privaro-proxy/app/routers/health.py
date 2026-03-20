@@ -26,3 +26,14 @@ async def health():
         detector="regex-v1",
         supabase="connected" if settings.SUPABASE_URL else "not configured",
     )
+
+@router.get("/ibs-test")
+async def ibs_test():
+    from app.services import ibs
+    from app.config import settings
+    return {
+        "ibs_api_key_set": bool(settings.IBS_API_KEY),
+        "ibs_api_key_prefix": settings.IBS_API_KEY[:10] + "..." if settings.IBS_API_KEY else "EMPTY",
+        "ibs_base": settings.IBS_API_BASE,
+        "headers_preview": ibs._get_ibs_headers().get("Authorization", "")[:20] + "...",
+    }
