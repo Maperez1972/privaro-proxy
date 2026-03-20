@@ -1,19 +1,32 @@
 """
-Webhook receptor para iBS — 3 endpoints según la configuración real de iBS.
-iBS pasa el secret como query param: ?secret=<IBS_API_KEY>
+Webhook receptor para iBS — recibe event evidence.certified
+iBS envía el secret como Authorization: Bearer <IBS_WEBHOOK_SECRET>
 """
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException
 from typing import Optional
 from app.services import supabase as db
 
 router = APIRouter()
 
 
-def _validate_secret(secret: Optional[str]):
-    from app.config import settings  # lazy import — evita circular import
-    ibs_secret = settings.IBS_API_KEY or ""
-    if not secret or secret != ibs_secret:
-        print(f"[Webhook] Unauthorized — secret no coincide")
+def _validate_ibs_request(request: Request):
+    """
+    Valida que el webhook viene de iBS.
+    iBS envía Authorization: Bearer <bearer configurado al registrar el webhook>
+    Si no hay IBS_WEBHOOK_SECRET configurado, acepta sin validar (modo dev).
+    """
+    from app.config import settings
+    expected_secret = settings.IBS_WEBHOOK_SECRET or ""
+
+    if not expected_secret:
+        # Sin secret configurado — aceptar todo (modo dev / webhook sin bearer)
+        return
+
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = auth_header.replace("Bearer ", "").strip()
+
+    if bearer_token != expected_secret:
+        print(f"[Webhook] Unauthorized — bearer no coincide")
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
@@ -66,28 +79,28 @@ async def _process_evidence_certified(payload: dict) -> dict:
 
 
 @router.post("/ibs")
-async def receive_ibs_webhook(request: Request, secret: Optional[str] = Query(None)):
-    _validate_secret(secret)
+async def receive_ibs_webhook(request: Request):
+    _validate_ibs_request(request)
     return await _process_evidence_certified(await request.json())
 
 
 @router.post("/ibs/ibs-webhook")
-async def receive_ibs_webhook_evidence(request: Request, secret: Optional[str] = Query(None)):
-    _validate_secret(secret)
+async def receive_ibs_webhook_evidence(request: Request):
+    _validate_ibs_request(request)
     return await _process_evidence_certified(await request.json())
 
 
 @router.post("/ibs/ibs-webhook-signature-ok")
-async def receive_ibs_signature_ok(request: Request, secret: Optional[str] = Query(None)):
-    _validate_secret(secret)
+async def receive_ibs_signature_ok(request: Request):
+    _validate_ibs_request(request)
     payload = await request.json()
     print(f"[Webhook] Signature OK: {str(payload)[:300]}")
     return await _process_evidence_certified(payload)
 
 
 @router.post("/ibs/ibs-webhook-signature-ko")
-async def receive_ibs_signature_ko(request: Request, secret: Optional[str] = Query(None)):
-    _validate_secret(secret)
+async def receive_ibs_signature_ko(request: Request):
+    _validate_ibs_request(request)
     payload = await request.json()
     print(f"[Webhook] ⚠️ Signature KO: {str(payload)[:300]}")
     evidence_id = payload.get("evidence_id") or payload.get("id")
