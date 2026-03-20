@@ -16,6 +16,7 @@ class ProxyOptions(BaseModel):
     mode: DetectionMode = DetectionMode.tokenise
     include_detections: bool = True
     reversible: bool = True
+    agent_mode: bool = False          # Phase 7b: triggers stricter policies
 
 
 class ProtectRequest(BaseModel):
@@ -30,10 +31,10 @@ class DetectRequest(BaseModel):
 
 
 class Detection(BaseModel):
-    type: str                   # full_name | dni | iban | email | phone | ssn ...
-    severity: str               # critical | high | medium | low
-    action: str                 # tokenised | anonymised | blocked | detected
-    token: Optional[str] = None  # [NM-0001] if tokenised
+    type: str
+    severity: str
+    action: str
+    token: Optional[str] = None
     start: Optional[int] = None
     end: Optional[int] = None
     confidence: float = 1.0
