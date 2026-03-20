@@ -224,16 +224,21 @@ async def update_vault_access_ibs(token_id: str, user_id: str, evidence_id: str)
         )
         return response.status_code in (200, 201, 204)
 
-async def insert_tokens_batch(rows: list) -> bool:
-    """Insert multiple tokens in vault in one call."""
-    if not rows:
-        return True
+
+async def get_org_ibs_signature(org_id: str) -> Optional[str]:
+    """Get the iBS signature_id for an organization."""
     async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.post(
-            f"{SUPABASE_REST}/tokens_vault",
+        response = await client.get(
+            f"{SUPABASE_REST}/organizations",
             headers=SUPABASE_HEADERS,
-            json=rows,
+            params={
+                "id": f"eq.{org_id}",
+                "select": "ibs_signature_id",
+                "limit": "1",
+            },
         )
-        if response.status_code not in (200, 201):
-            print(f"[Vault] INSERT tokens failed: {response.status_code} {response.text[:200]}")
-        return response.status_code in (200, 201)
+        if response.status_code == 200:
+            data = response.json()
+            if data and data[0].get("ibs_signature_id"):
+                return data[0]["ibs_signature_id"]
+    return None
