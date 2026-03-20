@@ -39,3 +39,27 @@ async def ibs_test():
         "ibs_base": settings.IBS_API_BASE,
         "environment": settings.ENVIRONMENT,
     }
+
+@router.get("/health/ibs-direct")
+async def ibs_direct_test():
+    """Test directo de iBS — llama sincrónicamente."""
+    import httpx
+    from app.config import settings
+    key = settings.IBS_API_KEY or ""
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{settings.IBS_API_BASE}/webhooks",
+                headers=headers,
+            )
+            return {
+                "status": r.status_code,
+                "response": r.text[:300],
+                "key_used_prefix": key[:12] + "...",
+            }
+    except Exception as e:
+        return {"error": str(e)}
