@@ -151,10 +151,6 @@ def apply_policies(
         else:
             detection.action = "tokenised"  # safe default
 
-        # Store regulation reference in detection metadata if available
-        if regulation_ref:
-            detection.regulation_ref = regulation_ref  # type: ignore[attr-defined]
-
     return detections
 
 
