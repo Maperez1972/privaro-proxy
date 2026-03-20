@@ -43,39 +43,15 @@ async def ibs_test():
 
 @router.get("/health/ibs-certify-test")
 async def ibs_certify_test():
-    """Test directo de POST /evidences — certifica un evento de prueba."""
-    import hashlib, base64, json
-    import httpx
+    """Test directo usando ibs._post_evidence — incluye signatures:[]"""
     from app.services import ibs
-
-    key = settings.IBS_API_KEY or ""
-    if not key:
-        return {"error": "IBS_API_KEY not set"}
-
-    # Build a test payload hash
-    payload = {"test": True, "source": "privaro-health-check"}
-    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    sha512 = hashlib.sha512(payload_json.encode()).digest()
-    payload_hash = base64.b64encode(sha512).decode()
-
-    ibs_body = {
-        "payload": {
-            "title": "privaro_health_test",
-            "files": [{"name": "test.json", "file": payload_hash}],
-        }
+    # Usa directamente la función del módulo ibs — mismo código que certify_audit_log
+    evidence_id = await ibs._post_evidence(
+        title="privaro_health_test_001",
+        payload_hash=ibs._build_hash({"test": True, "source": "health-check"}),
+    )
+    return {
+        "success": evidence_id is not None,
+        "evidence_id": evidence_id,
+        "ibs_key_prefix": settings.IBS_API_KEY[:12] + "..." if settings.IBS_API_KEY else "EMPTY",
     }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(
-                f"{settings.IBS_API_BASE}/evidences",
-                headers=ibs._get_ibs_headers(),
-                json=ibs_body,
-            )
-            return {
-                "status": r.status_code,
-                "response": r.text[:500],
-                "headers_auth_prefix": ibs._get_ibs_headers()["Authorization"][:20] + "...",
-            }
-    except Exception as e:
-        return {"error": str(e)}
