@@ -2,14 +2,16 @@
 Privacy Proxy Router — Core of the product.
 
 POST /v1/proxy/detect  — Detect PII without masking (analysis mode)
-POST /v1/proxy/protect — Detect + mask + audit log (production mode)
+POST /v1/proxy/protect — Detect + mask + audit log + contextual policy (Phase 7b)
 GET  /v1/proxy/test    — Health check with sample detection
 """
 import time
 import uuid
-import asyncio
+import os
+import base64
+import hashlib
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from app.models.schemas import (
     ProtectRequest, ProtectResponse,
@@ -20,6 +22,7 @@ from app.services import detector
 from app.services.auth import verify_api_key_or_dev
 from app.services import supabase as db
 from app.services import ibs
+from app.services import policy_engine as pe
 from app.config import settings
 
 router = APIRouter()
@@ -32,13 +35,9 @@ async def detect_pii(
     body: DetectRequest,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """
-    Analysis mode: detect PII entities without masking or storing.
-    Use in the PII Sandbox for real-time preview.
-    """
+    """Analysis mode: detect PII without masking or storing."""
     t0 = time.monotonic()
 
-    # Validate pipeline belongs to org
     pipeline = await db.get_pipeline(body.pipeline_id)
     if not pipeline:
         raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
@@ -64,14 +63,20 @@ async def protect_prompt(
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """
-    CORE endpoint. Flow:
+    CORE endpoint — Phase 7b: Contextual Policy Engine + Risk Scoring.
+
+    Flow:
     1. Validate pipeline + org
-    2. Detect PII with regex engine
-    3. Apply tokenise / anonymise / block
-    4. INSERT audit_log with ibs_status='pending'
-    5. INSERT pii_detections (granular)
-    6. Return protected_prompt to client (~50ms)
-    7. BACKGROUND: trigger iBS certification (Phase 5)
+    2. Detect PII
+    3. Load policy rules + provider trust posture
+    4. Apply contextual policy (entity × provider × role × region × agent_mode)
+    5. Compute risk_score
+    6. Apply tokenisation based on resolved actions
+    7. INSERT audit_log with risk_score
+    8. INSERT pii_detections (with detector metadata)
+    9. INSERT tokens_vault (AES-256-GCM)
+    10. Return to client ~50ms
+    11. BACKGROUND: iBS certification
     """
     t0 = time.monotonic()
     request_id = f"req_{uuid.uuid4().hex[:12]}"
@@ -84,25 +89,109 @@ async def protect_prompt(
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
     org_id = pipeline["org_id"]
+    agent_mode = body.options.agent_mode if hasattr(body.options, "agent_mode") else False
 
-    # ── Steps 2-3: Detect and protect ───────────────────────────────────────
-    protected_prompt, detections = detector.protect(
-        body.prompt,
-        mode=body.options.mode.value,
-    )
+    # ── Step 2: Detect PII ───────────────────────────────────────────────────
+    detections = detector.detect(body.prompt)
+
+    # ── Step 3: Load policies + provider trust posture ───────────────────────
+    policies = await db.get_policy_rules(org_id) or []
+    provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
+
+    # Build evaluation context
+    policy_context = {
+        "provider": pipeline.get("llm_provider", ""),
+        "user_role": key_record.get("role", "developer"),
+        "data_region": provider_trust.get("data_region", "EU") if provider_trust else "EU",
+        "agent_mode": agent_mode,
+        "pipeline_sector": pipeline.get("sector", "general"),
+        "default_action": body.options.mode.value,
+    }
+
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+
+    # ── Step 4: Apply contextual policy ──────────────────────────────────────
+    if policies and detections:
+        detections = pe.apply_policies(detections, policies, policy_context)
+    else:
+        # Fallback: apply mode from request options
+        for d in detections:
+            d.action = "tokenised" if body.options.mode.value == "tokenise" else body.options.mode.value
+
+    # ── Step 5: Apply tokenisation to text ───────────────────────────────────
+    protected_prompt = body.prompt
+    counters: Dict[str, int] = {}
+
+    # Check if any detection is blocked — if all blocked, return blocked response
+    if all(d.action == "blocked" for d in detections) and detections:
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        risk_score = pe.compute_risk_score(detections, provider_risk_level, agent_mode, len(detections))
+        audit_log_id = await db.insert_audit_log({
+            "org_id": org_id, "pipeline_id": body.pipeline_id,
+            "event_type": "request_blocked", "entity_type": detections[0].type,
+            "entity_category": pe._get_category(detections[0].type),
+            "action_taken": "blocked", "severity": "critical",
+            "prompt_hash": hashlib.sha256(body.prompt.encode()).hexdigest(),
+            "pipeline_stage": "proxy", "processing_ms": processing_ms,
+            "ibs_status": "pending", "source": "proxy",
+            "risk_score": risk_score, "agent_mode": agent_mode,
+            "metadata": {"request_id": request_id, "mode": body.options.mode.value,
+                         "total_detected": len(detections), "total_masked": 0, "by_type": {}},
+        })
+        if audit_log_id:
+            background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
+                                       {"request_id": request_id})
+        return ProtectResponse(
+            request_id=request_id,
+            protected_prompt="[BLOCKED: Policy violation — PII detected that cannot be processed]",
+            detections=detections if body.options.include_detections else [],
+            stats={"total_detected": len(detections), "total_masked": 0,
+                   "leaked": len(detections), "coverage_pct": 0.0,
+                   "processing_ms": processing_ms, "by_type": {}, "risk_score": risk_score},
+            audit_log_id=audit_log_id,
+            gdpr_compliant=False,
+        )
+
+    # Apply replacements back-to-front to preserve offsets
+    for detection in reversed(detections):
+        if detection.start is None or detection.end is None:
+            continue
+        entity_type = detection.type
+
+        if detection.action in ("tokenised", "pseudonymised"):
+            counters[entity_type] = counters.get(entity_type, 0) + 1
+            token = _make_token(entity_type, counters[entity_type])
+            detection.token = token
+            detection.action = "tokenised"
+            replacement = token
+        elif detection.action in ("anonymised", "anonymise", "anonymise_irreversible"):
+            detection.action = "anonymised"
+            replacement = f"[{entity_type.upper()}]"
+        else:
+            detection.action = "tokenised"
+            counters[entity_type] = counters.get(entity_type, 0) + 1
+            token = _make_token(entity_type, counters[entity_type])
+            detection.token = token
+            replacement = token
+
+        protected_prompt = protected_prompt[:detection.start] + replacement + protected_prompt[detection.end:]
 
     processing_ms = int((time.monotonic() - t0) * 1000)
     stats = detector.build_stats(detections, processing_ms)
 
-    # ── Step 4: INSERT audit_log ─────────────────────────────────────────────
-    # Determine primary event type and severity
+    # ── Step 5: Compute risk_score ────────────────────────────────────────────
+    risk_score = pe.compute_risk_score(
+        detections,
+        provider_risk_level=provider_risk_level,
+        agent_mode=agent_mode,
+        leaked_count=stats["leaked"],
+    )
+    stats["risk_score"] = risk_score
+
+    # ── Step 6: Build primary event ───────────────────────────────────────────
     if not detections:
-        event_type = "request_clean"
-        severity = "low"
-        entity_type = "none"
-        action_taken = "passed"
+        event_type, severity, entity_type, action_taken = "request_clean", "low", "none", "passed"
     else:
-        # Use the most severe detection as the primary event
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         primary = min(detections, key=lambda d: severity_order.get(d.severity, 99))
         event_type = "pii_detected"
@@ -112,7 +201,6 @@ async def protect_prompt(
         if stats["leaked"] > 0:
             event_type = "pii_leaked"
 
-    import hashlib
     prompt_hash = hashlib.sha256(body.prompt.encode()).hexdigest()
 
     audit_payload = {
@@ -120,7 +208,7 @@ async def protect_prompt(
         "pipeline_id": body.pipeline_id,
         "event_type": event_type,
         "entity_type": entity_type,
-        "entity_category": _get_category(entity_type),
+        "entity_category": pe._get_category(entity_type),
         "action_taken": action_taken,
         "severity": severity,
         "prompt_hash": prompt_hash,
@@ -128,18 +216,23 @@ async def protect_prompt(
         "processing_ms": processing_ms,
         "ibs_status": "pending",
         "source": "proxy",
+        "risk_score": risk_score,
+        "agent_mode": agent_mode,
         "metadata": {
             "request_id": request_id,
             "total_detected": stats["total_detected"],
             "total_masked": stats["total_masked"],
             "by_type": stats["by_type"],
             "mode": body.options.mode.value,
+            "risk_score": risk_score,
+            "provider": pipeline.get("llm_provider", ""),
+            "provider_risk_level": provider_risk_level,
         },
     }
 
     audit_log_id = await db.insert_audit_log(audit_payload)
 
-    # ── Step 5a: INSERT pii_detections ────────────────────────────────────────
+    # ── Step 7: INSERT pii_detections ─────────────────────────────────────────
     if detections and audit_log_id:
         detection_rows = [
             {
@@ -152,18 +245,19 @@ async def protect_prompt(
                 "end_offset": d.end,
                 "confidence_score": d.confidence,
                 "detector_used": d.detector,
+                "detector_version": "regex-v1",
+                "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
+                "decision_reason": f"Policy: {d.action} for {d.type} in context provider={policy_context['provider']} role={policy_context['user_role']}",
             }
             for d in detections
         ]
         background_tasks.add_task(db.insert_pii_detections, detection_rows)
 
-    # ── Step 5b: INSERT tokens_vault (sólo para tokenised + reversible) ───────
+    # ── Step 8: INSERT tokens_vault ───────────────────────────────────────────
     if detections and audit_log_id and body.options.reversible:
-        import os, base64
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-        enc_key_hex = settings.ENCRYPTION_KEY
         try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            enc_key_hex = settings.ENCRYPTION_KEY
             enc_key = bytes.fromhex(enc_key_hex) if enc_key_hex else os.urandom(32)
         except Exception:
             enc_key = os.urandom(32)
@@ -171,13 +265,16 @@ async def protect_prompt(
         token_rows = []
         for d in detections:
             if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
-                # Extraer valor original del prompt usando offsets
                 original_value = body.prompt[d.start:d.end]
-                # Cifrar con AES-256-GCM
-                aesgcm = AESGCM(enc_key)
-                nonce = os.urandom(12)
-                ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
-                encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+                try:
+                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                    aesgcm = AESGCM(enc_key)
+                    nonce = os.urandom(12)
+                    ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+                    encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+                except Exception as e:
+                    print(f"[Vault] Encryption error: {e}")
+                    continue
 
                 token_rows.append({
                     "org_id": org_id,
@@ -192,8 +289,8 @@ async def protect_prompt(
 
         if token_rows:
             background_tasks.add_task(db.insert_tokens_batch, token_rows)
-    
-    # ── Step 6 (background): iBS blockchain certification ────────────────────
+
+    # ── Step 9: iBS certification ─────────────────────────────────────────────
     if audit_log_id:
         background_tasks.add_task(
             ibs.certify_audit_log,
@@ -202,7 +299,7 @@ async def protect_prompt(
             audit_payload.get("metadata", {}),
         )
 
-    # ── Step 7 (background): Update pipeline counters ────────────────────────
+    # ── Step 10: Update pipeline counters ────────────────────────────────────
     background_tasks.add_task(
         db.increment_pipeline_counters,
         body.pipeline_id,
@@ -212,7 +309,6 @@ async def protect_prompt(
         processing_ms,
     )
 
-    # ── Step 7: Return to client ─────────────────────────────────────────────
     return ProtectResponse(
         request_id=request_id,
         protected_prompt=protected_prompt,
@@ -229,28 +325,32 @@ async def protect_prompt(
 async def proxy_test(
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """
-    Smoke test: run the detector on a hardcoded sample.
-    Confirms the engine is working without touching the DB.
-    """
     sample = "Paciente: María García, DNI 34521789X, IBAN ES91 2100 0418 4502 0005 1332, email: maria.garcia@clinica.es"
     protected, detections = detector.protect(sample, mode="tokenise")
     return {
         "status": "ok",
         "detector": "regex-v1",
+        "policy_engine": "contextual-v1",
         "sample_input": sample,
         "protected_output": protected,
         "entities_detected": len(detections),
+        "risk_score": pe.compute_risk_score(detections),
         "detections": [d.model_dump() for d in detections],
     }
 
 
+# ── Token helpers ─────────────────────────────────────────────────────────────
+
+TOKEN_PREFIX = {
+    "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
+    "credit_card": "CC", "email": "EM", "phone": "PH",
+    "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT", "ssn": "SS",
+}
+
+def _make_token(entity_type: str, counter: int) -> str:
+    prefix = TOKEN_PREFIX.get(entity_type, "XX")
+    return f"[{prefix}-{counter:04d}]"
+
+
 def _get_category(entity_type: str) -> str:
-    categories = {
-        "dni": "personal", "nie": "personal", "ssn": "personal",
-        "full_name": "personal", "email": "personal",
-        "phone": "personal", "ip_address": "personal", "date_of_birth": "personal",
-        "iban": "financial", "credit_card": "financial",
-        "health_record": "special",
-    }
-    return categories.get(entity_type, "personal")
+    return pe._get_category(entity_type)
