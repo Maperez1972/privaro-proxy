@@ -2,14 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies first (layer cache)
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source — v2.3 tokens vault
+# Cache bust arg — increment to force full rebuild of app layer
+ARG CACHE_BUST=4
 COPY app/ ./app/
 
-# Non-root user for security
+# Non-root user
 RUN adduser --disabled-password --gecos "" appuser
 USER appuser
 
