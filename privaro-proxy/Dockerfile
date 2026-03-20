@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Cache bust arg — increment to force full rebuild of app layer
-ARG CACHE_BUST=4
+ARG CACHE_BUST=5
 COPY app/ ./app/
 
 # Non-root user
