@@ -271,3 +271,24 @@ async def update_vault_access_ibs(token_id: str, user_id: str, evidence_id: str)
             json={"ibs_evidence_id": evidence_id},
         )
         return response.status_code in (200, 201, 204)
+
+async def update_vault_access_log_ibs(
+    evidence_id: str,
+    certification_hash: str,
+    network: str,
+) -> bool:
+    """Actualiza vault_access_log con certification_hash cuando llega el webhook iBS."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/vault_access_log",
+            headers=SUPABASE_HEADERS,
+            params={"ibs_evidence_id": f"eq.{evidence_id}"},
+            json={
+                "ibs_certification_hash": certification_hash,
+                "ibs_network": network,
+            },
+        )
+        success = response.status_code in (200, 201, 204)
+        if success:
+            print(f"[Vault] vault_access_log certified: evidence={evidence_id}")
+        return success
