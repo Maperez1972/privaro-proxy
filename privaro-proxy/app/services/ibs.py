@@ -1,7 +1,7 @@
 """
 iBS (iCommunity Blockchain Solutions) — Blockchain Evidence Layer
 Certifica cada audit_log y vault_access en Polygon via POST /v2/evidences.
-Firma: 1 firma por organización (KYC verificado por el admin/DPO).
+Firma: sig_G5zivdkPD226iTWDCYKBuh (icommunity_labs — org-level signature)
 """
 import hashlib
 import base64
@@ -12,6 +12,7 @@ from app.config import settings
 from app.services import supabase as db
 
 IBS_BASE = settings.IBS_API_BASE
+IBS_SIGNATURE_ID = "sig_G5zivdkPD226iTWDCYKBuh"  # icommunity_labs — firma de organización
 
 
 def _get_ibs_headers() -> dict:
@@ -31,15 +32,12 @@ def _build_hash(payload: Dict) -> str:
 
 async def _post_evidence(title: str, payload_hash: str, file_name: str = "audit_log.json") -> str | None:
     """POST /v2/evidences. Devuelve evidence_id o None si falla."""
-    # signatures requiere al menos {"id": "..."} — array vacío no válido
-    signatures = [{"id": signature_id}] if signature_id else [{"id": "privaro"}]
-
     ibs_payload = {
         "payload": {
             "title": title,
             "files": [{"name": file_name, "file": payload_hash}],
         },
-        "signatures": signatures,
+        "signatures": [{"id": IBS_SIGNATURE_ID}],
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -73,11 +71,6 @@ async def certify_audit_log(
         print("[iBS] IBS_API_KEY no configurada — skipping")
         return False
 
-    # Obtener firma de la organización
-    signature_id = await db.get_org_ibs_signature(org_id)
-    if not signature_id:
-        print(f"[iBS] No signature found for org {org_id} — using default")
-
     payload = {
         "audit_log_id": audit_log_id,
         "org_id": org_id,
@@ -88,8 +81,9 @@ async def certify_audit_log(
     title = f"privaro_{audit_log_id[:16]}"
     entity_type = metadata.get("by_type", {})
     entity_types = "_".join(list(entity_type.keys())[:2]) if entity_type else "pii"
-    evidence_id = await _post_evidence(title, payload_hash, f"pii_audit_{entity_types}.json")
-    
+    file_name = f"pii_audit_{entity_types}.json"
+
+    evidence_id = await _post_evidence(title, payload_hash, file_name)
     if evidence_id:
         await db.insert_ibs_sync_queue({
             "audit_log_id": audit_log_id,
@@ -113,8 +107,6 @@ async def certify_vault_reveal(
         print("[iBS] IBS_API_KEY no configurada — skipping vault reveal certification")
         return False
 
-    signature_id = await db.get_org_ibs_signature(org_id)
-
     payload = {
         "event": "vault_reveal",
         "token_id": token_id,
@@ -126,8 +118,9 @@ async def certify_vault_reveal(
     }
     payload_hash = _build_hash(payload)
     title = f"vault_{token_id[:16]}"
+    file_name = f"vault_reveal_{entity_type}_{token_value.replace('[', '').replace(']', '')}.json"
 
-    evidence_id = await _post_evidence(title, payload_hash, signature_id)
+    evidence_id = await _post_evidence(title, payload_hash, file_name)
     if evidence_id:
         print(f"[iBS] Vault reveal certified: token={token_value} evidence={evidence_id}")
         await db.update_vault_access_ibs(token_id, user_id, evidence_id)
