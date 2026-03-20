@@ -4,7 +4,6 @@ This bypasses RLS intentionally: the proxy is a trusted server component.
 All writes are validated and scoped by org_id before reaching this layer.
 """
 import httpx
-import json
 from typing import Optional, Dict, Any
 from app.config import settings
 
@@ -19,10 +18,6 @@ SUPABASE_HEADERS = {
 
 
 async def insert_audit_log(payload: Dict[str, Any]) -> Optional[str]:
-    """
-    Insert a new audit_log row and return its UUID.
-    Uses service_role — bypasses RLS (correct for server writes).
-    """
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
             f"{SUPABASE_REST}/audit_logs",
@@ -32,13 +27,11 @@ async def insert_audit_log(payload: Dict[str, Any]) -> Optional[str]:
         if response.status_code in (200, 201):
             data = response.json()
             return data[0]["id"] if data else None
-        else:
-            print(f"[Supabase] audit_log INSERT failed: {response.status_code} {response.text}")
-            return None
+        print(f"[Supabase] audit_log INSERT failed: {response.status_code} {response.text}")
+        return None
 
 
 async def insert_pii_detections(rows: list) -> bool:
-    """Insert multiple pii_detection rows for a single request."""
     if not rows:
         return True
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -51,10 +44,6 @@ async def insert_pii_detections(rows: list) -> bool:
 
 
 async def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch pipeline config by ID.
-    Returns None if pipeline not found or inactive.
-    """
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(
             f"{SUPABASE_REST}/pipelines",
@@ -73,7 +62,6 @@ async def get_pipeline(pipeline_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_org_settings(org_id: str) -> Optional[Dict[str, Any]]:
-    """Fetch org settings for policy enforcement."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(
             f"{SUPABASE_REST}/org_settings",
@@ -87,7 +75,6 @@ async def get_org_settings(org_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def insert_ibs_sync_queue(payload: Dict[str, Any]) -> bool:
-    """Insert into ibs_sync_queue for resilience tracking."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
             f"{SUPABASE_REST}/ibs_sync_queue",
@@ -104,7 +91,6 @@ async def update_audit_log_ibs(
     ibs_network: str,
     ibs_certified_at: Optional[str],
 ) -> bool:
-    """UPDATE audit_log ibs_* columns when webhook arrives."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.patch(
             f"{SUPABASE_REST}/audit_logs",
@@ -122,7 +108,6 @@ async def update_audit_log_ibs(
 
 
 async def update_audit_log_ibs_failed(audit_log_id: str, ibs_evidence_id: str) -> bool:
-    """Mark audit_log as ibs_status=failed when signature KO."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.patch(
             f"{SUPABASE_REST}/audit_logs",
@@ -134,12 +119,7 @@ async def update_audit_log_ibs_failed(audit_log_id: str, ibs_evidence_id: str) -
 
 
 async def get_audit_log_id_by_evidence(evidence_id: str, title: str) -> Optional[str]:
-    """
-    Find audit_log_id from ibs_sync_queue by evidence_id.
-    Fallback: search by title prefix in audit_logs metadata.
-    """
     async with httpx.AsyncClient(timeout=5.0) as client:
-        # Try ibs_sync_queue first
         r = await client.get(
             f"{SUPABASE_REST}/ibs_sync_queue",
             headers=SUPABASE_HEADERS,
@@ -154,8 +134,6 @@ async def get_audit_log_id_by_evidence(evidence_id: str, title: str) -> Optional
             if data:
                 return data[0]["audit_log_id"]
 
-        # Fallback: extract from title "privaro_<first16_of_uuid>"
-        # title format: "privaro_67a5583e4ca14f3c"
         if title.startswith("privaro_"):
             partial_id = title.replace("privaro_", "")
             r2 = await client.get(
@@ -175,7 +153,6 @@ async def get_audit_log_id_by_evidence(evidence_id: str, title: str) -> Optional
 
 
 async def delete_ibs_sync_queue(audit_log_id: str) -> bool:
-    """Remove from ibs_sync_queue after successful certification."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.delete(
             f"{SUPABASE_REST}/ibs_sync_queue",
@@ -192,9 +169,7 @@ async def increment_pipeline_counters(
     leaked: int,
     latency_ms: int,
 ) -> None:
-    """Increment pipeline aggregate counters (fire-and-forget)."""
     async with httpx.AsyncClient(timeout=5.0) as client:
-        # Use Supabase RPC for atomic increments
         await client.post(
             f"{settings.SUPABASE_URL}/rest/v1/rpc/increment_pipeline_stats",
             headers=SUPABASE_HEADERS,
@@ -223,6 +198,28 @@ async def update_vault_access_ibs(token_id: str, user_id: str, evidence_id: str)
             json={"ibs_evidence_id": evidence_id},
         )
         return response.status_code in (200, 201, 204)
+
+
+async def update_vault_access_log_ibs(
+    evidence_id: str,
+    certification_hash: str,
+    network: str,
+) -> bool:
+    """Update vault_access_log with certification_hash when iBS webhook arrives."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/vault_access_log",
+            headers=SUPABASE_HEADERS,
+            params={"ibs_evidence_id": f"eq.{evidence_id}"},
+            json={
+                "ibs_certification_hash": certification_hash,
+                "ibs_network": network,
+            },
+        )
+        success = response.status_code in (200, 201, 204)
+        if success:
+            print(f"[Vault] vault_access_log certified: evidence={evidence_id}")
+        return success
 
 
 async def get_org_ibs_signature(org_id: str) -> Optional[str]:
@@ -261,7 +258,7 @@ async def get_policy_rules(org_id: str) -> list:
         return []
 
 
-async def get_provider_trust(provider: str, org_id: str) -> dict | None:
+async def get_provider_trust(provider: str, org_id: str) -> Optional[Dict[str, Any]]:
     """Fetch provider trust posture for a given provider name."""
     if not provider:
         return None
@@ -279,6 +276,7 @@ async def get_provider_trust(provider: str, org_id: str) -> dict | None:
             data = response.json()
             return data[0] if data else None
         return None
+
 
 async def insert_tokens_batch(rows: list) -> bool:
     """Insert multiple tokens in tokens_vault in one call."""
