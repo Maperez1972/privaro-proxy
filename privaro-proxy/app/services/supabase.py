@@ -279,3 +279,17 @@ async def get_provider_trust(provider: str, org_id: str) -> dict | None:
             data = response.json()
             return data[0] if data else None
         return None
+
+async def insert_tokens_batch(rows: list) -> bool:
+    """Insert multiple tokens in tokens_vault in one call."""
+    if not rows:
+        return True
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            json=rows,
+        )
+        if response.status_code not in (200, 201):
+            print(f"[Vault] INSERT tokens failed: {response.status_code} {response.text[:200]}")
+        return response.status_code in (200, 201)
