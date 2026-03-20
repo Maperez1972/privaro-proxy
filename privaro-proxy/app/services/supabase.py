@@ -243,52 +243,39 @@ async def get_org_ibs_signature(org_id: str) -> Optional[str]:
                 return data[0]["ibs_signature_id"]
     return None
 
-async def insert_tokens_batch(rows: list) -> bool:
-    """Insert multiple tokens in tokens_vault in one call."""
-    if not rows:
-        return True
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.post(
-            f"{SUPABASE_REST}/tokens_vault",
-            headers=SUPABASE_HEADERS,
-            json=rows,
-        )
-        if response.status_code not in (200, 201):
-            print(f"[Vault] INSERT tokens failed: {response.status_code} {response.text[:200]}")
-        return response.status_code in (200, 201)
 
-async def update_vault_access_ibs(token_id: str, user_id: str, evidence_id: str) -> bool:
-    """Update vault_access_log with iBS evidence_id after certification."""
+async def get_policy_rules(org_id: str) -> list:
+    """Fetch all enabled policy rules for an org, ordered by priority."""
     async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.patch(
-            f"{SUPABASE_REST}/vault_access_log",
+        response = await client.get(
+            f"{SUPABASE_REST}/policy_rules",
             headers=SUPABASE_HEADERS,
             params={
-                "token_id": f"eq.{token_id}",
-                "user_id": f"eq.{user_id}",
-                "action": "eq.reveal",
+                "org_id": f"eq.{org_id}",
+                "is_enabled": "eq.true",
+                "order": "priority.asc",
             },
-            json={"ibs_evidence_id": evidence_id},
         )
-        return response.status_code in (200, 201, 204)
+        if response.status_code == 200:
+            return response.json()
+        return []
 
-async def update_vault_access_log_ibs(
-    evidence_id: str,
-    certification_hash: str,
-    network: str,
-) -> bool:
-    """Actualiza vault_access_log con certification_hash cuando llega el webhook iBS."""
+
+async def get_provider_trust(provider: str, org_id: str) -> dict | None:
+    """Fetch provider trust posture for a given provider name."""
+    if not provider:
+        return None
     async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.patch(
-            f"{SUPABASE_REST}/vault_access_log",
+        response = await client.get(
+            f"{SUPABASE_REST}/llm_providers",
             headers=SUPABASE_HEADERS,
-            params={"ibs_evidence_id": f"eq.{evidence_id}"},
-            json={
-                "ibs_certification_hash": certification_hash,
-                "ibs_network": network,
+            params={
+                "org_id": f"eq.{org_id}",
+                "provider": f"eq.{provider}",
+                "limit": "1",
             },
         )
-        success = response.status_code in (200, 201, 204)
-        if success:
-            print(f"[Vault] vault_access_log certified: evidence={evidence_id}")
-        return success
+        if response.status_code == 200:
+            data = response.json()
+            return data[0] if data else None
+        return None
