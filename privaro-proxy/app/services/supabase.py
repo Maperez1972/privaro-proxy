@@ -313,3 +313,33 @@ async def update_vault_access_log_ibs(
             },
         )
         return response.status_code in (200, 201, 204)
+
+
+async def find_existing_token(
+    org_id: str,
+    conversation_id: str,
+    entity_type: str,
+    encrypted_value: str,
+) -> dict | None:
+    """
+    Look up an existing token for the same encrypted value within a conversation.
+    Enables token consistency: same PII = same token within a conversation.
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "conversation_id": f"eq.{conversation_id}",
+                "entity_type": f"eq.{entity_type}",
+                "encrypted_original": f"eq.{encrypted_value}",
+                "is_reversible": "eq.true",
+                "limit": "1",
+                "select": "id,token_value",
+            },
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data[0] if data else None
+        return None
