@@ -97,8 +97,7 @@ async def protect_prompt(
     # ── Step 3: Load policies + provider trust posture ───────────────────────
     policies = await db.get_policy_rules(org_id) or []
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
-    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
-    
+
     # Build evaluation context
     policy_context = {
         "provider": pipeline.get("llm_provider", ""),
@@ -107,11 +106,6 @@ async def protect_prompt(
         "agent_mode": agent_mode,
         "pipeline_sector": pipeline.get("sector", "general"),
         "default_action": body.options.mode.value,
-        # Trust posture fields
-        "eu_residency": provider_trust.get("eu_residency", True) if provider_trust else True,
-        "approved_special_categories": provider_trust.get("approved_special_categories", False) if provider_trust else False,
-        "approved_for_agents": provider_trust.get("approved_for_agents", True) if provider_trust else True,
-        "provider_risk_level": provider_risk_level,
     }
 
     provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
@@ -251,7 +245,7 @@ async def protect_prompt(
                 "end_offset": d.end,
                 "confidence_score": d.confidence,
                 "detector_used": d.detector,
-                "detector_version": "presidio-v1" if d.detector == "presidio" else "regex-v1",
+                "detector_version": "regex-v1",
                 "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
                 "decision_reason": f"Policy: {d.action} for {d.type} in context provider={policy_context['provider']} role={policy_context['user_role']}",
             }
@@ -259,7 +253,7 @@ async def protect_prompt(
         ]
         background_tasks.add_task(db.insert_pii_detections, detection_rows)
 
-    # ── Step 8: INSERT tokens_vault ───────────────────────────────────────────
+    # ── Step 8: INSERT tokens_vault (conversation-scoped dedup) ──────────────
     if detections and audit_log_id and body.options.reversible:
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -267,6 +261,8 @@ async def protect_prompt(
             enc_key = bytes.fromhex(enc_key_hex) if enc_key_hex else os.urandom(32)
         except Exception:
             enc_key = os.urandom(32)
+
+        conversation_id = body.conversation_id  # None if no conversation context
 
         token_rows = []
         for d in detections:
@@ -282,6 +278,20 @@ async def protect_prompt(
                     print(f"[Vault] Encryption error: {e}")
                     continue
 
+                # ── Token consistency: reuse existing token within conversation ──
+                if conversation_id:
+                    existing = await db.find_existing_token(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        entity_type=d.type,
+                        encrypted_value=encrypted,
+                    )
+                    if existing:
+                        # Reuse the existing token — update detection token to match
+                        d.token = existing["token_value"]
+                        print(f"[Vault] Reusing token {d.token} for {d.type} in conv {conversation_id[:8]}")
+                        continue  # Don't insert duplicate
+
                 token_rows.append({
                     "org_id": org_id,
                     "pipeline_id": body.pipeline_id,
@@ -291,6 +301,7 @@ async def protect_prompt(
                     "encryption_key_id": "key-v1",
                     "is_reversible": True,
                     "access_roles": ["admin", "dpo"],
+                    "conversation_id": conversation_id,  # scope: None = global, uuid = conversation
                 })
 
         if token_rows:
@@ -331,15 +342,21 @@ async def protect_prompt(
 async def proxy_test(
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
+    from app.services.nlp_engine import is_available as nlp_available
     sample = "Paciente: María García, DNI 34521789X, IBAN ES91 2100 0418 4502 0005 1332, email: maria.garcia@clinica.es"
     protected, detections = detector.protect(sample, mode="tokenise")
+    tier1 = [d for d in detections if d.detector == "regex"]
+    tier2 = [d for d in detections if d.detector == "presidio"]
     return {
         "status": "ok",
-        "detector": "regex-v1",
-        "policy_engine": "contextual-v1",
+        "detector": "hybrid-v1",
+        "tier1_regex": "active",
+        "tier2_nlp": "active" if nlp_available() else "unavailable",
         "sample_input": sample,
         "protected_output": protected,
         "entities_detected": len(detections),
+        "tier1_detections": len(tier1),
+        "tier2_detections": len(tier2),
         "risk_score": pe.compute_risk_score(detections),
         "detections": [d.model_dump() for d in detections],
     }
