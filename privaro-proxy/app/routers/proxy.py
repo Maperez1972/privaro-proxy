@@ -97,7 +97,8 @@ async def protect_prompt(
     # ── Step 3: Load policies + provider trust posture ───────────────────────
     policies = await db.get_policy_rules(org_id) or []
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
-
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+    
     # Build evaluation context
     policy_context = {
         "provider": pipeline.get("llm_provider", ""),
