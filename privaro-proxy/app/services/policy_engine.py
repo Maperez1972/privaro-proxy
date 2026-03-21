@@ -115,6 +115,25 @@ def evaluate_policies(
         key=lambda r: (r.get("priority", 100), -ACTION_PRIORITY.get(r.get("action", "tokenise"), 0))
     )
 
+    # ── Provider trust posture automatic rules ────────────────────────────
+    # These apply regardless of org-configured rules
+    provider_risk = context.get("provider_risk_level", "medium")
+    eu_residency = context.get("eu_residency", True)
+    approved_special = context.get("approved_special_categories", False)
+    approved_agents = context.get("approved_for_agents", True)
+
+    # Block special categories on non-approved providers
+    if entity_category == "special" and not approved_special:
+        return "anonymise", "GDPR Art.9 — provider not approved for special categories", False
+
+    # Block agent mode on non-approved providers
+    if context.get("agent_mode") and not approved_agents:
+        return "block", "Provider not approved for agent pipelines", False
+
+    # Escalate financial data on high-risk providers
+    if entity_category == "financial" and provider_risk == "high":
+        return "block", "Financial data blocked on high-risk provider", False
+    
     # Take the highest priority rule
     best_rule = matching_rules[0]
     action = best_rule.get("action", "tokenise")
