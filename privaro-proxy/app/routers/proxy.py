@@ -251,7 +251,7 @@ async def protect_prompt(
                 "end_offset": d.end,
                 "confidence_score": d.confidence,
                 "detector_used": d.detector,
-                "detector_version": "regex-v1",
+                "detector_version": "presidio-v1" if d.detector == "presidio" else "regex-v1",
                 "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
                 "decision_reason": f"Policy: {d.action} for {d.type} in context provider={policy_context['provider']} role={policy_context['user_role']}",
             }
