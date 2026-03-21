@@ -106,6 +106,11 @@ async def protect_prompt(
         "agent_mode": agent_mode,
         "pipeline_sector": pipeline.get("sector", "general"),
         "default_action": body.options.mode.value,
+        # Trust posture fields
+        "eu_residency": provider_trust.get("eu_residency", True) if provider_trust else True,
+        "approved_special_categories": provider_trust.get("approved_special_categories", False) if provider_trust else False,
+        "approved_for_agents": provider_trust.get("approved_for_agents", True) if provider_trust else True,
+        "provider_risk_level": provider_risk_level,
     }
 
     provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
