@@ -1,8 +1,8 @@
 """
-PII Detection Engine — MVP v0.1
-Detects PII using regex patterns for Spanish/EU entities.
+PII Detection Engine — Phase 8 — Hybrid Architecture
+Tier 1: Regex (deterministic, high confidence, structured data)
+Tier 2: Presidio + spaCy ES (contextual NLP, free text, names)
 
-Phase 2 will add: Microsoft Presidio + spaCy es_core_news_lg
 Current coverage:
   - DNI / NIE / NIF (Spain)
   - IBAN ES
@@ -114,19 +114,22 @@ def _make_token(entity_type: str, counter: int) -> str:
     return f"[{prefix}-{counter:04d}]"
 
 
-def detect(text: str) -> List[Detection]:
+def detect(text: str, use_nlp: bool = True) -> List[Detection]:
     """
-    Detect PII entities in text using regex patterns.
-    Returns list of Detection objects sorted by position (start offset).
+    Hybrid detection: Tier 1 (regex) + Tier 2 (Presidio NLP).
+
+    Tier 1 runs first — high confidence, deterministic.
+    Tier 2 fills gaps — catches names, implicit PII, free text.
+    NLP results never override regex results (no duplicate spans).
     """
     detections: List[Detection] = []
-    seen_spans: List[Tuple[int, int]] = []  # avoid overlapping matches
+    seen_spans: List[Tuple[int, int]] = []
 
+    # ── Tier 1: Regex ────────────────────────────────────────────────────────
     for entity_type, severity, pattern, confidence in PATTERNS:
         for match in pattern.finditer(text):
             start, end = match.start(), match.end()
 
-            # Skip if overlaps with an already-detected span
             if any(s <= start < e or s < end <= e for s, e in seen_spans):
                 continue
 
@@ -134,13 +137,27 @@ def detect(text: str) -> List[Detection]:
             detections.append(Detection(
                 type=entity_type,
                 severity=severity,
-                action="detected",          # will be updated by protect()
+                action="detected",
                 token=None,
                 start=start,
                 end=end,
                 confidence=confidence,
                 detector="regex",
             ))
+
+    # ── Tier 2: Presidio NLP ─────────────────────────────────────────────────
+    if use_nlp:
+        try:
+            from app.services.nlp_engine import detect_nlp
+            nlp_detections = detect_nlp(text, existing_spans=seen_spans)
+            for d in nlp_detections:
+                if d.start is not None and d.end is not None:
+                    seen_spans.append((d.start, d.end))
+            detections.extend(nlp_detections)
+        except Exception as e:
+            # NLP failure never breaks the request — Tier 1 results stand
+            import logging
+            logging.getLogger(__name__).warning(f"[NLP] Tier 2 skipped: {e}")
 
     # Sort by position in text
     detections.sort(key=lambda d: d.start or 0)
