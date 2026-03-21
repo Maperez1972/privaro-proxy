@@ -23,6 +23,7 @@ class ProtectRequest(BaseModel):
     pipeline_id: str
     prompt: str = Field(..., min_length=1, max_length=50000)
     options: ProxyOptions = ProxyOptions()
+    conversation_id: Optional[str] = None  # Token scoping: reuse tokens within same conversation
 
 
 class DetectRequest(BaseModel):
