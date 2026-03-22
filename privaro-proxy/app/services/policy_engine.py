@@ -1,9 +1,14 @@
 """
-Contextual Policy Engine — Phase 7b
+Contextual Policy Engine — Phase 7c (Pipeline-scoped policies)
 Evaluates policy rules against a multi-dimensional context:
   entity_type × provider × user_role × pipeline_sector × region × agent_mode
 
-Returns the resolved action for each detection.
+Policy scope resolution (3 levels):
+  1. Pipeline-level rules  → evaluated first (_effective_priority = priority)
+  2. Org-level rules       → fallback (_effective_priority = priority + 1000)
+  3. Default action        → if no rule matches at either level
+
+See supabase.get_policy_rules() for merge logic.
 """
 from typing import List, Dict, Any, Optional
 from app.models.schemas import Detection
@@ -46,29 +51,24 @@ def _matches_context(rule: Dict, context: Dict) -> bool:
     Returns True if the rule applies to the given context.
     Supports wildcard 'all' in array fields.
     """
-    # Provider match
     providers = rule.get("applies_to_providers") or ["all"]
     provider = context.get("provider", "")
     if "all" not in providers and provider not in providers:
         return False
 
-    # Role match
     roles = rule.get("applies_to_roles") or ["all"]
     role = context.get("user_role", "viewer")
     if "all" not in roles and role not in roles:
         return False
 
-    # Region match
     regions = rule.get("applies_to_regions") or ["all"]
     region = context.get("data_region", "EU")
     if "all" not in regions and region not in regions:
         return False
 
-    # Agent mode match
     if rule.get("agent_mode_only") and not context.get("agent_mode", False):
         return False
 
-    # Category match (if rule has category, entity must match)
     rule_category = rule.get("category")
     entity_category = context.get("entity_category", "personal")
     if rule_category and rule_category != "all" and rule_category != entity_category:
@@ -86,8 +86,11 @@ def evaluate_policies(
     Evaluate all matching policies for a detection.
     Returns (resolved_action, regulation_ref, requires_approval).
 
-    Priority: higher priority rules win. Among same priority, more
-    restrictive action wins.
+    Uses _effective_priority set by supabase.get_policy_rules():
+      - Pipeline rules: _effective_priority = priority (wins)
+      - Org rules: _effective_priority = priority + 1000 (fallback)
+
+    Among same effective_priority, more restrictive action wins.
     """
     entity_type = detection.type
     entity_category = _get_category(entity_type)
@@ -98,7 +101,6 @@ def evaluate_policies(
         "entity_category": entity_category,
     }
 
-    # Filter enabled rules for this entity type
     matching_rules = [
         r for r in policies
         if r.get("is_enabled", True)
@@ -107,38 +109,27 @@ def evaluate_policies(
     ]
 
     if not matching_rules:
-        # No specific rule — use default from mode
         return context.get("default_action", "tokenise"), None, False
 
-    # Sort by priority (lower number = higher priority), then by action restrictiveness
+    # Sort by effective_priority (pipeline rules first), then action restrictiveness
     matching_rules.sort(
-        key=lambda r: (r.get("priority", 100), -ACTION_PRIORITY.get(r.get("action", "tokenise"), 0))
+        key=lambda r: (
+            r.get("_effective_priority", r.get("priority", 100)),
+            -ACTION_PRIORITY.get(r.get("action", "tokenise"), 0)
+        )
     )
 
-    # ── Provider trust posture automatic rules ────────────────────────────
-    # These apply regardless of org-configured rules
-    provider_risk = context.get("provider_risk_level", "medium")
-    eu_residency = context.get("eu_residency", True)
-    approved_special = context.get("approved_special_categories", False)
-    approved_agents = context.get("approved_for_agents", True)
-
-    # Block special categories on non-approved providers
-    if entity_category == "special" and not approved_special:
-        return "anonymise", "GDPR Art.9 — provider not approved for special categories", False
-
-    # Block agent mode on non-approved providers
-    if context.get("agent_mode") and not approved_agents:
-        return "block", "Provider not approved for agent pipelines", False
-
-    # Escalate financial data on high-risk providers
-    if entity_category == "financial" and provider_risk == "high":
-        return "block", "Financial data blocked on high-risk provider", False
-    
-    # Take the highest priority rule
     best_rule = matching_rules[0]
     action = best_rule.get("action", "tokenise")
     regulation_ref = best_rule.get("regulation_ref")
     requires_approval = best_rule.get("requires_approval", False)
+
+    # Log which scope the winning rule came from (useful for audit/debug)
+    source = best_rule.get("_source", "unknown")
+    if source == "pipeline":
+        print(f"[PolicyEngine] entity={entity_type} → action={action} (pipeline rule, prio={best_rule.get('priority')})")
+    else:
+        print(f"[PolicyEngine] entity={entity_type} → action={action} (org fallback, prio={best_rule.get('priority')})")
 
     return action, regulation_ref, requires_approval
 
@@ -169,6 +160,10 @@ def apply_policies(
             detection.action = "tokenised"
         else:
             detection.action = "tokenised"  # safe default
+
+        # Store regulation reference in detection metadata if available
+        if regulation_ref:
+            detection.regulation_ref = regulation_ref  # type: ignore[attr-defined]
 
     return detections
 
