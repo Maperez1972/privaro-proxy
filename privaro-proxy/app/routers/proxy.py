@@ -94,8 +94,8 @@ async def protect_prompt(
     # ── Step 2: Detect PII ───────────────────────────────────────────────────
     detections = detector.detect(body.prompt)
 
-    # ── Step 3: Load policies + provider trust posture ───────────────────────
-    policies = await db.get_policy_rules(org_id) or []
+    # ── Step 3: Load policies (pipeline-scoped + org fallback) + provider trust ─
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
 
     # Build evaluation context
