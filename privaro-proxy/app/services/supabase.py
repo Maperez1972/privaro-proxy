@@ -244,21 +244,88 @@ async def get_org_ibs_signature(org_id: str) -> Optional[str]:
     return None
 
 
-async def get_policy_rules(org_id: str) -> list:
-    """Fetch all enabled policy rules for an org, ordered by priority."""
+async def get_policy_rules(org_id: str, pipeline_id: str | None = None) -> list:
+    """
+    Fetch effective policy rules with 3-level scope resolution.
+
+    Level 1 — Pipeline rules (scope='pipeline'):
+        Specific to this pipeline. Evaluated first (priority as-is).
+        If overrides_org=True, suppresses the org rule for the same entity_type.
+
+    Level 2 — Org rules (scope='org', pipeline_id IS NULL):
+        Apply to all pipelines as fallback.
+        Suppressed per-entity when pipeline has overrides_org=True for that entity.
+        Otherwise additive: both pipeline + org rules run (pipeline wins on conflict).
+
+    Level 3 — Effective priority:
+        Pipeline rules: priority as defined.
+        Org fallback rules: priority + 1000 (always evaluated after pipeline rules).
+
+    Returns merged list sorted by effective_priority ascending.
+    """
     async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(
+        pipeline_rules = []
+        overridden_entities: set = set()
+
+        if pipeline_id:
+            r_pipe = await client.get(
+                f"{SUPABASE_REST}/policy_rules",
+                headers=SUPABASE_HEADERS,
+                params={
+                    "org_id": f"eq.{org_id}",
+                    "pipeline_id": f"eq.{pipeline_id}",
+                    "is_enabled": "eq.true",
+                    "order": "priority.asc",
+                },
+            )
+            if r_pipe.status_code == 200:
+                pipeline_rules = r_pipe.json()
+
+            # Entity types where pipeline rule explicitly overrides org rule
+            overridden_entities = {
+                r["entity_type"]
+                for r in pipeline_rules
+                if r.get("overrides_org", False)
+            }
+
+        # Always fetch org-level rules as fallback
+        r_org = await client.get(
             f"{SUPABASE_REST}/policy_rules",
             headers=SUPABASE_HEADERS,
             params={
                 "org_id": f"eq.{org_id}",
+                "pipeline_id": "is.null",
                 "is_enabled": "eq.true",
                 "order": "priority.asc",
             },
         )
-        if response.status_code == 200:
-            return response.json()
-        return []
+        org_rules = r_org.json() if r_org.status_code == 200 else []
+
+        # Suppress org rules where pipeline has explicit override
+        filtered_org = [
+            r for r in org_rules
+            if r["entity_type"] not in overridden_entities
+        ]
+
+        # Tag effective priority before merging
+        for r in pipeline_rules:
+            r["_effective_priority"] = r["priority"]
+            r["_source"] = "pipeline"
+        for r in filtered_org:
+            r["_effective_priority"] = r["priority"] + 1000
+            r["_source"] = "org"
+
+        merged = sorted(
+            pipeline_rules + filtered_org,
+            key=lambda r: (r["_effective_priority"], r["entity_type"])
+        )
+
+        print(
+            f"[PolicyEngine] org={org_id[:8]} pipeline={str(pipeline_id)[:8] if pipeline_id else 'None'} "
+            f"→ {len(pipeline_rules)} pipeline + {len(filtered_org)} org rules "
+            f"({len(overridden_entities)} entities suppressed)"
+        )
+        return merged
 
 
 async def get_provider_trust(provider: str, org_id: str) -> dict | None:
@@ -343,3 +410,99 @@ async def find_existing_token(
             data = response.json()
             return data[0] if data else None
         return None
+
+
+async def create_pipeline_policy_rule(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Insert a pipeline-scoped policy rule.
+    payload must include: org_id, pipeline_id, entity_type, action, category, scope='pipeline'
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/policy_rules",
+            headers=SUPABASE_HEADERS,
+            json={**payload, "scope": "pipeline"},
+        )
+        if response.status_code in (200, 201):
+            data = response.json()
+            return data[0]["id"] if data else None
+        print(f"[Supabase] policy_rule INSERT failed: {response.status_code} {response.text[:200]}")
+        return None
+
+
+async def apply_preset_to_pipeline(
+    org_id: str,
+    pipeline_id: str,
+    preset_sector: str,
+    updated_by: str,
+) -> int:
+    """
+    Copy all policy_rules from a policy_preset sector template
+    and create pipeline-scoped versions for the given pipeline.
+    Deletes any existing pipeline-scoped rules for this pipeline first.
+    Returns count of rules created.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # 1. Delete existing pipeline-scoped rules for this pipeline
+        await client.delete(
+            f"{SUPABASE_REST}/policy_rules",
+            headers=SUPABASE_HEADERS,
+            params={
+                "pipeline_id": f"eq.{pipeline_id}",
+                "org_id": f"eq.{org_id}",
+            },
+        )
+
+        # 2. Fetch preset template rules from policy_presets
+        r = await client.get(
+            f"{SUPABASE_REST}/policy_presets",
+            headers=SUPABASE_HEADERS,
+            params={
+                "sector": f"eq.{preset_sector}",
+                "select": "rules",
+                "limit": "1",
+            },
+        )
+        if r.status_code != 200 or not r.json():
+            return 0
+
+        preset = r.json()[0]
+        rules_template = preset.get("rules") or []
+
+        if not rules_template:
+            return 0
+
+        # 3. Build pipeline-scoped rule rows from template
+        new_rules = [
+            {
+                "org_id": org_id,
+                "pipeline_id": pipeline_id,
+                "scope": "pipeline",
+                "entity_type": rule.get("entity_type"),
+                "category": rule.get("category", "personal"),
+                "action": rule.get("action", "tokenise"),
+                "is_enabled": True,
+                "priority": rule.get("priority", 100),
+                "regulation_ref": rule.get("regulation_ref"),
+                "applies_to_providers": rule.get("applies_to_providers", ["all"]),
+                "applies_to_roles": rule.get("applies_to_roles", ["all"]),
+                "overrides_org": rule.get("overrides_org", False),
+                "updated_by": updated_by,
+            }
+            for rule in rules_template
+            if rule.get("entity_type")
+        ]
+
+        if not new_rules:
+            return 0
+
+        # 4. Bulk insert
+        r2 = await client.post(
+            f"{SUPABASE_REST}/policy_rules",
+            headers=SUPABASE_HEADERS,
+            json=new_rules,
+        )
+        if r2.status_code in (200, 201):
+            created = r2.json()
+            return len(created)
+        return 0
