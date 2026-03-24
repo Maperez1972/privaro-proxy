@@ -7,15 +7,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
+# Cache bust — increment to force full rebuild including pip + spacy model
+ARG CACHE_BUST=19
+RUN echo "Cache bust: $CACHE_BUST"
+
 # Install Python deps (including Presidio + spaCy)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download spaCy ES model (43MB) — cached in image layer
-RUN python -m spacy download es_core_news_md
+# Download spaCy ES model (43MB) — must be after pip install
+RUN python -m spacy download es_core_news_md && \
+    python -c "import spacy; nlp = spacy.load('es_core_news_md'); print('[spaCy] es_core_news_md OK')"
 
-# Cache bust — increment to force rebuild of app layer
-ARG CACHE_BUST=17
+# Copy application code
 COPY app/ ./app/
 
 # Non-root user
