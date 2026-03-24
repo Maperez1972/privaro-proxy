@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import proxy, health, webhooks
+from app.routers import proxy, health, webhooks, agent
 from app.config import settings
 from app.services import ibs
 
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Privaro Proxy API",
     description="Privacy Infrastructure for Enterprise AI — iCommunity Labs",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
     redoc_url=None,
@@ -50,6 +50,7 @@ app.add_middleware(
 app.include_router(health.router, tags=["Health"])
 app.include_router(proxy.router, prefix="/v1/proxy", tags=["Privacy Proxy"])
 app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
+app.include_router(agent.router, tags=["Agent API"])
 
 
 @app.exception_handler(Exception)
