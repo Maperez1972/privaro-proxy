@@ -380,9 +380,25 @@ async def _apply_agent_tokenisation(
     counters: Dict[str, int] = {}
     token_rows = []
 
+    # Filter full_name false positives: must start with uppercase and have confidence >= 0.75
+    def _is_valid_name(d) -> bool:
+        if d.type != "full_name":
+            return True
+        if d.start is None or d.end is None:
+            return False
+        original = text[d.start:d.end]
+        # Must start with uppercase letter and be at least 3 chars
+        if not original or not original[0].isupper() or len(original) < 3:
+            return False
+        # Must have confidence >= 0.75
+        if d.confidence < 0.75:
+            return False
+        return True
+
     # Sort descending by position to replace from end → no offset drift
     sorted_dets = sorted(
-        [d for d in detections if d.start is not None and d.end is not None],
+        [d for d in detections
+         if d.start is not None and d.end is not None and _is_valid_name(d)],
         key=lambda d: d.start,
         reverse=True,
     )
