@@ -51,6 +51,8 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(proxy.router, prefix="/v1/proxy", tags=["Privacy Proxy"])
 app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
 app.include_router(agent.router, tags=["Agent API"])
+from app.routers import document
+app.include_router(document.router, prefix="/v1/proxy", tags=["document"])
 
 
 @app.exception_handler(Exception)
