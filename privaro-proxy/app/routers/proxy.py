@@ -135,6 +135,7 @@ async def protect_prompt(
             "pipeline_stage": "proxy", "processing_ms": processing_ms,
             "ibs_status": "pending", "source": "proxy",
             "risk_score": risk_score, "agent_mode": agent_mode,
+            "conversation_id": body.conversation_id if body.conversation_id else None,
             "metadata": {"request_id": request_id, "mode": body.options.mode.value,
                          "total_detected": len(detections), "total_masked": 0, "by_type": {}},
         })
