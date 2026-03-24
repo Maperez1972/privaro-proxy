@@ -6,21 +6,21 @@ Endpoints for AI agent governance:
   POST /v1/agent/reveal     — detokenise a full run for final output
   POST /v1/agent/run/end    — close a run and finalise counters
 
-All endpoints use the same api_key auth as /v1/protect.
-agent_run_id scopes token consistency across the full run.
+Authentication: X-Privaro-Key header (same as /v1/proxy/protect)
 """
 import time
 import uuid
 import hashlib
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from typing import Dict, Any
 
 import app.services.supabase as db
 import app.services.policy_engine as pe
 from app.services.detector import Detector
-from app.routers.proxy import _validate_api_key   # reuse auth helper
+from app.services.auth import verify_api_key_or_dev
 
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 detector = Detector()
@@ -108,14 +108,9 @@ class AgentRunEndResponse(BaseModel):
 @router.post("/run/start", response_model=AgentRunStartResponse)
 async def agent_run_start(
     body: AgentRunStartRequest,
-    authorization: str = Header(...),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """
-    Create an agent run. Returns agent_run_id to use in all subsequent /agent/protect calls.
-    """
-    api_key = authorization.replace("Bearer ", "").strip()
-    key_record = await _validate_api_key(api_key)
-
+    """Create an agent run. Returns agent_run_id for subsequent /agent/protect calls."""
     pipeline = await db.get_pipeline(body.pipeline_id)
     if not pipeline:
         raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
@@ -144,18 +139,15 @@ async def agent_run_start(
 @router.post("/protect", response_model=AgentProtectResponse)
 async def agent_protect(
     body: AgentProtectRequest,
-    authorization: str = Header(...),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """
     Protect a step in an agent run.
     Accepts an array of messages (prompt + tool outputs for this step).
     Returns the same array with PII tokenised/anonymised.
-    Tokens are scoped to agent_run_id — same PII = same token throughout the run.
     """
     t0 = time.monotonic()
     request_id = f"agnt_{uuid.uuid4().hex[:12]}"
-    api_key = authorization.replace("Bearer ", "").strip()
-    key_record = await _validate_api_key(api_key)
 
     # Validate run belongs to this org
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
@@ -262,15 +254,9 @@ async def agent_protect(
 @router.post("/reveal", response_model=AgentRevealResponse)
 async def agent_reveal(
     body: AgentRevealRequest,
-    authorization: str = Header(...),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """
-    Detokenise text using the token map of a completed agent run.
-    Replaces all [TYPE-XXXX] tokens with their original values.
-    Only reversible tokens are replaced (irreversible anonymisations remain).
-    """
-    api_key = authorization.replace("Bearer ", "").strip()
-    key_record = await _validate_api_key(api_key)
+    """Detokenise text using the token map of a completed agent run."""
 
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
     if not run:
@@ -300,14 +286,9 @@ async def agent_reveal(
 @router.post("/run/end", response_model=AgentRunEndResponse)
 async def agent_run_end(
     body: AgentRunEndRequest,
-    authorization: str = Header(...),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """
-    Close an agent run. Updates status and finalises aggregated counters.
-    Call this when the agent finishes (success or failure).
-    """
-    api_key = authorization.replace("Bearer ", "").strip()
-    key_record = await _validate_api_key(api_key)
+    """Close an agent run. Updates status and finalises aggregated counters."""
 
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
     if not run:
