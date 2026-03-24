@@ -40,6 +40,7 @@ class Detection(BaseModel):
     end: Optional[int] = None
     confidence: float = 1.0
     detector: str = "regex"
+    regulation_ref: Optional[str] = None   # set by policy engine when a rule matches
 
 
 class ProtectResponse(BaseModel):
