@@ -321,16 +321,73 @@ async def _apply_agent_tokenisation(
     agent_run_id: str,
 ) -> tuple[str, int]:
     """
-    Apply tokenisation to text using agent_run_id scope.
-    Same PII value within a run always maps to the same token.
+    Apply tokenisation with agent_run_id scope.
+    Encrypts original values with AES-256-GCM, same as /v1/proxy/protect.
     Returns (protected_text, tokens_created_count).
     """
-    from app.services.tokeniser import apply_tokenisation
-    return await apply_tokenisation(
-        text=text,
-        detections=detections,
-        org_id=org_id,
-        pipeline_id=pipeline_id,
-        conversation_id=None,
-        agent_run_id=agent_run_id,
+    import os
+    import base64
+    from app.routers.proxy import _make_token
+    from app.config import settings
+    import app.services.supabase as db_svc
+
+    # Setup encryption key
+    try:
+        enc_key = bytes.fromhex(settings.ENCRYPTION_KEY)
+    except Exception:
+        enc_key = os.urandom(32)
+
+    protected_text = text
+    counters: Dict[str, int] = {}
+    token_rows = []
+
+    # Sort detections descending by position to replace from end
+    sorted_dets = sorted(
+        [d for d in detections if d.start is not None and d.end is not None],
+        key=lambda d: d.start,
+        reverse=True,
     )
+
+    for d in sorted_dets:
+        if d.action == "anonymised":
+            protected_text = protected_text[:d.start] + "[REDACTED]" + protected_text[d.end:]
+            continue
+        if d.action == "blocked":
+            protected_text = protected_text[:d.start] + "[BLOCKED]" + protected_text[d.end:]
+            continue
+        if d.action not in ("tokenised", "pseudonymised"):
+            continue
+
+        original_value = text[d.start:d.end]
+        entity_type = d.type.upper()[:2]
+        counters[entity_type] = counters.get(entity_type, 0) + 1
+        token = _make_token(d.type, counters[entity_type])
+        d.token = token
+        protected_text = protected_text[:d.start] + token + protected_text[d.end:]
+
+        # Encrypt original value
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            aesgcm = AESGCM(enc_key)
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+            encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+        except Exception:
+            encrypted = base64.b64encode(original_value.encode()).decode()
+
+        token_rows.append({
+            "org_id": org_id,
+            "pipeline_id": pipeline_id,
+            "agent_run_id": agent_run_id,
+            "conversation_id": None,
+            "entity_type": d.type,
+            "token_value": token,
+            "encrypted_original": encrypted,
+            "encryption_key_id": "key-v1",
+            "is_reversible": True,
+        })
+
+    if token_rows:
+        await db_svc.insert_tokens_batch(token_rows)
+
+    return protected_text, len(token_rows)
