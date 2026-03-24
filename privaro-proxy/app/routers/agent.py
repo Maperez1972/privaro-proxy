@@ -19,11 +19,10 @@ from typing import Dict, Any
 
 import app.services.supabase as db
 import app.services.policy_engine as pe
-from app.services.detector import Detector
+import app.services.detector as detector
 from app.services.auth import verify_api_key_or_dev
 
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
-detector = Detector()
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
