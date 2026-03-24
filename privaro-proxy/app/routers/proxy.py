@@ -219,6 +219,7 @@ async def protect_prompt(
         "source": "proxy",
         "risk_score": risk_score,
         "agent_mode": agent_mode,
+        "conversation_id": body.conversation_id if body.conversation_id else None,
         "metadata": {
             "request_id": request_id,
             "total_detected": stats["total_detected"],
@@ -361,7 +362,6 @@ async def proxy_test(
         "tier1_detections": len(tier1),
         "tier2_detections": len(tier2),
         "risk_score": pe.compute_risk_score(detections),
-        "conversation_id": body.conversation_id if body.conversation_id else None,
         "detections": [d.model_dump() for d in detections],
     }
 
