@@ -657,3 +657,25 @@ async def find_existing_agent_token(
             data = r.json()
             return data[0] if data else None
         return None
+
+async def get_agent_run_vault_rows(agent_run_id: str, org_id: str) -> list:
+    """
+    Fetch all reversible vault rows for an agent run.
+    Returns raw rows with token_value + encrypted_original for decryption.
+    Used by /agent/reveal to detokenise final output.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            params={
+                "agent_run_id": f"eq.{agent_run_id}",
+                "org_id": f"eq.{org_id}",
+                "is_reversible": "eq.true",
+                "select": "token_value,encrypted_original,entity_type",
+            },
+        )
+        if r.status_code == 200:
+            return r.json()
+        print(f"[Supabase] get_agent_run_vault_rows failed: {r.status_code} {r.text[:200]}")
+        return []
