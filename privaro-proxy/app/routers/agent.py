@@ -11,16 +11,18 @@ Authentication: X-Privaro-Key header (same as /v1/proxy/protect)
 import time
 import uuid
 import hashlib
+import os
+import base64
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from typing import Dict, Any
 
 import app.services.supabase as db
 import app.services.policy_engine as pe
 import app.services.detector as detector
 from app.services.auth import verify_api_key_or_dev
+from app.config import settings
 
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 
@@ -30,8 +32,8 @@ router = APIRouter(prefix="/v1/agent", tags=["agent"])
 class AgentRunStartRequest(BaseModel):
     pipeline_id: str
     agent_name: Optional[str] = None
-    agent_framework: Optional[str] = None   # langchain|crewai|autogen|custom
-    external_run_id: Optional[str] = None   # caller's own correlation ID
+    agent_framework: Optional[str] = None
+    external_run_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = {}
 
 
@@ -46,13 +48,13 @@ class AgentMessage(BaseModel):
     role: str = Field(..., description="user|assistant|tool|system")
     content: str = Field(..., min_length=1, max_length=100000)
     step_type: str = Field("prompt", description="prompt|tool_output|system|observation")
-    tool_name: Optional[str] = None          # for tool_output steps
+    tool_name: Optional[str] = None
 
 
 class AgentProtectRequest(BaseModel):
     agent_run_id: str
     messages: List[AgentMessage] = Field(..., min_items=1, max_items=50)
-    step_index: Optional[int] = None         # auto-incremented if not provided
+    step_index: Optional[int] = None
     mode: str = Field("tokenise", description="tokenise|anonymise|block")
 
 
@@ -125,14 +127,10 @@ async def agent_run_start(
         external_run_id=body.external_run_id,
         metadata=body.metadata or {},
     )
-
     if not run_id:
         raise HTTPException(status_code=500, detail={"error": "failed_to_create_run"})
 
-    return AgentRunStartResponse(
-        agent_run_id=run_id,
-        pipeline_id=body.pipeline_id,
-    )
+    return AgentRunStartResponse(agent_run_id=run_id, pipeline_id=body.pipeline_id)
 
 
 @router.post("/protect", response_model=AgentProtectResponse)
@@ -142,13 +140,13 @@ async def agent_protect(
 ):
     """
     Protect a step in an agent run.
-    Accepts an array of messages (prompt + tool outputs for this step).
+    Accepts an array of messages (prompt + tool outputs).
     Returns the same array with PII tokenised/anonymised.
+    Tokens are scoped to agent_run_id — same PII = same token throughout the run.
     """
     t0 = time.monotonic()
     request_id = f"agnt_{uuid.uuid4().hex[:12]}"
 
-    # Validate run belongs to this org
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
     if not run:
         raise HTTPException(status_code=404, detail={"error": "agent_run_not_found"})
@@ -160,11 +158,8 @@ async def agent_protect(
         raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
 
     org_id = pipeline["org_id"]
-
-    # Determine step index
     step_index = body.step_index if body.step_index is not None else run.get("step_count", 0)
 
-    # Load pipeline-scoped policies
     policies = await db.get_policy_rules(org_id, pipeline_id=run["pipeline_id"]) or []
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
     provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
@@ -173,12 +168,11 @@ async def agent_protect(
         "provider": pipeline.get("llm_provider", ""),
         "user_role": key_record.get("role", "developer"),
         "data_region": (provider_trust or {}).get("data_region", "EU"),
-        "agent_mode": True,          # always agent_mode for agent API
+        "agent_mode": True,
         "pipeline_sector": pipeline.get("sector", "general"),
         "default_action": body.mode,
     }
 
-    # Process each message
     protected_messages = []
     all_detections = []
     total_created = 0
@@ -191,20 +185,16 @@ async def agent_protect(
         if detections:
             if policies:
                 detections = pe.apply_policies(detections, policies, policy_context)
-
-            # Tokenise with agent_run_id scope
-            protected_content, tokens_in_msg = await _apply_agent_tokenisation(
+            protected_content, tokens_created_msg = await _apply_agent_tokenisation(
                 text=msg.content,
                 detections=detections,
                 org_id=org_id,
                 pipeline_id=run["pipeline_id"],
                 agent_run_id=body.agent_run_id,
             )
-            tokens_created_msg = tokens_in_msg
 
         all_detections.extend(detections)
         total_created += tokens_created_msg
-
         protected_messages.append(ProtectedMessage(
             role=msg.role,
             content=protected_content,
@@ -213,23 +203,19 @@ async def agent_protect(
             tokens_created=tokens_created_msg,
         ))
 
-    # Compute risk
     risk_score = pe.compute_risk_score(all_detections, provider_risk_level, True, 0)
     pii_detected = len(all_detections)
     pii_masked = sum(1 for d in all_detections if d.action in ("tokenised", "anonymised", "blocked"))
     gdpr_ok = all(d.action != "blocked" or d.severity != "critical" for d in all_detections)
     processing_ms = int((time.monotonic() - t0) * 1000)
 
-    # Persist step
     step_id = await db.create_agent_step(
         agent_run_id=body.agent_run_id,
         org_id=org_id,
         step_index=step_index,
         role=body.messages[0].role if body.messages else "user",
         step_type=body.messages[0].step_type if body.messages else "prompt",
-        prompt_hash=hashlib.sha256(
-            " ".join(m.content for m in body.messages).encode()
-        ).hexdigest()[:32],
+        prompt_hash=hashlib.sha256(" ".join(m.content for m in body.messages).encode()).hexdigest()[:32],
         pii_detected=pii_detected,
         pii_masked=pii_masked,
         risk_score=risk_score,
@@ -255,19 +241,46 @@ async def agent_reveal(
     body: AgentRevealRequest,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
-    """Detokenise text using the token map of a completed agent run."""
-
+    """
+    Detokenise text using the token map of an agent run.
+    Fetches all reversible tokens from vault, decrypts originals with
+    AES-256-GCM using the same ENCRYPTION_KEY as /v1/proxy/protect,
+    and replaces [TYPE-XXXX] tokens in the text with real values.
+    """
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
     if not run:
         raise HTTPException(status_code=404, detail={"error": "agent_run_not_found"})
 
-    # Fetch all reversible tokens for this run
-    token_map = await db.get_agent_run_token_map(
+    # Fetch raw vault rows (token_value + encrypted_original)
+    vault_rows = await db.get_agent_run_vault_rows(
         agent_run_id=body.agent_run_id,
         org_id=key_record["org_id"],
     )
 
-    # Replace tokens in text (longest first to avoid partial replacements)
+    if not vault_rows:
+        return AgentRevealResponse(
+            agent_run_id=body.agent_run_id,
+            revealed_text=body.text,
+            tokens_replaced=0,
+        )
+
+    # Decrypt each token's original value
+    enc_key = _get_encryption_key()
+    token_map: Dict[str, str] = {}
+
+    for row in vault_rows:
+        token_value = row.get("token_value")
+        encrypted_original = row.get("encrypted_original")
+        if not token_value or not encrypted_original:
+            continue
+        try:
+            original = _decrypt_aes_gcm(encrypted_original, enc_key)
+            token_map[token_value] = original
+        except Exception as e:
+            print(f"[Reveal] Failed to decrypt token {token_value}: {e}")
+            continue
+
+    # Replace tokens in text (longest token first to avoid partial matches)
     revealed = body.text
     count = 0
     for token_value, original in sorted(token_map.items(), key=lambda x: len(x[0]), reverse=True):
@@ -288,7 +301,6 @@ async def agent_run_end(
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """Close an agent run. Updates status and finalises aggregated counters."""
-
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
     if not run:
         raise HTTPException(status_code=404, detail={"error": "agent_run_not_found"})
@@ -297,9 +309,7 @@ async def agent_run_end(
     if not closed:
         raise HTTPException(status_code=500, detail={"error": "failed_to_close_run"})
 
-    # Re-fetch to get final counters
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
-
     return AgentRunEndResponse(
         agent_run_id=body.agent_run_id,
         status=run["status"],
@@ -311,7 +321,45 @@ async def agent_run_end(
     )
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# ── Crypto helpers ─────────────────────────────────────────────────────────────
+
+def _get_encryption_key() -> bytes:
+    """Return AES-256 key from settings. Same key used in /v1/proxy/protect."""
+    try:
+        return bytes.fromhex(settings.ENCRYPTION_KEY)
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "encryption_key_not_configured"}
+        )
+
+
+def _decrypt_aes_gcm(encrypted_b64: str, key: bytes) -> str:
+    """
+    Decrypt AES-256-GCM ciphertext.
+    Format: base64(nonce[12] + ciphertext + tag[16])
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    raw = base64.b64decode(encrypted_b64)
+    nonce = raw[:12]
+    ciphertext = raw[12:]
+    aesgcm = AESGCM(key)
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    return plaintext.decode("utf-8")
+
+
+# ── Tokenisation helper ────────────────────────────────────────────────────────
+
+def _make_token(entity_type: str, counter: int) -> str:
+    """Generate a token like [NM-0001], [ID-0002], etc."""
+    PREFIX_MAP = {
+        "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
+        "phone": "PH", "iban": "BK", "credit_card": "CC",
+        "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR",
+    }
+    prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
+    return f"[{prefix}-{counter:04d}]"
+
 
 async def _apply_agent_tokenisation(
     text: str,
@@ -322,26 +370,17 @@ async def _apply_agent_tokenisation(
 ) -> tuple[str, int]:
     """
     Apply tokenisation with agent_run_id scope.
-    Encrypts original values with AES-256-GCM, same as /v1/proxy/protect.
+    Encrypts originals AES-256-GCM. Persists to tokens_vault with agent_run_id.
     Returns (protected_text, tokens_created_count).
     """
-    import os
-    import base64
-    from app.routers.proxy import _make_token
-    from app.config import settings
-    import app.services.supabase as db_svc
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    # Setup encryption key
-    try:
-        enc_key = bytes.fromhex(settings.ENCRYPTION_KEY)
-    except Exception:
-        enc_key = os.urandom(32)
-
+    enc_key = _get_encryption_key()
     protected_text = text
     counters: Dict[str, int] = {}
     token_rows = []
 
-    # Sort detections descending by position to replace from end
+    # Sort descending by position to replace from end → no offset drift
     sorted_dets = sorted(
         [d for d in detections if d.start is not None and d.end is not None],
         key=lambda d: d.start,
@@ -359,28 +398,24 @@ async def _apply_agent_tokenisation(
             continue
 
         original_value = text[d.start:d.end]
-        entity_type = d.type.upper()[:2]
+        entity_type = d.type
         counters[entity_type] = counters.get(entity_type, 0) + 1
-        token = _make_token(d.type, counters[entity_type])
+        token = _make_token(entity_type, counters[entity_type])
         d.token = token
         protected_text = protected_text[:d.start] + token + protected_text[d.end:]
 
-        # Encrypt original value
-        try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            aesgcm = AESGCM(enc_key)
-            nonce = os.urandom(12)
-            ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
-            encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
-        except Exception:
-            encrypted = base64.b64encode(original_value.encode()).decode()
+        # Encrypt original value — AES-256-GCM, nonce prepended
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(enc_key)
+        ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+        encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
 
         token_rows.append({
             "org_id": org_id,
             "pipeline_id": pipeline_id,
             "agent_run_id": agent_run_id,
             "conversation_id": None,
-            "entity_type": d.type,
+            "entity_type": entity_type,
             "token_value": token,
             "encrypted_original": encrypted,
             "encryption_key_id": "key-v1",
@@ -388,6 +423,6 @@ async def _apply_agent_tokenisation(
         })
 
     if token_rows:
-        await db_svc.insert_tokens_batch(token_rows)
+        await db.insert_tokens_batch(token_rows)
 
     return protected_text, len(token_rows)
