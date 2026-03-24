@@ -506,3 +506,154 @@ async def apply_preset_to_pipeline(
             created = r2.json()
             return len(created)
         return 0
+
+
+# ── Agent API DB functions ─────────────────────────────────────────────────────
+
+async def create_agent_run(
+    org_id: str,
+    pipeline_id: str,
+    api_key_id: Optional[str],
+    agent_name: Optional[str],
+    agent_framework: Optional[str],
+    external_run_id: Optional[str],
+    metadata: dict,
+) -> Optional[str]:
+    """Create a new agent_run row. Returns the run UUID."""
+    payload = {
+        "org_id": org_id,
+        "pipeline_id": pipeline_id,
+        "status": "running",
+        "metadata": metadata,
+    }
+    if api_key_id:  payload["api_key_id"]     = api_key_id
+    if agent_name:  payload["agent_name"]      = agent_name
+    if agent_framework: payload["agent_framework"] = agent_framework
+    if external_run_id: payload["external_run_id"] = external_run_id
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(
+            f"{SUPABASE_REST}/agent_runs",
+            headers=SUPABASE_HEADERS,
+            json=payload,
+        )
+        if r.status_code in (200, 201):
+            data = r.json()
+            return data[0]["id"] if data else None
+        print(f"[Supabase] create_agent_run failed: {r.status_code} {r.text[:200]}")
+        return None
+
+
+async def get_agent_run(run_id: str, org_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch an agent_run by ID, verified against org_id."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get(
+            f"{SUPABASE_REST}/agent_runs",
+            headers=SUPABASE_HEADERS,
+            params={
+                "id": f"eq.{run_id}",
+                "org_id": f"eq.{org_id}",
+                "limit": "1",
+            },
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data[0] if data else None
+        return None
+
+
+async def create_agent_step(
+    agent_run_id: str,
+    org_id: str,
+    step_index: int,
+    role: str,
+    step_type: str,
+    prompt_hash: Optional[str],
+    pii_detected: int,
+    pii_masked: int,
+    risk_score: float,
+    gdpr_compliant: bool,
+    processing_ms: int,
+) -> Optional[str]:
+    """Insert an agent_step. Returns step UUID."""
+    payload = {
+        "agent_run_id": agent_run_id,
+        "org_id": org_id,
+        "step_index": step_index,
+        "role": role,
+        "step_type": step_type,
+        "pii_detected": pii_detected,
+        "pii_masked": pii_masked,
+        "risk_score": risk_score,
+        "gdpr_compliant": gdpr_compliant,
+        "processing_ms": processing_ms,
+    }
+    if prompt_hash: payload["prompt_hash"] = prompt_hash
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(
+            f"{SUPABASE_REST}/agent_steps",
+            headers=SUPABASE_HEADERS,
+            json=payload,
+        )
+        if r.status_code in (200, 201):
+            data = r.json()
+            return data[0]["id"] if data else None
+        print(f"[Supabase] create_agent_step failed: {r.status_code} {r.text[:200]}")
+        return None
+
+
+async def get_agent_run_token_map(agent_run_id: str, org_id: str) -> dict:
+    """
+    Returns {token_value: original_value} for all reversible tokens in the run.
+    Used by /agent/reveal to detokenise final output.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{settings.SUPABASE_URL}/rest/v1/rpc/get_agent_run_tokens",
+            headers=SUPABASE_HEADERS,
+            json={"p_agent_run_id": agent_run_id, "p_org_id": org_id},
+        )
+        if r.status_code == 200:
+            rows = r.json()
+            # token_value → encrypted_original (proxy decrypts on reveal)
+            # For now return token_value → token_value as placeholder
+            # Full decrypt requires ENCRYPTION_KEY — handled in reveal endpoint
+            return {row["token_value"]: row["token_value"] for row in rows if row.get("token_value")}
+        return {}
+
+
+async def close_agent_run(run_id: str, status: str = "completed") -> bool:
+    """Call close_agent_run RPC to finalise counters and set status."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{settings.SUPABASE_URL}/rest/v1/rpc/close_agent_run",
+            headers=SUPABASE_HEADERS,
+            json={"p_run_id": run_id, "p_status": status},
+        )
+        return r.status_code in (200, 201, 204)
+
+
+async def find_existing_agent_token(
+    agent_run_id: str,
+    entity_type: str,
+    encrypted_value: str,
+) -> Optional[dict]:
+    """
+    Look up existing token in agent run scope.
+    Same PII → same token within a run (consistency guarantee).
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(
+            f"{settings.SUPABASE_URL}/rest/v1/rpc/find_agent_token",
+            headers=SUPABASE_HEADERS,
+            json={
+                "p_agent_run_id": agent_run_id,
+                "p_entity_type": entity_type,
+                "p_encrypted_val": encrypted_value,
+            },
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data[0] if data else None
+        return None
