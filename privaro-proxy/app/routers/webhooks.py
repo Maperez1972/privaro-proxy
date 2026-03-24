@@ -10,21 +10,12 @@ router = APIRouter()
 
 
 def _validate_ibs_request(request: Request):
-    """
-    Valida que el webhook viene de iBS.
-    iBS envía Authorization: Bearer <bearer configurado al registrar el webhook>
-    Si no hay IBS_WEBHOOK_SECRET configurado, acepta sin validar (modo dev).
-    """
     from app.config import settings
     expected_secret = settings.IBS_WEBHOOK_SECRET or ""
-
     if not expected_secret:
-        # Sin secret configurado — aceptar todo (modo dev / webhook sin bearer)
         return
-
     auth_header = request.headers.get("Authorization", "")
     bearer_token = auth_header.replace("Bearer ", "").strip()
-
     if bearer_token != expected_secret:
         print(f"[Webhook] Unauthorized — bearer no coincide")
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
@@ -43,7 +34,7 @@ async def _process_evidence_certified(payload: dict) -> dict:
         data.get("certification_hash") or data.get("certificationHash")
         or data.get("tx_hash") or data.get("txHash")
     )
-    network = data.get("network", "polygon")
+    network = data.get("network", "fantom_opera_mainnet")
     certification_timestamp = (
         data.get("certification_timestamp") or data.get("certificationTimestamp")
         or data.get("certified_at")
@@ -55,6 +46,9 @@ async def _process_evidence_certified(payload: dict) -> dict:
         print(f"[Webhook] Missing evidence_id — payload: {payload}")
         return {"status": "ignored", "reason": "no evidence_id"}
 
+    results = []
+
+    # ── 1. Update audit_logs by evidence_id (individual + batch) ─────────────
     audit_log_id = await db.get_audit_log_id_by_evidence(evidence_id, title)
 
     if audit_log_id:
@@ -68,17 +62,50 @@ async def _process_evidence_certified(payload: dict) -> dict:
         if updated:
             await db.delete_ibs_sync_queue(audit_log_id)
             print(f"[Webhook] ✅ Audit log certified: {audit_log_id} → {certification_hash}")
-            return {"status": "certified", "type": "audit_log", "audit_log_id": audit_log_id}
+            results.append({"type": "audit_log", "id": audit_log_id})
 
-    # Fallback: buscar en vault_access_log (reveals y revokes)
+    # ── 2. Update all audit_logs with this batch evidence_id ──────────────────
+    # Batch certifications: multiple logs share the same ibs_evidence_id
+    if certification_hash:
+        await db.update_audit_logs_batch_hash(
+            evidence_id=evidence_id,
+            certification_hash=certification_hash,
+            network=network,
+            certified_at=certification_timestamp,
+        )
+
+    # ── 3. Update agent_runs with this evidence_id ────────────────────────────
+    if certification_hash:
+        agent_runs_updated = await db.update_agent_runs_ibs_hash(
+            evidence_id=evidence_id,
+            certification_hash=certification_hash,
+            network=network,
+            certified_at=certification_timestamp,
+        )
+        if agent_runs_updated > 0:
+            print(f"[Webhook] ✅ {agent_runs_updated} agent_run(s) hash updated → {certification_hash}")
+            results.append({"type": "agent_runs", "count": agent_runs_updated})
+
+    # ── 4. Update ibs_batches table ───────────────────────────────────────────
+    if certification_hash:
+        await db.update_ibs_batch_certified(
+            evidence_id=evidence_id,
+            certification_hash=certification_hash,
+            network=network,
+        )
+
+    # ── 5. Fallback: vault_access_log ─────────────────────────────────────────
     vault_updated = await db.update_vault_access_log_ibs(
         evidence_id=evidence_id,
         certification_hash=certification_hash or "",
         network=network,
     )
     if vault_updated:
-        print(f"[Webhook] ✅ Vault access certified: evidence={evidence_id} → {certification_hash}")
-        return {"status": "certified", "type": "vault_access", "evidence_id": evidence_id}
+        print(f"[Webhook] ✅ Vault access certified: evidence={evidence_id}")
+        results.append({"type": "vault_access", "evidence_id": evidence_id})
+
+    if results:
+        return {"status": "certified", "evidence_id": evidence_id, "updated": results}
 
     print(f"[Webhook] ⚠️ No matching record for evidence_id={evidence_id}")
     return {"status": "not_found", "evidence_id": evidence_id}
@@ -116,4 +143,3 @@ async def receive_ibs_signature_ko(request: Request):
         if audit_log_id:
             await db.update_audit_log_ibs_failed(audit_log_id, evidence_id)
     return {"status": "ko_received"}
-    
