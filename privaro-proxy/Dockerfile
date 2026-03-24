@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m spacy download es_core_news_md
 
 # Cache bust — increment to force rebuild of app layer
-ARG CACHE_BUST=11
+ARG CACHE_BUST=12
 COPY app/ ./app/
 
 # Non-root user
