@@ -679,3 +679,72 @@ async def get_agent_run_vault_rows(agent_run_id: str, org_id: str) -> list:
             return r.json()
         print(f"[Supabase] get_agent_run_vault_rows failed: {r.status_code} {r.text[:200]}")
         return []
+
+async def update_audit_logs_batch_hash(
+    evidence_id: str,
+    certification_hash: str,
+    network: str,
+    certified_at: Optional[str],
+) -> bool:
+    """
+    Update ALL audit_logs that share this batch evidence_id with the TX hash.
+    Called when iBS webhook arrives for a batch certification.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/audit_logs",
+            headers=SUPABASE_HEADERS,
+            params={"ibs_evidence_id": f"eq.{evidence_id}"},
+            json={
+                "ibs_certification_hash": certification_hash,
+                "ibs_network": network,
+                "ibs_certified_at": certified_at,
+            },
+        )
+        return response.status_code in (200, 201, 204)
+
+
+async def update_agent_runs_ibs_hash(
+    evidence_id: str,
+    certification_hash: str,
+    network: str,
+    certified_at: Optional[str],
+) -> int:
+    """
+    Update agent_runs that were certified in this batch with the TX hash.
+    Returns number of rows updated.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/agent_runs",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            params={"ibs_evidence_id": f"eq.{evidence_id}"},
+            json={
+                "ibs_certification_hash": certification_hash,
+                "ibs_network": network,
+                "ibs_certified_at": certified_at,
+            },
+        )
+        if response.status_code in (200, 201, 204):
+            data = response.json()
+            return len(data) if isinstance(data, list) else 0
+        return 0
+
+
+async def update_ibs_batch_certified(
+    evidence_id: str,
+    certification_hash: str,
+    network: str,
+) -> bool:
+    """Mark an ibs_batch as certified when webhook arrives."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/ibs_batches",
+            headers=SUPABASE_HEADERS,
+            params={"evidence_id": f"eq.{evidence_id}"},
+            json={
+                "status": "certified",
+                "certified_at": "now()",
+            },
+        )
+        return response.status_code in (200, 201, 204)
