@@ -226,6 +226,7 @@ async def protect_prompt(
             "by_type": stats["by_type"],
             "mode": body.options.mode.value,
             "risk_score": risk_score,
+            "conversation_id": body.conversation_id if body.conversation_id else None,
             "provider": pipeline.get("llm_provider", ""),
             "provider_risk_level": provider_risk_level,
         },
@@ -248,6 +249,7 @@ async def protect_prompt(
                 "detector_used": d.detector,
                 "detector_version": "regex-v1",
                 "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
+                "conversation_id": body.conversation_id if body.conversation_id else None,
                 "decision_reason": f"Policy: {d.action} for {d.type} in context provider={policy_context['provider']} role={policy_context['user_role']}",
             }
             for d in detections
@@ -359,6 +361,7 @@ async def proxy_test(
         "tier1_detections": len(tier1),
         "tier2_detections": len(tier2),
         "risk_score": pe.compute_risk_score(detections),
+        "conversation_id": body.conversation_id if body.conversation_id else None,
         "detections": [d.model_dump() for d in detections],
     }
 
