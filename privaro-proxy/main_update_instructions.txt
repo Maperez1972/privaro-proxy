@@ -1,0 +1,10 @@
+# Add this line to app/main.py where the other routers are registered:
+# 
+# from app.routers import proxy, agent, document
+# 
+# app.include_router(proxy.router, prefix="/v1/proxy", tags=["proxy"])
+# app.include_router(agent.router, prefix="/v1/agent", tags=["agent"])
+# app.include_router(document.router, prefix="/v1/proxy", tags=["document"])
+#
+# The document router uses prefix /v1/proxy so the endpoint is:
+# POST /v1/proxy/protect-document
