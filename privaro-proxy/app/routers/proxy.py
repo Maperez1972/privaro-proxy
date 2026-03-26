@@ -23,6 +23,7 @@ from app.services.auth import verify_api_key_or_dev
 from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
+from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 from app.config import settings
 
 router = APIRouter()
@@ -74,7 +75,7 @@ async def protect_prompt(
     6. Apply tokenisation based on resolved actions
     7. INSERT audit_log with risk_score
     8. INSERT pii_detections (with detector metadata)
-    9. INSERT tokens_vault (AES-256-GCM)
+    9. INSERT tokens_vault (AES-256-GCM) — BYOK-aware
     10. Return to client ~50ms
     11. BACKGROUND: iBS certification
     """
@@ -94,11 +95,10 @@ async def protect_prompt(
     # ── Step 2: Detect PII ───────────────────────────────────────────────────
     detections = detector.detect(body.prompt)
 
-    # ── Step 3: Load policies (pipeline-scoped + org fallback) + provider trust ─
+    # ── Step 3: Load policies + provider trust ────────────────────────────────
     policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
 
-    # Build evaluation context
     policy_context = {
         "provider": pipeline.get("llm_provider", ""),
         "user_role": key_record.get("role", "developer"),
@@ -107,14 +107,12 @@ async def protect_prompt(
         "pipeline_sector": pipeline.get("sector", "general"),
         "default_action": body.options.mode.value,
     }
-
     provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
 
     # ── Step 4: Apply contextual policy ──────────────────────────────────────
     if policies and detections:
         detections = pe.apply_policies(detections, policies, policy_context)
     else:
-        # Fallback: apply mode from request options
         for d in detections:
             d.action = "tokenised" if body.options.mode.value == "tokenise" else body.options.mode.value
 
@@ -257,16 +255,19 @@ async def protect_prompt(
         ]
         background_tasks.add_task(db.insert_pii_detections, detection_rows)
 
-    # ── Step 8: INSERT tokens_vault (conversation-scoped dedup) ──────────────
+    # ── Step 8: INSERT tokens_vault — BYOK-aware ──────────────────────────────
     if detections and audit_log_id and body.options.reversible:
+        # Resolve org encryption key (BYOK if configured, managed otherwise)
+        enc_key_id = await get_org_default_key_id(org_id)
         try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            enc_key_hex = settings.ENCRYPTION_KEY
-            enc_key = bytes.fromhex(enc_key_hex) if enc_key_hex else os.urandom(32)
-        except Exception:
-            enc_key = os.urandom(32)
+            enc_key = await resolve_encryption_key(enc_key_id, org_id)
+        except Exception as e:
+            print(f"[Vault] Key resolution failed, falling back to managed: {e}")
+            from app.services.key_manager import _get_managed_key
+            enc_key = _get_managed_key()
+            enc_key_id = "key-v1"
 
-        conversation_id = body.conversation_id  # None if no conversation context
+        conversation_id = body.conversation_id
 
         token_rows = []
         for d in detections:
@@ -282,7 +283,7 @@ async def protect_prompt(
                     print(f"[Vault] Encryption error: {e}")
                     continue
 
-                # ── Token consistency: reuse existing token within conversation ──
+                # Token consistency: reuse existing token within conversation
                 if conversation_id:
                     existing = await db.find_existing_token(
                         org_id=org_id,
@@ -291,10 +292,9 @@ async def protect_prompt(
                         encrypted_value=encrypted,
                     )
                     if existing:
-                        # Reuse the existing token — update detection token to match
                         d.token = existing["token_value"]
                         print(f"[Vault] Reusing token {d.token} for {d.type} in conv {conversation_id[:8]}")
-                        continue  # Don't insert duplicate
+                        continue
 
                 token_rows.append({
                     "org_id": org_id,
@@ -302,14 +302,18 @@ async def protect_prompt(
                     "entity_type": d.type,
                     "token_value": d.token,
                     "encrypted_original": encrypted,
-                    "encryption_key_id": "key-v1",
+                    "encryption_key_id": enc_key_id,   # ← BYOK-aware key_id
                     "is_reversible": True,
                     "access_roles": ["admin", "dpo"],
-                    "conversation_id": conversation_id,  # scope: None = global, uuid = conversation
+                    "conversation_id": conversation_id,
                 })
 
         if token_rows:
             background_tasks.add_task(db.insert_tokens_batch, token_rows)
+            # Track key usage (fire and forget)
+            background_tasks.add_task(
+                db.increment_encryption_key_usage, enc_key_id, len(token_rows)
+            )
 
     # ── Step 9: iBS certification ─────────────────────────────────────────────
     if audit_log_id:
