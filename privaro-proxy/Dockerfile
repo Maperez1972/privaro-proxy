@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Cache bust — increment to force full rebuild including pip + spacy model
-ARG CACHE_BUST=21
+ARG CACHE_BUST=22
 RUN echo "Cache bust: $CACHE_BUST"
 
 # Install Python deps (including Presidio + spaCy)
