@@ -1,5 +1,5 @@
 """
-Privaro Proxy API — v0.1.0 (MVP)
+Privaro Proxy API — v0.3.0
 Privacy Infrastructure for Enterprise AI · iCommunity Labs
 """
 from contextlib import asynccontextmanager
@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import proxy, health, webhooks, agent
+from app.routers import proxy, health, webhooks, agent, document
 from app.config import settings
 from app.services import ibs
 
@@ -51,8 +51,11 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(proxy.router, prefix="/v1/proxy", tags=["Privacy Proxy"])
 app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
 app.include_router(agent.router, tags=["Agent API"])
-from app.routers import document
-app.include_router(document.router, prefix="/v1/proxy", tags=["document"])
+app.include_router(document.router, prefix="/v1/proxy", tags=["Document"])
+
+# Phase 13 — BYOK / Key Management
+from app.routers import byok
+app.include_router(byok.router, tags=["BYOK"])
 
 
 @app.exception_handler(Exception)
