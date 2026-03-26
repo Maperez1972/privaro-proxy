@@ -748,3 +748,22 @@ async def update_ibs_batch_certified(
             },
         )
         return response.status_code in (200, 201, 204)
+
+async def increment_encryption_key_usage(key_id: str, count: int = 1) -> None:
+    """
+    Increment tokens_encrypted counter on encryption_keys table.
+    Fire-and-forget — non-critical, never breaks a request.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(
+                f"{settings.SUPABASE_URL}/rest/v1/rpc/increment_key_usage",
+                headers={
+                    "apikey": settings.SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"p_key_id": key_id, "p_count": count},
+            )
+    except Exception:
+        pass  # Non-critical — never fail a request over usage tracking
