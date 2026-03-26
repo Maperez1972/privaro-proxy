@@ -367,35 +367,42 @@ async def _apply_agent_tokenisation(
     org_id: str,
     pipeline_id: str,
     agent_run_id: str,
-) -> tuple[str, int]:
+) -> tuple:
     """
-    Apply tokenisation with agent_run_id scope.
-    Encrypts originals AES-256-GCM. Persists to tokens_vault with agent_run_id.
+    Apply tokenisation with agent_run_id scope — BYOK-aware.
+    Resolves org encryption key via key_manager (BYOK if configured).
     Returns (protected_text, tokens_created_count).
     """
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 
-    enc_key = _get_encryption_key()
+    # Resolve org encryption key — BYOK or managed
+    enc_key_id = await get_org_default_key_id(org_id)
+    try:
+        enc_key = await resolve_encryption_key(enc_key_id, org_id)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[Agent] Key resolution failed, using managed: {e}")
+        from app.services.key_manager import _get_managed_key
+        enc_key = _get_managed_key()
+        enc_key_id = "key-v1"
+
     protected_text = text
-    counters: Dict[str, int] = {}
+    counters: dict = {}
     token_rows = []
 
-    # Filter full_name false positives: must start with uppercase and have confidence >= 0.75
     def _is_valid_name(d) -> bool:
         if d.type != "full_name":
             return True
         if d.start is None or d.end is None:
             return False
         original = text[d.start:d.end]
-        # Must start with uppercase letter and be at least 3 chars
         if not original or not original[0].isupper() or len(original) < 3:
             return False
-        # Must have confidence >= 0.75
         if d.confidence < 0.75:
             return False
         return True
 
-    # Sort descending by position to replace from end → no offset drift
     sorted_dets = sorted(
         [d for d in detections
          if d.start is not None and d.end is not None and _is_valid_name(d)],
@@ -416,11 +423,19 @@ async def _apply_agent_tokenisation(
         original_value = text[d.start:d.end]
         entity_type = d.type
         counters[entity_type] = counters.get(entity_type, 0) + 1
-        token = _make_token(entity_type, counters[entity_type])
+
+        PREFIX_MAP = {
+            "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
+            "phone": "PH", "iban": "BK", "credit_card": "CC",
+            "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR",
+        }
+        prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
+        token = f"[{prefix}-{counters[entity_type]:04d}]"
         d.token = token
         protected_text = protected_text[:d.start] + token + protected_text[d.end:]
 
-        # Encrypt original value — AES-256-GCM, nonce prepended
+        # Encrypt with org key (BYOK or managed)
+        import os, base64
         nonce = os.urandom(12)
         aesgcm = AESGCM(enc_key)
         ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
@@ -434,11 +449,12 @@ async def _apply_agent_tokenisation(
             "entity_type": entity_type,
             "token_value": token,
             "encrypted_original": encrypted,
-            "encryption_key_id": "key-v1",
+            "encryption_key_id": enc_key_id,   # ← BYOK-aware
             "is_reversible": True,
         })
 
     if token_rows:
+        import app.services.supabase as db
         await db.insert_tokens_batch(token_rows)
 
     return protected_text, len(token_rows)
