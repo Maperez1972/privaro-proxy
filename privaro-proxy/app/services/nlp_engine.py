@@ -70,7 +70,9 @@ PRESIDIO_TO_PRIVARO = {
 }
 
 # Minimum confidence threshold for NLP results
-NLP_CONFIDENCE_THRESHOLD = 0.65
+# Raised from 0.65 → 0.75 to reduce false positives on capitalized text
+# (e.g. legal document headers, contract titles, clause references)
+NLP_CONFIDENCE_THRESHOLD = 0.75
 
 
 def detect_nlp(
@@ -113,6 +115,25 @@ def detect_nlp(
 
         entity_type, severity, base_confidence = mapping
         confidence = min(result.score, base_confidence)
+
+        # ── Post-NLP filter: full_name requires ≥2 consecutive capitalized words ──
+        # Avoids false positives on single capitalized words in legal documents,
+        # contract clause titles, article headers, etc.
+        # e.g. "CONTRATO", "CLÁUSULA", "Parte" → rejected
+        # e.g. "Juan García", "MIGUEL ÁNGEL PÉREZ" → accepted
+        if entity_type == "full_name":
+            span_text = text[start:end]
+            # Count consecutive capitalized tokens (words starting with uppercase
+            # or fully uppercase, excluding pure punctuation/numbers)
+            import re as _re
+            tokens = span_text.split()
+            cap_tokens = [t for t in tokens if _re.match(r'^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñA-ZÁÉÍÓÚÜÑ]*$', t)]
+            if len(cap_tokens) < 2:
+                logger.debug(
+                    f"[NLP] Skipping full_name false positive: '{span_text}' "
+                    f"(only {len(cap_tokens)} capitalized word(s))"
+                )
+                continue
 
         new_detections.append(Detection(
             type=entity_type,
