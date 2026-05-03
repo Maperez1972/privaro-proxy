@@ -2,22 +2,19 @@
 Relay Router — POST /v1/relay/complete
 
 Full-cycle endpoint:
-    1. Receive prompt + pipeline_id + provider config
+    1. Receive messages + pipeline_id
     2. Detect & tokenise PII (same as /v1/proxy/protect)
-    3. Route tokenised messages to the configured LLM provider
-    4. Optionally de-tokenise the LLM response
-    5. Return protected prompt + LLM response + audit trail
+    3. Fetch customer API key from llm_providers (decrypted in-memory)
+    4. Route tokenised messages to configured LLM provider
+    5. Optionally de-tokenise LLM response
+    6. Return response + audit trail + iBS certification
 
-This is the "one-shot" endpoint for ISVs who want Privaro to handle
-both the privacy layer AND the LLM call transparently.
-
-Supported providers: anthropic | openai | mistral | gemini
+The customer configures their LLM provider API keys at /app/admin/providers.
+Privaro stores them encrypted and decrypts them only at request time.
 """
 import time
 import uuid
 import hashlib
-import os
-import base64
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
@@ -29,7 +26,6 @@ from app.services import detector
 from app.services import policy_engine as pe
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 from app.services.llm_router import route, LLMRouterError, list_providers
-from app.config import settings
 
 router = APIRouter(prefix="/v1/relay", tags=["relay"])
 
@@ -40,8 +36,8 @@ class RelayMessage(BaseModel):
 
 
 class RelayOptions(BaseModel):
-    mode: str = "tokenise"              # tokenise | anonymise | block
-    detokenise_response: bool = True    # Replace tokens in LLM response
+    mode: str = "tokenise"
+    detokenise_response: bool = True
     include_detections: bool = True
     max_tokens: int = 2048
     temperature: float = 0.7
@@ -53,7 +49,6 @@ class RelayRequest(BaseModel):
     messages: List[RelayMessage] = Field(..., min_items=1, max_items=50)
     provider: Optional[str] = None      # Override pipeline provider
     model: Optional[str] = None         # Override pipeline model
-    customer_api_key: Optional[str] = None  # Customer-provided LLM key
     options: RelayOptions = RelayOptions()
     conversation_id: Optional[str] = None
 
@@ -62,16 +57,13 @@ class RelayResponse(BaseModel):
     request_id: str
     provider: str
     model: str
-    # Privacy layer results
-    protected_messages: List[Dict]      # Messages sent to LLM (tokenised)
+    protected_messages: List[Dict]
     pii_detected: int
     pii_masked: int
     risk_score: float
     gdpr_compliant: bool
-    # LLM response
-    response: str                       # Final response (de-tokenised if requested)
-    response_raw: Optional[str] = None  # Raw LLM response with tokens (if detokenise=True)
-    # Audit
+    response: str
+    response_raw: Optional[str] = None
     audit_log_id: Optional[str] = None
     tokens_replaced: int = 0
     usage: Dict[str, Any] = {}
@@ -85,11 +77,11 @@ async def relay_complete(
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """
-    Full-cycle privacy relay:
-    Detect PII → Tokenise → Call LLM → De-tokenise → Return
+    Full-cycle privacy relay.
 
-    The LLM never sees raw PII. Every interaction is audit-logged and
-    blockchain-certified via iBS.
+    Privaro fetches the customer's LLM API key from their provider config
+    (/app/admin/providers), decrypts it in-memory, and routes the tokenised
+    request to their LLM. The key is never logged or stored beyond the request.
     """
     t0 = time.monotonic()
     request_id = f"relay_{uuid.uuid4().hex[:12]}"
@@ -108,11 +100,8 @@ async def relay_complete(
     # ── 2. Protect all messages ───────────────────────────────────────────────
     protected_messages = []
     all_detections = []
-    token_map: Dict[str, str] = {}  # token → original (for de-tokenisation)
-    enc_key = None
-    enc_key_id = None
-    
-    # Resolve encryption key once for all messages
+    token_map: Dict[str, str] = {}
+
     enc_key_id = await get_org_default_key_id(org_id)
     try:
         enc_key = await resolve_encryption_key(enc_key_id, org_id)
@@ -134,14 +123,20 @@ async def relay_complete(
         "default_action": body.options.mode,
     }
 
+    PREFIX_MAP = {
+        "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
+        "credit_card": "CC", "email": "EM", "phone": "PH",
+        "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT",
+    }
+
     for msg in body.messages:
         detections = detector.detect(msg.content)
-        
         if detections and policies:
             detections = pe.apply_policies(detections, policies, policy_context)
         elif detections:
             for d in detections:
-                d.action = body.options.mode if body.options.mode in ("tokenise", "anonymise", "block") else "tokenised"
+                d.action = body.options.mode if body.options.mode in (
+                    "tokenise", "anonymise", "block") else "tokenised"
 
         protected_content = msg.content
         counters: Dict[str, int] = {}
@@ -150,26 +145,19 @@ async def relay_complete(
             if d.start is None or d.end is None:
                 continue
             original_value = msg.content[d.start:d.end]
-
             if d.action in ("tokenised", "pseudonymised", "tokenise"):
                 entity_type = d.type
                 counters[entity_type] = counters.get(entity_type, 0) + 1
-                prefix_map = {
-                    "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
-                    "credit_card": "CC", "email": "EM", "phone": "PH",
-                    "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT",
-                }
-                prefix = prefix_map.get(entity_type, entity_type[:2].upper())
+                prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
                 token = f"[{prefix}-{counters[entity_type]:04d}]"
                 d.token = token
                 d.action = "tokenised"
-                # Store reverse mapping for de-tokenisation
                 token_map[token] = original_value
                 protected_content = protected_content[:d.start] + token + protected_content[d.end:]
-
             elif d.action in ("anonymised", "anonymise"):
                 d.action = "anonymised"
-                protected_content = protected_content[:d.start] + f"[{d.type.upper()}]" + protected_content[d.end:]
+                protected_content = (protected_content[:d.start] +
+                                     f"[{d.type.upper()}]" + protected_content[d.end:])
 
         all_detections.extend(detections)
         protected_messages.append({"role": msg.role, "content": protected_content})
@@ -179,13 +167,13 @@ async def relay_complete(
     pii_masked = sum(1 for d in all_detections if d.action in ("tokenised", "anonymised"))
     gdpr_compliant = all(d.action != "blocked" for d in all_detections)
 
-    # ── 3. Call LLM provider ──────────────────────────────────────────────────
+    # ── 3. Call LLM — key fetched from customer's provider config ────────────
     try:
         llm_result = await route(
             provider=provider,
             messages=protected_messages,
+            org_id=org_id,          # ← key resolved from llm_providers table
             model=model,
-            customer_api_key=body.customer_api_key,
             max_tokens=body.options.max_tokens,
             temperature=body.options.temperature,
             system=body.options.system_prompt,
@@ -193,7 +181,12 @@ async def relay_complete(
     except LLMRouterError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
-            detail={"error": "llm_provider_error", "message": str(e), "provider": e.provider}
+            detail={
+                "error": "llm_provider_error",
+                "message": str(e),
+                "provider": e.provider,
+                "hint": "Configure your LLM provider API key at /app/admin/providers"
+            }
         )
 
     # ── 4. De-tokenise response ───────────────────────────────────────────────
@@ -239,9 +232,8 @@ async def relay_complete(
     })
 
     if audit_log_id:
-        background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id, {
-            "request_id": request_id, "provider": provider
-        })
+        background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
+                                   {"request_id": request_id, "provider": provider})
 
     return RelayResponse(
         request_id=request_id,
