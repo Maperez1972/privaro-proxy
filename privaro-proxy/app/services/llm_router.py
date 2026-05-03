@@ -1,27 +1,27 @@
 """
 LLM Router — Multi-provider relay for Privaro proxy.
 
-Supports: Anthropic Claude, OpenAI (GPT-4/3.5), Mistral, Google Gemini.
-Provider is resolved from the pipeline configuration in Supabase.
+Supports: Anthropic Claude, OpenAI (GPT-4), Mistral, Google Gemini.
 
-Each provider uses a unified interface:
-    result = await route(provider, model, messages, api_key, options)
-    → {"content": str, "model": str, "usage": dict, "provider": str}
+IMPORTANT: API keys are customer-owned and stored encrypted in Supabase
+(llm_providers.api_key_encrypted). Privaro never stores them in plaintext.
+The ENCRYPTION_KEY env var (Railway) is Privaro's key to decrypt them at runtime.
 
-Environment variables (set in Railway):
-    ANTHROPIC_API_KEY   — for Claude
-    OPENAI_API_KEY      — for GPT-4
-    MISTRAL_API_KEY     — for Mistral
-    GOOGLE_API_KEY      — for Gemini
-    
-    Customers can also provide their own keys via the pipeline config
-    (stored encrypted in Supabase).
+Flow:
+    1. Client calls /v1/relay/complete with pipeline_id
+    2. Relay reads pipeline.llm_provider → looks up llm_providers table
+    3. Decrypts customer API key with ENCRYPTION_KEY (AES-256-GCM)
+    4. Routes to provider with decrypted key
+    5. Key is never logged or persisted beyond the request
 """
 from __future__ import annotations
 import json
 import os
+import base64
 from typing import Any, Dict, List, Optional
 import httpx
+
+from app.config import settings
 
 # ── Provider constants ────────────────────────────────────────────────────────
 PROVIDERS = {
@@ -62,57 +62,96 @@ class LLMRouterError(Exception):
 
 
 def _resolve_provider(provider_name: str) -> str:
-    """Normalise provider name to canonical key."""
     p = provider_name.lower().strip()
     return PROVIDER_ALIASES.get(p, p)
 
 
-def _get_api_key(provider: str, customer_key: Optional[str] = None) -> str:
+def _decrypt_api_key(encrypted_b64: str) -> str:
     """
-    Resolve API key for provider.
-    Priority: customer-provided key > environment variable.
+    Decrypt a customer API key stored in llm_providers.api_key_encrypted.
+    Uses Privaro's ENCRYPTION_KEY (AES-256-GCM) — same scheme as token vault.
     """
-    if customer_key:
-        return customer_key
-    
-    env_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "mistral": "MISTRAL_API_KEY",
-        "gemini": "GOOGLE_API_KEY",
-    }
-    env_key = env_map.get(provider)
-    if not env_key:
-        raise LLMRouterError(f"Unknown provider: {provider}", provider)
-    
-    key = os.getenv(env_key)
-    if not key:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    try:
+        enc_key = bytes.fromhex(settings.ENCRYPTION_KEY)
+        raw = base64.b64decode(encrypted_b64)
+        nonce = raw[:12]
+        ciphertext = raw[12:]
+        aesgcm = AESGCM(enc_key)
+        return aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+    except Exception as e:
         raise LLMRouterError(
-            f"No API key for {provider}. Set {env_key} in Railway environment variables.",
-            provider, 503
+            f"Failed to decrypt customer API key: {e}. "
+            "Check ENCRYPTION_KEY environment variable.",
+            status_code=500
         )
-    return key
 
 
-# ── Provider implementations ──────────────────────────────────────────────────
+async def get_customer_api_key(org_id: str, provider: str) -> str:
+    """
+    Fetch and decrypt the customer's API key for a provider from Supabase.
+    
+    Looks up llm_providers table:
+        org_id = {org_id}
+        provider = {provider}  (e.g. "anthropic", "openai")
+        is_active = true
+    
+    Raises LLMRouterError if no active provider config found.
+    """
+    import httpx as _httpx
+
+    provider_canonical = _resolve_provider(provider)
+    
+    url = f"{settings.SUPABASE_URL}/rest/v1/llm_providers"
+    headers = {
+        "apikey": settings.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    params = {
+        "org_id": f"eq.{org_id}",
+        "provider": f"eq.{provider_canonical}",
+        "is_active": "eq.true",
+        "select": "id,provider,api_key_encrypted,api_key_hint,available_models",
+        "limit": "1",
+    }
+    
+    async with _httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            raise LLMRouterError(
+                f"Failed to fetch provider config from Supabase: {resp.status_code}",
+                provider_canonical, 500
+            )
+        rows = resp.json()
+    
+    if not rows:
+        raise LLMRouterError(
+            f"No active {provider_canonical} provider configured for this organisation. "
+            f"Add your API key at /app/admin/providers.",
+            provider_canonical, 503
+        )
+    
+    row = rows[0]
+    if not row.get("api_key_encrypted"):
+        raise LLMRouterError(
+            f"Provider {provider_canonical} is configured but has no API key. "
+            f"Add your API key at /app/admin/providers.",
+            provider_canonical, 503
+        )
+    
+    return _decrypt_api_key(row["api_key_encrypted"])
+
+
+# ── Provider call implementations ─────────────────────────────────────────────
 
 async def _call_anthropic(
-    model: str,
-    messages: List[Dict],
-    api_key: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7,
     system: Optional[str] = None,
 ) -> Dict:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    # Separate system message from conversation
     sys_msg = system or next((m["content"] for m in messages if m["role"] == "system"), None)
     conv_messages = [m for m in messages if m["role"] != "system"]
-
     body: Dict[str, Any] = {
         "model": model or PROVIDERS["anthropic"]["default_model"],
         "max_tokens": max_tokens,
@@ -121,145 +160,96 @@ async def _call_anthropic(
     }
     if sys_msg:
         body["system"] = sys_msg
-
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
-            headers=headers, json=body
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json=body
         )
         if resp.status_code != 200:
-            raise LLMRouterError(
-                f"Anthropic API error {resp.status_code}: {resp.text[:200]}",
-                "anthropic", resp.status_code
-            )
+            raise LLMRouterError(f"Anthropic error {resp.status_code}: {resp.text[:300]}",
+                                 "anthropic", resp.status_code)
         data = resp.json()
         return {
             "content": data["content"][0]["text"],
             "model": data["model"],
             "provider": "anthropic",
-            "usage": {
-                "input_tokens": data["usage"]["input_tokens"],
-                "output_tokens": data["usage"]["output_tokens"],
-            },
+            "usage": {"input_tokens": data["usage"]["input_tokens"],
+                      "output_tokens": data["usage"]["output_tokens"]},
         }
 
 
 async def _call_openai(
-    model: str,
-    messages: List[Dict],
-    api_key: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-    **kwargs,
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
 ) -> Dict:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": model or PROVIDERS["openai"]["default_model"],
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
-            headers=headers, json=body
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model or PROVIDERS["openai"]["default_model"],
+                  "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         )
         if resp.status_code != 200:
-            raise LLMRouterError(
-                f"OpenAI API error {resp.status_code}: {resp.text[:200]}",
-                "openai", resp.status_code
-            )
+            raise LLMRouterError(f"OpenAI error {resp.status_code}: {resp.text[:300]}",
+                                 "openai", resp.status_code)
         data = resp.json()
         return {
             "content": data["choices"][0]["message"]["content"],
-            "model": data["model"],
-            "provider": "openai",
+            "model": data["model"], "provider": "openai",
             "usage": data.get("usage", {}),
         }
 
 
 async def _call_mistral(
-    model: str,
-    messages: List[Dict],
-    api_key: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-    **kwargs,
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
 ) -> Dict:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": model or PROVIDERS["mistral"]["default_model"],
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.mistral.ai/v1/chat/completions",
-            headers=headers, json=body
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model or PROVIDERS["mistral"]["default_model"],
+                  "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         )
         if resp.status_code != 200:
-            raise LLMRouterError(
-                f"Mistral API error {resp.status_code}: {resp.text[:200]}",
-                "mistral", resp.status_code
-            )
+            raise LLMRouterError(f"Mistral error {resp.status_code}: {resp.text[:300]}",
+                                 "mistral", resp.status_code)
         data = resp.json()
         return {
             "content": data["choices"][0]["message"]["content"],
-            "model": data["model"],
-            "provider": "mistral",
+            "model": data["model"], "provider": "mistral",
             "usage": data.get("usage", {}),
         }
 
 
 async def _call_gemini(
-    model: str,
-    messages: List[Dict],
-    api_key: str,
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-    **kwargs,
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
 ) -> Dict:
-    # Convert messages to Gemini format
-    contents = []
-    for m in messages:
-        role = "user" if m["role"] in ("user", "system") else "model"
-        contents.append({"role": role, "parts": [{"text": m["content"]}]})
-
-    body = {
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": temperature,
-        },
-    }
+    contents = [
+        {"role": "user" if m["role"] in ("user", "system") else "model",
+         "parts": [{"text": m["content"]}]}
+        for m in messages
+    ]
     model_id = model or PROVIDERS["gemini"]["default_model"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=body)
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}",
+            json={"contents": contents,
+                  "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature}}
+        )
         if resp.status_code != 200:
-            raise LLMRouterError(
-                f"Gemini API error {resp.status_code}: {resp.text[:200]}",
-                "gemini", resp.status_code
-            )
+            raise LLMRouterError(f"Gemini error {resp.status_code}: {resp.text[:300]}",
+                                 "gemini", resp.status_code)
         data = resp.json()
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
         usage = data.get("usageMetadata", {})
         return {
-            "content": content,
-            "model": model_id,
-            "provider": "gemini",
-            "usage": {
-                "input_tokens": usage.get("promptTokenCount", 0),
-                "output_tokens": usage.get("candidatesTokenCount", 0),
-            },
+            "content": data["candidates"][0]["content"]["parts"][0]["text"],
+            "model": model_id, "provider": "gemini",
+            "usage": {"input_tokens": usage.get("promptTokenCount", 0),
+                      "output_tokens": usage.get("candidatesTokenCount", 0)},
         }
 
 
@@ -268,32 +258,34 @@ async def _call_gemini(
 async def route(
     provider: str,
     messages: List[Dict],
+    org_id: str,
     model: Optional[str] = None,
-    customer_api_key: Optional[str] = None,
     max_tokens: int = 2048,
     temperature: float = 0.7,
     system: Optional[str] = None,
 ) -> Dict:
     """
-    Route a chat completion request to the specified LLM provider.
+    Route a request to the customer's configured LLM provider.
+    
+    Reads and decrypts the customer API key from Supabase llm_providers table.
+    The key is decrypted in-memory and never logged or persisted.
     
     Args:
-        provider:          Provider name (anthropic|openai|mistral|gemini)
-        messages:          List of {"role": "user"|"assistant"|"system", "content": str}
-        model:             Model name (uses provider default if None)
-        customer_api_key:  Customer-provided API key (overrides env var)
-        max_tokens:        Maximum tokens in response
-        temperature:       Sampling temperature (0.0–1.0)
-        system:            System prompt (for providers that support it)
-    
-    Returns:
-        {"content": str, "model": str, "provider": str, "usage": dict}
+        provider:   Provider name (anthropic|openai|mistral|gemini)
+        messages:   Chat messages (already tokenised by Privaro)
+        org_id:     Customer org ID — used to fetch their API key
+        model:      Model override (uses pipeline default if None)
+        max_tokens: Max response tokens
+        temperature: Sampling temperature
+        system:     System prompt
     
     Raises:
-        LLMRouterError on provider errors or missing API keys
+        LLMRouterError if provider not configured or API key missing
     """
     provider = _resolve_provider(provider)
-    api_key = _get_api_key(provider, customer_api_key)
+    
+    # Fetch customer API key from Supabase (decrypted in-memory)
+    api_key = await get_customer_api_key(org_id, provider)
 
     CALLERS = {
         "anthropic": _call_anthropic,
@@ -301,24 +293,17 @@ async def route(
         "mistral": _call_mistral,
         "gemini": _call_gemini,
     }
-
     caller = CALLERS.get(provider)
     if not caller:
         raise LLMRouterError(
             f"Unsupported provider: {provider}. Supported: {list(CALLERS.keys())}",
             provider, 400
         )
-
     return await caller(
-        model=model,
-        messages=messages,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system,
+        model=model, messages=messages, api_key=api_key,
+        max_tokens=max_tokens, temperature=temperature, system=system,
     )
 
 
 def list_providers() -> Dict:
-    """Return supported providers and their models."""
     return {k: v for k, v in PROVIDERS.items()}
