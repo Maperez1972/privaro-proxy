@@ -1,6 +1,10 @@
 """
 Configuration — reads from environment variables.
 All secrets are injected by Railway in production, .env file in development.
+
+NOTE: LLM provider API keys (Anthropic, OpenAI, etc.) are NOT stored here.
+They are customer-owned, stored encrypted in Supabase (llm_providers table),
+and decrypted in-memory at request time by the LLM router.
 """
 from pydantic_settings import BaseSettings
 from typing import List, Optional
@@ -12,23 +16,19 @@ class Settings(BaseSettings):
 
     # ── Supabase ───────────────────────────────────────────────────
     SUPABASE_URL: str
-    SUPABASE_SERVICE_KEY: str          # service_role key — bypasses RLS for server writes
+    SUPABASE_SERVICE_KEY: str
 
     # ── Encryption ────────────────────────────────────────────────
-    ENCRYPTION_KEY: str = "0" * 64    # required in production — generate with secrets.token_hex(32)
+    # Used to decrypt customer LLM API keys stored in llm_providers table
+    # and to encrypt/decrypt PII tokens in the vault.
+    ENCRYPTION_KEY: str = "0" * 64
 
     # ── iBS (Blockchain Evidence) ──────────────────────────────────
     IBS_API_KEY: str = ""
     IBS_WEBHOOK_SECRET: str = ""
     IBS_API_BASE: str = "https://api.icommunitylabs.com/v2"
 
-    # ── LLM Provider API Keys (for multi-provider relay) ──────────
-    ANTHROPIC_API_KEY: Optional[str] = None    # Claude models
-    OPENAI_API_KEY: Optional[str] = None       # GPT-4 models
-    MISTRAL_API_KEY: Optional[str] = None      # Mistral models
-    GOOGLE_API_KEY: Optional[str] = None       # Gemini models
-
-    # ── Development only (never set in production) ─────────────────
+    # ── Development only ───────────────────────────────────────────
     PRIVARO_DEV_KEY: Optional[str] = None
     DEV_ORG_ID: Optional[str] = None
 
