@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     IBS_WEBHOOK_SECRET: str = ""
     IBS_API_BASE: str = "https://api.icommunitylabs.com/v2"
 
+    # ── LLM Provider API Keys (for multi-provider relay) ──────────
+    ANTHROPIC_API_KEY: Optional[str] = None    # Claude models
+    OPENAI_API_KEY: Optional[str] = None       # GPT-4 models
+    MISTRAL_API_KEY: Optional[str] = None      # Mistral models
+    GOOGLE_API_KEY: Optional[str] = None       # Gemini models
+
     # ── Development only (never set in production) ─────────────────
     PRIVARO_DEV_KEY: Optional[str] = None
     DEV_ORG_ID: Optional[str] = None
@@ -41,7 +47,7 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": True,
-        "extra": "ignore",  # ignora variables del .env no declaradas aquí
+        "extra": "ignore",
     }
 
 
