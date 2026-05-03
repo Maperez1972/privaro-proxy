@@ -23,9 +23,11 @@ from app.models.schemas import Detection
 # Each entry: (entity_type, severity, pattern, confidence)
 PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
 
-    # DNI: 8 digits + letter. NIE: X/Y/Z + 7 digits + letter
+    # DNI / NIF: optional "DNI:" prefix + 8 digits + letter
+    # Group 1 captures ONLY the number — excludes "DNI: " prefix from span.
+    # Standalone 8-digit+letter without prefix also matched (group 1 only).
     ("dni", "critical",
-     re.compile(r'\b(?:DNI|NIF|NIE)?[\s:]*([XYZxyz]?\d{7,8}[A-Za-z])\b'),
+     re.compile(r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b|\b([XYZxyz]?\d{8}[A-Za-z])\b'),
      0.95),
 
     # IBAN ES: ES + 2 check digits + 20 digits (spaces optional)
@@ -43,18 +45,26 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),
      0.99),
 
-    # Spanish phone: +34 or 6xx/7xx/9xx, 9 digits
+    # Spanish phone — covers all common ES formats:
+    #   677 23 45 67  (3+2+2+2)
+    #   677 234 567   (3+3+3)
+    #   677-23-45-67  (dashes)
+    #   +34 677 234 567
+    # Anchored: must NOT be preceded or followed by a digit (avoids IBAN/CC fragments)
     ("phone", "high",
-     re.compile(r'(?:\+34[\s-]?)?(?:6\d{2}|7[1-9]\d|9\d{2})[\s-]?\d{3}[\s-]?\d{3}\b'),
+     re.compile(
+         r'(?<!\d)(?:\+34[\s-]?)?(?:6\d{2}|7[1-9]\d|9\d{2})'
+         r'(?:[\s-]?\d{2,3}){2,3}'
+         r'(?!\d)'
+     ),
      0.90),
 
-    # International phone (loose): +XX format
+    # International phone (loose): +XX format, not Spain
     ("phone", "medium",
      re.compile(r'\+(?!34)\d{1,3}[\s-]?\(?\d{1,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}\b'),
      0.75),
 
-    # SIP (Sistema de Información de Población) / Health card ES
-    # Format: XXXX-XXXXXXXX-XX (varies by region)
+    # SIP / Health card ES (group 1 = number only)
     ("health_record", "critical",
      re.compile(r'\b(?:SIP|TSI|CIP)[\s:]*([A-Z0-9]{8,16})\b', re.IGNORECASE),
      0.85),
@@ -64,16 +74,17 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'),
      0.99),
 
-    # Date of birth patterns (common formats)
+    # Date of birth patterns — group 1 = date only, excludes keyword
     ("date_of_birth", "medium",
      re.compile(r'\b(?:nacido?|born|dob|f\.?nac\.?)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b', re.IGNORECASE),
      0.85),
 
-    # Full name heuristic: 2-3 capitalized words, typical Spanish surnames
-    # Triggered by keywords: paciente, nombre, cliente, empleado, sr/sra, don/doña
+    # Full name heuristic — keyword-triggered, group 1 = name only
+    # Keywords: solicitante covers mortgage/loan context (Gibobs use case)
     ("full_name", "low",
      re.compile(
-         r'(?:paciente|nombre|cliente|empleado|trabajador|sr\.?|sra\.?|don|doña|mr\.?|ms\.?|mrs\.?)[\s:]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})',
+         r'(?:paciente|solicitante|nombre|cliente|empleado|trabajador|cotitular'
+         r'|sr\.?|sra\.?|don|doña|mr\.?|ms\.?|mrs\.?)[\s:]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})',
          re.IGNORECASE
      ),
      0.80),
@@ -128,7 +139,15 @@ def detect(text: str, use_nlp: bool = True) -> List[Detection]:
     # ── Tier 1: Regex ────────────────────────────────────────────────────────
     for entity_type, severity, pattern, confidence in PATTERNS:
         for match in pattern.finditer(text):
-            start, end = match.start(), match.end()
+            # If pattern has capturing group(s), use the first non-None group
+            # span — this excludes keyword prefixes like "DNI:", "nacido:", etc.
+            # from the detection span so only the PII value itself is tokenised.
+            grp = next(
+                (i for i in range(1, pattern.groups + 1) if match.group(i) is not None),
+                None
+            )
+            start = match.start(grp) if grp else match.start()
+            end   = match.end(grp)   if grp else match.end()
 
             if any(s <= start < e or s < end <= e for s, e in seen_spans):
                 continue

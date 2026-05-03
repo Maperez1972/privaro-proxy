@@ -135,6 +135,26 @@ def detect_nlp(
                 )
                 continue
 
+            # ── Additional filter: reject ALL-CAPS domain/financial terms ──────
+            # Presidio sometimes classifies financial/document header terms as
+            # PERSON when they appear in ALL-CAPS (e.g. "SCORING HIPOTECARIO",
+            # "INFORME CREDITICIO", "CIRBE SCORE"). These are never person names.
+            ALL_CAPS_STOP = {
+                "SCORING", "HIPOTECARIO", "HIPOTECARIA", "INFORME", "CREDITICIO",
+                "CREDITICIA", "CIRBE", "CONTRATO", "CLÁUSULA", "CLAUSULA",
+                "ANEXO", "ARTÍCULO", "ARTICULO", "SECCIÓN", "SECCION",
+                "CONDICIONES", "GENERALES", "PARTICULARES", "PRÉSTAMO",
+                "PRESTAMO", "FINANCIERO", "FINANCIERA", "BANCARIO", "BANCARIA",
+                "RIESGO", "EVALUACIÓN", "EVALUACION", "DICTAMEN", "RESOLUCIÓN",
+                "RESOLUCION", "APROBADO", "DENEGADO", "PENDIENTE",
+            }
+            words_upper = set(span_text.upper().split())
+            if words_upper & ALL_CAPS_STOP:
+                logger.debug(
+                    f"[NLP] Skipping ALL-CAPS domain term as full_name: '{span_text}'"
+                )
+                continue
+
         new_detections.append(Detection(
             type=entity_type,
             severity=severity,
