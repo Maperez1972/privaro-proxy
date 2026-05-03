@@ -767,3 +767,59 @@ async def increment_encryption_key_usage(key_id: str, count: int = 1) -> None:
             )
     except Exception:
         pass  # Non-critical — never fail a request over usage tracking
+
+
+# ══════════════════════════════════════════════════════════════════════
+# OUTBOUND WEBHOOK HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+async def get_org_webhooks(org_id: str, event_type: str) -> list:
+    """Fetch active webhooks for an org that subscribe to a given event."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/org_webhooks",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "is_active": "eq.true",
+                "select": "id,url,secret,events",
+            },
+        )
+        if response.status_code != 200:
+            return []
+        rows = response.json()
+        # Filter by event subscription
+        return [r for r in rows if event_type in (r.get("events") or [])]
+
+
+async def log_webhook_delivery(
+    webhook_id: str,
+    org_id: str,
+    event_type: str,
+    payload: dict,
+    status: str,
+    http_status: int | None,
+    response_body: str,
+    attempts: int,
+) -> None:
+    """Log a webhook delivery attempt."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{SUPABASE_REST}/webhook_deliveries",
+                headers=SUPABASE_HEADERS,
+                json={
+                    "webhook_id": webhook_id,
+                    "org_id": org_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                    "status": status,
+                    "http_status": http_status,
+                    "response_body": response_body,
+                    "attempts": attempts,
+                    "last_attempt_at": "now()",
+                    "delivered_at": "now()" if status == "delivered" else None,
+                },
+            )
+    except Exception as e:
+        print(f"[Webhook] Failed to log delivery: {e}")
