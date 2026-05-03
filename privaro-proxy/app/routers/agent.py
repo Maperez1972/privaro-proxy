@@ -24,6 +24,9 @@ import app.services.detector as detector
 from app.services.auth import verify_api_key_or_dev
 from app.config import settings
 
+from fastapi import BackgroundTasks
+from app.routers.webhooks import maybe_dispatch_agent_step, dispatch_run_completed
+
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 
 
@@ -136,6 +139,7 @@ async def agent_run_start(
 @router.post("/protect", response_model=AgentProtectResponse)
 async def agent_protect(
     body: AgentProtectRequest,
+    background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """
@@ -223,6 +227,20 @@ async def agent_protect(
         processing_ms=processing_ms,
     )
 
+    # Fire outbound webhooks (non-blocking background task)
+    await maybe_dispatch_agent_step(
+        org_id=org_id,
+        agent_run_id=body.agent_run_id,
+        step_index=step_index,
+        pipeline_id=run["pipeline_id"],
+        risk_score=risk_score,
+        pii_detected=pii_detected,
+        pii_masked=pii_masked,
+        gdpr_compliant=gdpr_ok,
+        detections=all_detections,
+        background_tasks=background_tasks,
+    )
+
     return AgentProtectResponse(
         request_id=request_id,
         agent_run_id=body.agent_run_id,
@@ -298,6 +316,7 @@ async def agent_reveal(
 @router.post("/run/end", response_model=AgentRunEndResponse)
 async def agent_run_end(
     body: AgentRunEndRequest,
+    background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
 ):
     """Close an agent run. Updates status and finalises aggregated counters."""
@@ -310,6 +329,20 @@ async def agent_run_end(
         raise HTTPException(status_code=500, detail={"error": "failed_to_close_run"})
 
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
+
+    # Fire run_completed webhook (non-blocking)
+    await dispatch_run_completed(
+        org_id=run.get("org_id", key_record["org_id"]),
+        agent_run_id=body.agent_run_id,
+        pipeline_id=run.get("pipeline_id", ""),
+        status=run["status"],
+        step_count=run.get("step_count", 0),
+        total_pii_detected=run.get("total_pii_detected", 0),
+        max_risk_score=run.get("max_risk_score", 0.0),
+        gdpr_compliant=run.get("gdpr_compliant", True),
+        background_tasks=background_tasks,
+    )
+
     return AgentRunEndResponse(
         agent_run_id=body.agent_run_id,
         status=run["status"],
