@@ -25,6 +25,7 @@ from app.services import ibs
 from app.services import policy_engine as pe
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 from app.config import settings
+from app.services import quota as quota_svc
 
 router = APIRouter()
 
@@ -90,6 +91,12 @@ async def protect_prompt(
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
     org_id = pipeline["org_id"]
+
+    # ── Step 1b: Quota check ─────────────────────────────────────────────────
+    # Atomically increments request counter and raises HTTP 429 if exceeded.
+    # Enterprise plans bypass this check inside the RPC itself.
+    await quota_svc.check_and_increment(org_id)
+
     agent_mode = body.options.agent_mode if hasattr(body.options, "agent_mode") else False
 
     # ── Step 2: Detect PII ───────────────────────────────────────────────────

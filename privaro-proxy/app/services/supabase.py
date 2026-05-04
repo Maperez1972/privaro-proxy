@@ -823,3 +823,20 @@ async def log_webhook_delivery(
             )
     except Exception as e:
         print(f"[Webhook] Failed to log delivery: {e}")
+
+
+async def rpc(function_name: str, params: Dict[str, Any]) -> Any:
+    """Call a Supabase RPC (stored procedure) and return the result."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{settings.SUPABASE_URL}/rest/v1/rpc/{function_name}",
+                headers=SUPABASE_HEADERS,
+                json=params,
+            )
+            if response.status_code in (200, 201):
+                return response.json()
+            return None
+    except Exception as e:
+        print(f"[RPC] Error calling {function_name}: {e}")
+        return None
