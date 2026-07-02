@@ -84,6 +84,11 @@ No se hace por SQL directo — usa el panel de Supabase para no tocar el esquema
 2. Introduce el email del contacto del partner (ej. `sergio@octopus.tech`). Esto le manda un magic link para que fije su contraseña.
 3. Copia el **User UID** que aparece en la lista de usuarios tras la invitación — lo necesitas para el paso siguiente.
 
+> ℹ️ **Nota histórica (ya no es necesario actuar, resuelto en el código):**
+> Hay un trigger que asigna automáticamente a cada usuario nuevo `org_id = iCommunity Labs, role = 'developer'` al crearse. Esto rompía `partner-sub-accounts` (v1/v2) porque hacía `.maybeSingle()` sobre `user_roles` filtrando solo por `user_id`, y con dos filas la llamada fallaba. **Desde v3 (2026-07-03), la función busca explícitamente la fila cuya organización sea `org_type='partner'` entre TODAS las del usuario**, así que ya no hace falta borrar la fila automática a mano. Se deja documentado por si el síntoma reaparece en otro punto de la app que sí asuma una sola fila por usuario.
+>
+> ⚠️ **Esto sigue siendo válido:** `user_roles` tiene `UNIQUE(user_id, role)` — un mismo usuario no puede tener el rol `admin` dos veces, en ninguna org. Si vas a reutilizar tu propio email para pruebas internas y ya eres admin de otra org (ej. iCommunity Labs), usa un alias (`tunombre+partnerdemo@icommunity.io`) — si no, el INSERT del paso 3 falla por conflicto de constraint.
+
 ---
 
 ## 3. Vincular ese usuario a la organización partner con rol admin
@@ -145,3 +150,4 @@ Una vez verificado:
 | Fecha | Partner | Resultado |
 |---|---|---|
 | 2026-07-02 | Partner Demo (ficticio, pruebas) | Validado end-to-end: agregación de cuota, soft-cap, reset, aislamiento — ver conversación de referencia. Dos bugs reales encontrados y corregidos en el proceso (columna ambigua en RPC, codificación UTF-8). |
+| 2026-07-03 | Partner Demo — alta de usuario admin (`maperez+partnerdemo@icommunity.io`) | Encontrado y documentado: trigger de auto-asignación (`developer` @ iCommunity Labs) en usuarios nuevos, que rompía `partner-sub-accounts` por `.maybeSingle()` con filas duplicadas. Corregido en el runbook (ver aviso en Sección 2). |
