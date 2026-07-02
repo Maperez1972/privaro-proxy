@@ -1,6 +1,6 @@
 # Privaro — Guía de integración para partners
 
-**Versión:** v1
+**Versión:** v2
 **Última actualización:** 2026-07-02
 **Ámbito:** Partners tipo "agregador" (ISV que embebe Privaro en su propio producto y reparte el consumo entre sus clientes finales). Ejemplo de referencia: Octopus Technologies / Robin AI.
 
@@ -78,6 +78,24 @@ GET /v1/partner/sub-accounts/{org_id}/audit-summary?days=30     (resumen para un
 
 Todas usan la **partner API key** (no la del sub-account) en `X-Privaro-Key`. Devuelven 404 si el `org_id` solicitado no es un sub-account de ese partner — el aislamiento se verifica en cada llamada, no solo al crear la key.
 
+### 3.5 Webhook automático — nuevo informe DPO disponible
+
+Cuando se genera un DPO Report para uno de tus clientes finales, Privaro dispara un webhook hacia ti (si tienes uno configurado) en vez de obligarte a hacer polling:
+
+```
+Evento: dpo_report.generated
+Firma:  header X-Privaro-Signature: sha256=<hmac-sha256 del body con tu secret>
+Body:   { "event": "dpo_report.generated", "org_id": "...", "org_name": "...",
+          "report_id": "...", "period_label": "...", "event_count": N,
+          "certified_count": N, "high_risk_count": N, "generated_at": "..." }
+```
+
+Configúralo dándonos una URL de destino y un secreto — lo damos de alta en tu organización de partner. Es *best-effort*: si tu endpoint falla o no responde, la generación del informe no se ve afectada; simplemente no llega el aviso (usa el polling de 3.4 como respaldo).
+
+### 3.6 Notificaciones de consumo (80% y 100% del tier)
+
+Si lo activas, te avisamos automáticamente por email o webhook cuando el consumo agregado de tu cuenta llega al 80% de tu tier (aviso) y al 100% (ya en overage). Cada aviso se dispara **una sola vez por ciclo de facturación** — no te vamos a machacar con el mismo email en cada petición una vez pasado el umbral. Pídenos que te lo activemos indicando destinatarios y canal (email o webhook).
+
 ---
 
 ## 4. Modelo de facturación (resumen operativo)
@@ -106,8 +124,7 @@ Todas usan la **partner API key** (no la del sub-account) en `X-Privaro-Key`. De
 ## 6. Pendiente / roadmap conocido (no bloqueante para arrancar)
 
 - Sin pantalla self-serve de alta de partners/sub-accounts — hoy es manual vía Supabase.
-- Sin notificación automática al 80%/100% de cuota todavía (la cuota sí se cuenta correctamente; falta el aviso).
-- Sin webhook `dpo_report.generated` disparado automáticamente hacia el partner todavía — el partner debe hacer polling a `/dpo-report/latest`.
+- El webhook `dpo_report.generated` y las notificaciones de consumo (80%/100%) requieren que Privaro configure manualmente tus credenciales/destinatarios — no hay autoservicio todavía.
 - Overage: la tarifa (`overage_rate_per_1000`) no está fijada por defecto — se define por partner.
 
 ---
@@ -117,3 +134,5 @@ Todas usan la **partner API key** (no la del sub-account) en `X-Privaro-Key`. De
 | Versión | Fecha | Cambios |
 |---|---|---|
 | v1 | 2026-07-02 | Primera versión. Modelo partner/sub_account, `billing_accounts` agregada, soft-cap, API de partner de solo lectura (`/v1/partner/*`), reset mensual y escalón de descuento automáticos. |
+| v2 | 2026-07-02 | Corregido: codificación UTF-8 en respuestas JSON (afectaba a nombres con tildes/guiones en clientes como PowerShell). Corregido: `get_latest_dpo_report` buscaba `status='completed'`, el valor real es `'ready'` — el endpoint de informe DPO nunca habría devuelto nada. Añadido: notificaciones automáticas de consumo al 80%/100% del tier (Sección 3.6). Añadido: webhook `dpo_report.generated` hacia el partner cuando se genera un informe de un cliente final (Sección 3.5). |
+
