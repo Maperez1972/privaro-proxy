@@ -840,3 +840,110 @@ async def rpc(function_name: str, params: Dict[str, Any]) -> Any:
     except Exception as e:
         print(f"[RPC] Error calling {function_name}: {e}")
         return None
+
+
+# ── Partner API — sub-account access (added 2026-07) ────────────────────────
+# Backs app/routers/partner.py. A partner org (org_type='partner') can read
+# — never write — compliance artefacts belonging to its sub_account orgs.
+# Data isolation is enforced by checking parent_org_id, not by giving the
+# partner's key broader row access.
+
+async def get_organization(org_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch an organization row by id."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/organizations",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{org_id}", "limit": "1"},
+        )
+    rows = response.json() if response.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+async def verify_sub_account(partner_org_id: str, sub_org_id: str) -> bool:
+    """True only if sub_org_id is a sub_account whose parent is partner_org_id."""
+    sub_org = await get_organization(sub_org_id)
+    if not sub_org:
+        return False
+    return (
+        sub_org.get("org_type") == "sub_account"
+        and sub_org.get("parent_org_id") == partner_org_id
+    )
+
+
+async def get_latest_dpo_report(org_id: str) -> Optional[Dict[str, Any]]:
+    """Latest completed, non-superseded DPO report for an org."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/dpo_reports",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "status": "eq.completed",
+                "is_latest": "eq.true",
+                "select": "id,period_start,period_end,period_label,storage_path,"
+                          "event_count,certified_count,high_risk_count,generated_at",
+                "order": "generated_at.desc",
+                "limit": "1",
+            },
+        )
+    rows = response.json() if response.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+async def get_signed_dpo_report_url(storage_path: str, expires_in: int = 3600) -> Optional[str]:
+    """Short-lived signed URL for a DPO report PDF/HTML in the dpo-reports bucket."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{settings.SUPABASE_URL}/storage/v1/object/sign/dpo-reports/{storage_path}",
+            headers=SUPABASE_HEADERS,
+            json={"expiresIn": expires_in},
+        )
+    if response.status_code != 200:
+        return None
+    signed = response.json().get("signedURL")
+    return f"{settings.SUPABASE_URL}/storage/v1{signed}" if signed else None
+
+
+async def get_audit_summary(org_id: str, days: int = 30) -> Dict[str, Any]:
+    """Lightweight compliance summary for embedding in a partner's UI."""
+    from datetime import datetime, timedelta, timezone
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/audit_logs",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "created_at": f"gte.{since}",
+                "select": "event_type,action_taken,severity,risk_score",
+            },
+        )
+    rows = response.json() if response.status_code == 200 else []
+    total = len(rows)
+    leaked = sum(1 for r in rows if r.get("event_type") == "pii_leaked")
+    blocked = sum(1 for r in rows if r.get("action_taken") == "blocked")
+    high_risk = sum(1 for r in rows if (r.get("risk_score") or 0) >= 0.7)
+    return {
+        "period_days": days,
+        "total_events": total,
+        "pii_leaked_events": leaked,
+        "blocked_events": blocked,
+        "high_risk_events": high_risk,
+        "gdpr_compliant": leaked == 0,
+    }
+
+
+async def list_sub_accounts(partner_org_id: str) -> list:
+    """All sub_account orgs belonging to a partner — for dashboard listings."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/organizations",
+            headers=SUPABASE_HEADERS,
+            params={
+                "parent_org_id": f"eq.{partner_org_id}",
+                "org_type": "eq.sub_account",
+                "select": "id,name,created_at",
+            },
+        )
+    return response.json() if response.status_code == 200 else []

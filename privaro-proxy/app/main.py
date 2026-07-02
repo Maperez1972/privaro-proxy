@@ -58,6 +58,10 @@ app.include_router(document.router, prefix="/v1/proxy", tags=["Document"])
 from app.routers import byok
 app.include_router(byok.router, tags=["BYOK"])
 
+# Phase 14 — Partner API (sub-account aggregation, no separate end-user login)
+from app.routers import partner
+app.include_router(partner.router, prefix="/v1/partner", tags=["Partner API"])
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):

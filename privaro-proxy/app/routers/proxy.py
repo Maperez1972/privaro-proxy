@@ -46,6 +46,10 @@ async def detect_pii(
     if pipeline["org_id"] != key_record["org_id"]:
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
+    # Quota check — previously missing on /detect, meaning it was unmetered.
+    # Soft-cap: never blocks, just counts (see quota.py).
+    await quota_svc.check_and_increment(pipeline["org_id"])
+
     detections = detector.detect(body.prompt)
     processing_ms = int((time.monotonic() - t0) * 1000)
 
@@ -93,8 +97,10 @@ async def protect_prompt(
     org_id = pipeline["org_id"]
 
     # ── Step 1b: Quota check ─────────────────────────────────────────────────
-    # Atomically increments request counter and raises HTTP 429 if exceeded.
-    # Enterprise plans bypass this check inside the RPC itself.
+    # Soft-cap: atomically increments the request counter (rolled up to the
+    # partner's billing_account for sub_account orgs). Never raises/blocks —
+    # once the limit is hit, requests continue and are counted as overage.
+    # Enterprise plans are unlimited (bypassed inside the RPC).
     await quota_svc.check_and_increment(org_id)
 
     agent_mode = body.options.agent_mode if hasattr(body.options, "agent_mode") else False
