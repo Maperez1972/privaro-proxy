@@ -12,6 +12,16 @@ from app.config import settings
 from app.services import ibs
 
 
+class UTF8JSONResponse(JSONResponse):
+    """
+    Explicit charset=utf-8 in Content-Type. Without this, some HTTP clients
+    (notably Windows PowerShell's Invoke-WebRequest) default to Latin-1 when
+    decoding the response body, mangling non-ASCII characters like em-dashes
+    or accented names (e.g. "Cliente A" showing as "Clientea Â").
+    """
+    media_type = "application/json; charset=utf-8"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
@@ -35,6 +45,7 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
     redoc_url=None,
+    default_response_class=UTF8JSONResponse,
 )
 
 # CORS
@@ -65,7 +76,7 @@ app.include_router(partner.router, prefix="/v1/partner", tags=["Partner API"])
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    return JSONResponse(
+    return UTF8JSONResponse(
         status_code=500,
         content={"error": "internal_error", "detail": "An unexpected error occurred"},
     )
