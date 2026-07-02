@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     PRIVARO_DEV_KEY: Optional[str] = None
     DEV_ORG_ID: Optional[str] = None
 
+    # ── Usage notifications (added 2026-07) ─────────────────────────
+    # Shared secret between this service and the send-usage-notification
+    # Supabase Edge Function — server-to-server only, not user-facing.
+    INTERNAL_NOTIFY_SECRET: Optional[str] = None
+
     # ── CORS ───────────────────────────────────────────────────────
     CORS_ORIGINS: List[str] = [
         "https://privaro.lovable.app",

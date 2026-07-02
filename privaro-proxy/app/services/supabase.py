@@ -872,14 +872,16 @@ async def verify_sub_account(partner_org_id: str, sub_org_id: str) -> bool:
 
 
 async def get_latest_dpo_report(org_id: str) -> Optional[Dict[str, Any]]:
-    """Latest completed, non-superseded DPO report for an org."""
+    """Latest ready, non-superseded DPO report for an org.
+    NOTE: dpo_reports.status uses 'ready' (set by generate-dpo-report),
+    not 'completed' — verified against the actual generator function."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(
             f"{SUPABASE_REST}/dpo_reports",
             headers=SUPABASE_HEADERS,
             params={
                 "org_id": f"eq.{org_id}",
-                "status": "eq.completed",
+                "status": "eq.ready",
                 "is_latest": "eq.true",
                 "select": "id,period_start,period_end,period_label,storage_path,"
                           "event_count,certified_count,high_risk_count,generated_at",
@@ -947,3 +949,77 @@ async def list_sub_accounts(partner_org_id: str) -> list:
             },
         )
     return response.json() if response.status_code == 200 else []
+
+
+# ── Usage notifications (80% threshold / overage) — added 2026-07 ──────────
+
+async def get_notification_config(org_id: str, notif_type: str) -> Optional[Dict[str, Any]]:
+    """Enabled org_notifications row for this org + type, or None."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/org_notifications",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "type": f"eq.{notif_type}",
+                "is_enabled": "eq.true",
+                "limit": "1",
+            },
+        )
+    rows = response.json() if response.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+async def mark_notification_triggered(notification_id: str) -> None:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.patch(
+            f"{SUPABASE_REST}/org_notifications",
+            headers={**SUPABASE_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{notification_id}"},
+            json={"last_triggered": "now()"},
+        )
+
+
+async def send_usage_notification(
+    org_id: str, notif_type: str, org_name: str, plan: str,
+    requests_used: int, requests_limit: int,
+) -> None:
+    """
+    Fire a usage_threshold/usage_overage notification for owner_org_id.
+    Looks up org_notifications for recipients/channel. Best-effort — never
+    raises, since a notification failure must never affect the proxy request
+    that triggered it.
+    """
+    try:
+        config = await get_notification_config(org_id, notif_type)
+        if not config:
+            return  # No config, or explicitly disabled — nothing to do.
+
+        if config.get("channel") == "webhook" and config.get("webhook_url"):
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    config["webhook_url"],
+                    json={
+                        "event": notif_type, "org_id": org_id, "org_name": org_name,
+                        "plan": plan, "requests_used": requests_used, "requests_limit": requests_limit,
+                    },
+                )
+        elif config.get("channel") == "email" and config.get("recipients"):
+            internal_secret = settings.INTERNAL_NOTIFY_SECRET
+            if not internal_secret:
+                print("[Notify] INTERNAL_NOTIFY_SECRET not set — skipping email notification")
+                return
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{settings.SUPABASE_URL}/functions/v1/send-usage-notification",
+                    headers={"X-Internal-Secret": internal_secret, "Content-Type": "application/json"},
+                    json={
+                        "org_id": org_id, "type": notif_type, "recipients": config["recipients"],
+                        "org_name": org_name, "plan": plan,
+                        "requests_used": requests_used, "requests_limit": requests_limit,
+                    },
+                )
+
+        await mark_notification_triggered(config["id"])
+    except Exception as e:
+        print(f"[Notify] Failed to send {notif_type} for org {org_id}: {e}")

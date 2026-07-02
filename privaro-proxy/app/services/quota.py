@@ -1,22 +1,24 @@
 """
 quota.py — Request quota enforcement.
 
-v2 (2026-07): reads/writes billing_accounts instead of organizations directly.
-This is what makes partner aggregation work: a sub_account org's requests
-increment its PARENT partner's billing_account, not its own — the RPC
-resolves this via organizations.billing_account_id, so no branching logic
-is needed here.
+v3 (2026-07): fires a usage_threshold (80%) / usage_overage (100%)
+notification the FIRST time each is crossed per billing cycle. The RPC
+(increment_billing_requests) does the crossing detection and dedup
+server-side (threshold_notified_at / overage_notified_at columns), so this
+file just reacts to the flags it gets back — no polling, no extra queries
+on the hot path.
 
-Soft-cap behaviour: once the plan's requests_limit is exceeded, requests are
-still allowed (never blocked) and counted separately as overage. This matches
-the public pricing FAQ ("we don't block your calls, you can upgrade or add
-overage capacity"). Enterprise plans are unlimited (bypassed inside the RPC).
+Notifications are dispatched as a fire-and-forget background task so a
+slow email/webhook never adds latency to the actual proxy request.
 
-Monthly reset and the 20%->15% partner discount step-down are handled by
-pg_cron jobs in Supabase (reset_billing_cycles, apply_discount_reviews) —
-nothing to do here.
+v2 recap: reads/writes billing_accounts instead of organizations directly.
+Sub-account requests roll up to the parent partner's billing_account
+automatically (resolved server-side by organizations.billing_account_id).
+Soft-cap: never blocks. Monthly reset and the 20%->15% discount step-down
+are handled by pg_cron jobs in Supabase — nothing to do here.
 """
 
+import asyncio
 import logging
 from app.services import supabase as db
 
@@ -27,10 +29,9 @@ async def check_and_increment(org_id: str) -> dict:
     """
     Atomically increment the org's billing account request counter.
 
-    Returns dict with allowed, requests_used, requests_limit, plan, over_quota.
-    Never raises — soft-cap means requests always proceed. Callers that want
-    to notify the customer (80%/100% thresholds) should inspect the returned
-    dict and fire a notification themselves; this function only counts.
+    Returns dict with allowed, requests_used, requests_limit, plan,
+    over_quota, owner_org_id. Never raises — soft-cap means requests always
+    proceed.
     """
     try:
         result = await db.rpc(
@@ -38,11 +39,6 @@ async def check_and_increment(org_id: str) -> dict:
             {"p_org_id": org_id},
         )
     except Exception as e:
-        # Non-fatal — log and allow on RPC error to avoid blocking prod traffic.
-        # NOTE: this fails open by design (never block billable traffic on an
-        # infra hiccup), but it also means quota under-counts during an outage.
-        # Alert on repeated [Quota] RPC error log lines — that's a signal the
-        # RPC or billing_accounts table has a problem, not just noise.
         logger.error(f"[Quota] RPC error for org {org_id}: {e}")
         return {
             "allowed": True, "requests_used": -1, "requests_limit": -1,
@@ -69,4 +65,31 @@ async def check_and_increment(org_id: str) -> dict:
             f"used={row.get('requests_used')}/{row.get('requests_limit')}"
         )
 
+    # Fire-and-forget — never let a notification delay or fail the request.
+    if row.get("notify_threshold") or row.get("notify_overage"):
+        asyncio.create_task(_dispatch_notifications(row))
+
     return row
+
+
+async def _dispatch_notifications(row: dict) -> None:
+    owner_org_id = row.get("owner_org_id")
+    if not owner_org_id:
+        return
+
+    try:
+        org = await db.get_organization(owner_org_id)
+        org_name = org.get("name") if org else owner_org_id
+
+        if row.get("notify_threshold"):
+            await db.send_usage_notification(
+                owner_org_id, "usage_threshold", org_name, row.get("plan"),
+                row.get("requests_used"), row.get("requests_limit"),
+            )
+        if row.get("notify_overage"):
+            await db.send_usage_notification(
+                owner_org_id, "usage_overage", org_name, row.get("plan"),
+                row.get("requests_used"), row.get("requests_limit"),
+            )
+    except Exception as e:
+        logger.error(f"[Quota] Notification dispatch failed for org {owner_org_id}: {e}")
