@@ -132,4 +132,4 @@ Verificad la firma antes de confiar en el contenido del webhook.
 
 ## Soporte
 
-Cualquier duda durante la integración, escribidnos a **[email de soporte]** o contactad directamente con vuestro interlocutor en iCommunity Labs.
+Cualquier duda durante la integración, escribidnos a **soporte@icommunity.io** o contactad directamente con vuestro interlocutor en iCommunity Labs.

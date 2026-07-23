@@ -12,7 +12,7 @@
 
 ### 1.1 Registro e inicio de sesión
 
-La aplicación tiene tres modos en la pantalla de acceso (`/auth`):
+La aplicación tiene tres modos en la pantalla de acceso (`https://privaro.ai/auth`):
 
 - **Iniciar sesión**: email + contraseña.
 - **Crear cuenta**: email, contraseña, nombre completo y nombre de la organización. Al crear una cuenta nueva se crea también la organización.
