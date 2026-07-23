@@ -27,6 +27,7 @@ from typing import Optional
 
 from app.config import settings
 from app.services.key_manager import encrypt_byok_key_for_storage
+from app.services.llm_router import _decrypt_api_key
 
 router = APIRouter(prefix="/internal", tags=["Internal"])
 
@@ -39,17 +40,54 @@ class EncryptKeyResponse(BaseModel):
     encrypted: str
 
 
+class DecryptKeyRequest(BaseModel):
+    encrypted: str
+
+
+class DecryptKeyResponse(BaseModel):
+    raw_key: str
+
+
+def _check_internal_secret(x_internal_secret: Optional[str]) -> None:
+    if not settings.INTERNAL_NOTIFY_SECRET:
+        raise HTTPException(status_code=500, detail={"error": "server_misconfigured"})
+    if x_internal_secret != settings.INTERNAL_NOTIFY_SECRET:
+        raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+
+
 @router.post("/encrypt-provider-key", response_model=EncryptKeyResponse)
 async def encrypt_provider_key(
     body: EncryptKeyRequest,
     x_internal_secret: Optional[str] = Header(None),
 ):
-    if not settings.INTERNAL_NOTIFY_SECRET:
-        raise HTTPException(status_code=500, detail={"error": "server_misconfigured"})
-    if x_internal_secret != settings.INTERNAL_NOTIFY_SECRET:
-        raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+    _check_internal_secret(x_internal_secret)
     if not body.raw_key or len(body.raw_key) < 8:
         raise HTTPException(status_code=400, detail={"error": "invalid_key"})
 
     encrypted = encrypt_byok_key_for_storage(body.raw_key)
     return EncryptKeyResponse(encrypted=encrypted)
+
+
+@router.post("/decrypt-provider-key", response_model=DecryptKeyResponse)
+async def decrypt_provider_key(
+    body: DecryptKeyRequest,
+    x_internal_secret: Optional[str] = Header(None),
+):
+    """
+    Mirror of encrypt-provider-key, added 2026-07-23 — found needed when
+    chat-completion (the internal demo chat, a separate Edge Function) sent
+    the ENCRYPTED blob straight to OpenAI as if it were the raw key. It
+    only ever "worked" before because the plaintext-storage bug meant the
+    column already held a usable raw key; now that llm_providers.api_key_encrypted
+    is correctly encrypted, any consumer other than llm_router.py (which
+    already decrypts internally) needs this to get a usable key.
+
+    Same shared-secret, server-to-server-only auth as the encrypt endpoint.
+    Callers must never persist or log the returned raw_key.
+    """
+    _check_internal_secret(x_internal_secret)
+    try:
+        raw_key = _decrypt_api_key(body.encrypted)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"error": "decryption_failed", "detail": str(e)})
+    return DecryptKeyResponse(raw_key=raw_key)
