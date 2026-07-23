@@ -142,6 +142,7 @@ Una vez verificado:
 - No crea el webhook `dpo_report.generated` del partner — si lo quiere, pídele URL + genera un secreto y da de alta una fila en `org_webhooks` con `events = ARRAY['dpo_report.generated']`.
 - No activa notificaciones de consumo 80%/100% — si las quiere, inserta filas en `org_notifications` (`type='usage_threshold'` y `type='usage_overage'`) con sus destinatarios.
 - No genera la partner API key de solo-lectura (`/v1/partner/*`, para que el partner embeba compliance en su propio producto) — eso es aparte del acceso de dashboard; créala igual que se hizo para Partner Demo si el partner la va a usar.
+- **El cambio de cupón de Stripe en la fecha de revisión sigue siendo manual** (aunque desde 2026-07-23 recibes un email automático a soporte@icommunity.io en el momento exacto en que `discount_phase` pasa a `reviewed` — ver `apply_discount_reviews()`. El aviso es automático; el cambio real de `PARTNER20` a `PARTNER15` en el Dashboard de Stripe, no.
 
 ---
 

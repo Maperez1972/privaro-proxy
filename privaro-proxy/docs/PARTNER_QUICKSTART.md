@@ -1,6 +1,6 @@
 # Privaro — Guía de integración rápida para partners
 
-**Versión:** v1
+**Versión:** v2
 **Última actualización:** 23 de julio de 2026
 
 Esta guía cubre únicamente los pasos que tu equipo tiene que ejecutar para integrar Privaro en vuestro producto. No incluye nada de cómo funciona Privaro por dentro — solo lo que necesitáis vosotros.
@@ -43,6 +43,16 @@ Por cada cliente final que queráis proteger con Privaro:
 
 > ⚠️ **La API key se muestra una única vez.** Copiadla y guardadla en vuestro gestor de secretos en ese mismo momento — no podemos volver a mostrárosla. Si la perdéis, hay que dar de alta el cliente de nuevo.
 
+**¿Queréis automatizarlo desde vuestro propio backend?** En vez de dar de alta cada cliente a mano en el panel, podéis llamar directamente a:
+
+```
+POST https://<URL-DEL-PROXY-PRIVARO>/v1/partner/sub-accounts
+Headers: X-Privaro-Key: <vuestra clave de partner, con permiso adicional 'partner:write_children'>
+Body: { "name": "...", "sector": "...", "llm_provider": "...", "llm_model": "..." }
+```
+
+Mismo resultado que hacerlo desde "Mis clientes" (misma API key generada, mismo aviso de que solo se muestra una vez), pero disparable automáticamente el momento en que uno de vuestros clientes se da de alta con vosotros. Pedidnos que activemos el permiso `partner:write_children` en vuestra clave de partner si queréis usar esta vía — por defecto la clave de partner es solo de lectura.
+
 ---
 
 ## 5. Integración técnica — proteger un prompt
@@ -84,6 +94,35 @@ POST https://api.privaro.ai/v1/proxy/detect
 ### Importante sobre límites de uso
 
 Privaro **nunca bloquea vuestro tráfico**. Si superáis el volumen contratado, las llamadas se siguen sirviendo con normalidad — el exceso se factura aparte, no se corta el servicio.
+
+### Streaming — si vuestro chat muestra la respuesta palabra a palabra
+
+Si vuestro producto usa streaming (lo habitual en un chat), usad esta vía en vez de `/v1/proxy/protect` — protege el prompt, llama al LLM configurado en vuestro pipeline (con la clave que hayáis dado de alta en LLM Providers), y os devuelve la respuesta en streaming real:
+
+```
+POST https://api.privaro.ai/v1/relay/stream
+Headers:
+  X-Privaro-Key: <API key del cliente final>
+  Content-Type: application/json
+Body:
+{
+  "pipeline_id": "<id del pipeline de ese cliente>",
+  "messages": [{ "role": "user", "content": "<mensaje del usuario>" }]
+}
+```
+
+Respuesta en Server-Sent Events, según el modelo va generando texto:
+
+```
+data: {"delta": "Hola"}
+data: {"delta": ", "}
+data: {"delta": "¿en qué puedo ayudarte?"}
+data: [DONE]
+```
+
+Concatenad los `delta` según llegan para mostrar el efecto de streaming en vuestra interfaz. Soportado hoy para OpenAI/Azure y Anthropic — para otros proveedores, usad `/v1/proxy/protect` + vuestra propia llamada al LLM mientras tanto.
+
+Este comportamiento está activado por defecto en vuestra organización; si alguna vez preferís desactivarlo, hay un interruptor en Billing → Security Configuration del panel.
 
 ---
 

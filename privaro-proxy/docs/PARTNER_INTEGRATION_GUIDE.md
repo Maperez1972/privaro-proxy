@@ -1,6 +1,6 @@
 # Privaro — Guía de integración para partners
 
-**Versión:** v3
+**Versión:** v4
 **Última actualización:** 2026-07-23
 **Ámbito:** Partners tipo "agregador" (ISV que embebe Privaro en su propio producto y reparte el consumo entre sus clientes finales). Ejemplo de referencia: Octupus Technologies / Robin AI.
 
@@ -67,6 +67,16 @@ A diferencia del alta del partner (que hace el equipo de Privaro), **cada client
 
 Por debajo, esto llama a la Edge Function `partner-sub-accounts` (`GET`/`POST`), autenticada con la sesión del usuario del partner (no con `X-Privaro-Key`). No requiere ninguna acción manual de Privaro salvo que el partner tenga dudas.
 
+**Alternativa programática (añadida 2026-07-23):** si el partner quiere que su propio backend cree sub-accounts automáticamente (p. ej. en el momento en que uno de sus clientes se da de alta en su producto, sin ningún clic en el panel de Privaro), puede usar en su lugar:
+
+```
+POST /v1/partner/sub-accounts
+Headers: X-Privaro-Key: <partner API key con permiso 'partner:write_children'>
+Body: { "name": "...", "sector": "...", "llm_provider": "...", "llm_model": "..." }
+```
+
+Mismo efecto exacto que el autoservicio de la UI (misma `billing_account`, misma generación de API key), pero autenticado con la clave de partner en vez de una sesión de navegador. Requiere el permiso `partner:write_children` en la key — deliberadamente distinto de `partner:read_children`, para que una clave de solo lectura (pensada para el panel embebido) no pueda crear cuentas facturables por accidente.
+
 ### 3.4 Integración técnica — llamadas de protección (por cada cliente final)
 
 El partner llama al proxy usando la API key del sub-account correspondiente:
@@ -80,6 +90,18 @@ Body: { "pipeline_id": "...", "prompt": "..." }
 Cada llamada cuenta contra la cuota del partner (agregada), pero genera audit log, PII detections y certificación blockchain aislados en el `org_id` del sub-account.
 
 `/v1/proxy/detect` funciona igual, en modo solo-análisis (sin persistir).
+
+**Streaming (añadido 2026-07-23):** si el producto del partner muestra las respuestas del LLM en streaming (la mayoría de chats modernos), existe una vía completa alternativa que también llama al LLM por vosotros:
+
+```
+POST https://<proxy-url>/v1/relay/stream
+Headers: X-Privaro-Key: prvr_xxxxx
+Body: { "pipeline_id": "...", "messages": [{"role":"user","content":"..."}] }
+```
+
+Protege el prompt, llama al proveedor del LLM ya configurado en `LLM Providers` (BYOK — la clave del cliente, nunca la vuestra), y devuelve la respuesta en SSE (`data: {"delta": "..."}\n\n`, terminando en `data: [DONE]\n\n`) según el modelo la va generando. Soportado hoy para OpenAI/Azure y Anthropic; otros proveedores devuelven un error explícito indicando que no hay streaming disponible todavía.
+
+Controlado por `organizations.streaming_enabled` (activado por defecto) — un admin puede desactivarlo desde Billing → Security Configuration si prefiere que todo pase por el modelo no-streaming.
 
 ### 3.5 Integración técnica — panel de compliance embebido (opcional pero recomendado)
 
@@ -117,7 +139,7 @@ Si lo activas, te avisamos automáticamente por email o webhook cuando el consum
 
 - El partner paga una cuota fija mensual (prepago) basada en el tier de peticiones/mes agregadas de todos sus sub-accounts — no revenue share, salvo acuerdo específico.
 - La suscripción se gestiona en Stripe (link de pago + código promocional para el descuento inicial — ver Sección 3.2).
-- Descuento de partner: fase inicial (mayor descuento, primeros 6 meses) → fase de revisión (descuento suelo). En Supabase el cambio de fase es automático (`pg_cron`); **en Stripe el cambio de cupón es manual todavía** — hay que sincronizar ambos en la fecha `discount_review_at`.
+- Descuento de partner: fase inicial (mayor descuento, primeros 6 meses) → fase de revisión (descuento suelo). En Supabase el cambio de fase es automático (`pg_cron`), y desde 2026-07-23 dispara un email interno automático a soporte@icommunity.io en el momento del cambio (ver `apply_discount_reviews()`). **El cambio del cupón en la propia suscripción de Stripe sigue siendo manual** — el email es un recordatorio, no ejecuta el cambio por sí solo.
 - Cuota: **soft-cap**. Nunca se bloquea el tráfico al superar el límite; el exceso se cuenta aparte (`overage_requests_used`) y se factura según `overage_rate_per_1000` (a definir por partner).
 - Reset de cuota: automático cada mes (`pg_cron`), sin intervención manual.
 - El partner decide libremente cómo repercute el coste a sus clientes finales — Privaro no impone su modelo de precios hacia el usuario final.
@@ -141,10 +163,10 @@ Si lo activas, te avisamos automáticamente por email o webhook cuando el consum
 
 ## 6. Pendiente / roadmap conocido (no bloqueante para arrancar)
 
-- Sin autoservicio para el alta del partner en sí (org + billing_account + primer usuario admin) — decisión deliberada, se hace manualmente tras confirmar el pago. El alta de clientes finales SÍ es autoservicio (Sección 3.3).
+- Sin autoservicio para el alta del partner en sí (org + billing_account + primer usuario admin) — decisión deliberada, se hace manualmente tras confirmar el pago. El alta de clientes finales SÍ es autoservicio, tanto desde la UI (Sección 3.3) como vía API (`POST /v1/partner/sub-accounts`).
 - El webhook `dpo_report.generated` y las notificaciones de consumo (80%/100%) requieren que Privaro configure manualmente tus credenciales/destinatarios — no hay autoservicio todavía.
 - Overage: la tarifa (`overage_rate_per_1000`) no está fijada por defecto — se define por partner.
-- El escalón de descuento 20%→15% no está sincronizado automáticamente entre Supabase y Stripe — hay que cambiar el cupón a mano en la fecha de revisión (ver Sección 3.2).
+- El escalón de descuento 20%→15% dispara un aviso automático por email (2026-07-23), pero el cambio real del cupón en Stripe sigue siendo manual — no hay integración directa con la API de Stripe todavía.
 
 ---
 
@@ -155,4 +177,5 @@ Si lo activas, te avisamos automáticamente por email o webhook cuando el consum
 | v1 | 2026-07-02 | Primera versión. Modelo partner/sub_account, `billing_accounts` agregada, soft-cap, API de partner de solo lectura (`/v1/partner/*`), reset mensual y escalón de descuento automáticos. |
 | v2 | 2026-07-02 | Corregido: codificación UTF-8 en respuestas JSON (afectaba a nombres con tildes/guiones en clientes como PowerShell). Corregido: `get_latest_dpo_report` buscaba `status='completed'`, el valor real es `'ready'` — el endpoint de informe DPO nunca habría devuelto nada. Añadido: notificaciones automáticas de consumo al 80%/100% del tier (Sección 3.6). Añadido: webhook `dpo_report.generated` hacia el partner cuando se genera un informe de un cliente final (Sección 3.5). |
 | v3 | 2026-07-23 | Corregido: nombre del partner de referencia (Octopus → Octupus). Añadido: Sección 3.2, activación de pago vía Stripe (link de pago + código promocional), con las dos lecciones aprendidas al hacerlo por primera vez (el código no puede ir restringido a un customer en un Payment Link genérico; Adaptive Pricing puede ofrecer monedas no deseadas si no se desactiva). Actualizado: la Sección 3.3 (antes 3.2) ya no es un alta manual de clientes finales por parte de Privaro — ahora es autoservicio real del partner desde "Mis clientes", probado end-to-end. Actualizado el checklist de arranque y el roadmap pendiente en consecuencia. |
+| v4 | 2026-07-23 | Añadido: streaming real (`/v1/relay/stream`), con toggle `streaming_enabled` por organización. Añadido: alta programática de sub-accounts vía API (`POST /v1/partner/sub-accounts`, permiso `partner:write_children`), alternativa a la UI para partners que quieran automatizar el alta de sus propios clientes. Añadido: aviso automático por email cuando el descuento pasa a fase de revisión (el cambio real del cupón en Stripe sigue siendo manual). Corregido: bug de seguridad real — las claves de proveedores LLM (BYOK) se guardaban sin cifrar; ahora se cifran server-side antes de guardarse. |
 
