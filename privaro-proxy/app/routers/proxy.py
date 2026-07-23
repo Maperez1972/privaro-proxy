@@ -370,6 +370,10 @@ async def protect_prompt(
         for d in detections:
             if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
                 original_value = body.prompt[d.start:d.end]
+                # Deterministic hash for cross-turn matching — fixed 2026-07-23.
+                # NEVER use encrypted_original for this: AES-GCM's random nonce
+                # means the same plaintext never re-encrypts to the same bytes.
+                original_hash = hashlib.sha256(original_value.encode("utf-8")).hexdigest()
                 try:
                     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
                     aesgcm = AESGCM(enc_key)
@@ -386,7 +390,7 @@ async def protect_prompt(
                         org_id=org_id,
                         conversation_id=conversation_id,
                         entity_type=d.type,
-                        encrypted_value=encrypted,
+                        original_value_hash=original_hash,
                     )
                     if existing:
                         d.token = existing["token_value"]
@@ -399,6 +403,7 @@ async def protect_prompt(
                     "entity_type": d.type,
                     "token_value": d.token,
                     "encrypted_original": encrypted,
+                    "original_value_hash": original_hash,
                     "encryption_key_id": enc_key_id,   # ← BYOK-aware key_id
                     "is_reversible": True,
                     "access_roles": ["admin", "dpo"],

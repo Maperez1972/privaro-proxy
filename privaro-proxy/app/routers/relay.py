@@ -15,6 +15,8 @@ Privaro stores them encrypted and decrypts them only at request time.
 import time
 import uuid
 import hashlib
+import os
+import base64
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -38,13 +40,24 @@ PREFIX_MAP = {
 }
 
 
-async def _protect_messages(messages, org_id, pipeline_id, provider, sector, user_role, mode):
+async def _protect_messages(messages, org_id, pipeline_id, provider, sector, user_role, mode, conversation_id=None):
     """
     Shared PII-protection logic for both /complete and /stream. Factored out
     2026-07 when adding streaming, so both paths run exactly the same
     detection/tokenisation instead of it drifting between two copies.
 
-    Returns (protected_messages, all_detections, token_map).
+    Cross-turn token consistency added 2026-07-23 (roadmap item — Robin/
+    Octupus need the same PII value to get the SAME token across turns of
+    the same conversation, not a fresh [EM-0001] every single call). This
+    endpoint previously had NO token persistence at all — /v1/proxy/protect
+    did, but it turned out to be broken there too (see find_existing_token's
+    fix in supabase.py: it compared AES-GCM ciphertext, which has a random
+    nonce and can never match itself twice). Both are now fixed together
+    using a deterministic SHA-256 hash of the plaintext as the lookup key.
+
+    Returns (protected_messages, all_detections, token_map, provider_risk_level, token_rows).
+    token_rows is what the caller should background-task into tokens_vault —
+    already excludes anything that was found and reused from an earlier turn.
     """
     policies = await db.get_policy_rules(org_id, pipeline_id=pipeline_id) or []
     provider_trust = await db.get_provider_trust(provider, org_id)
@@ -59,9 +72,22 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
         "default_action": mode,
     }
 
+    enc_key = None
+    enc_key_id = None
+    if conversation_id:
+        enc_key_id = await get_org_default_key_id(org_id)
+        try:
+            enc_key = await resolve_encryption_key(enc_key_id, org_id)
+        except Exception as e:
+            print(f"[Vault] Key resolution failed, falling back to managed: {e}")
+            from app.services.key_manager import _get_managed_key
+            enc_key = _get_managed_key()
+            enc_key_id = "key-v1"
+
     protected_messages = []
     all_detections = []
     token_map: Dict[str, str] = {}
+    token_rows: List[Dict[str, Any]] = []
 
     for msg in messages:
         detections = detector.detect(msg.content)
@@ -78,11 +104,45 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
             if d.start is None or d.end is None:
                 continue
             original_value = msg.content[d.start:d.end]
+
             if d.action in ("tokenised", "pseudonymised", "tokenise"):
                 entity_type = d.type
-                counters[entity_type] = counters.get(entity_type, 0) + 1
-                prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
-                token = f"[{prefix}-{counters[entity_type]:04d}]"
+                reused_token = None
+
+                if conversation_id and enc_key:
+                    original_hash = hashlib.sha256(original_value.encode("utf-8")).hexdigest()
+                    existing = await db.find_existing_token(
+                        org_id=org_id, conversation_id=conversation_id,
+                        entity_type=entity_type, original_value_hash=original_hash,
+                    )
+                    if existing:
+                        reused_token = existing["token_value"]
+
+                if reused_token:
+                    token = reused_token
+                else:
+                    counters[entity_type] = counters.get(entity_type, 0) + 1
+                    prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
+                    token = f"[{prefix}-{counters[entity_type]:04d}]"
+
+                    if conversation_id and enc_key:
+                        try:
+                            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                            aesgcm = AESGCM(enc_key)
+                            nonce = os.urandom(12)
+                            ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+                            encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+                            token_rows.append({
+                                "org_id": org_id, "pipeline_id": pipeline_id,
+                                "entity_type": entity_type, "token_value": token,
+                                "encrypted_original": encrypted,
+                                "original_value_hash": hashlib.sha256(original_value.encode("utf-8")).hexdigest(),
+                                "encryption_key_id": enc_key_id, "is_reversible": True,
+                                "access_roles": ["admin", "dpo"], "conversation_id": conversation_id,
+                            })
+                        except Exception as e:
+                            print(f"[Vault] Encryption error (relay): {e}")
+
                 d.token = token
                 d.action = "tokenised"
                 token_map[token] = original_value
@@ -95,7 +155,7 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
         all_detections.extend(detections)
         protected_messages.append({"role": msg.role, "content": protected_content})
 
-    return protected_messages, all_detections, token_map, provider_risk_level
+    return protected_messages, all_detections, token_map, provider_risk_level, token_rows
 
 
 class RelayMessage(BaseModel):
@@ -170,10 +230,13 @@ async def relay_complete(
     await quota_svc.check_and_increment(org_id)
 
     # ── 2. Protect all messages ───────────────────────────────────────────────
-    protected_messages, all_detections, token_map, provider_risk_level = await _protect_messages(
+    protected_messages, all_detections, token_map, provider_risk_level, token_rows = await _protect_messages(
         body.messages, org_id, body.pipeline_id, provider,
         pipeline.get("sector", "general"), key_record.get("role", "developer"), body.options.mode,
+        conversation_id=body.conversation_id,
     )
+    if token_rows:
+        background_tasks.add_task(db.insert_tokens_batch, token_rows)
 
     risk_score = pe.compute_risk_score(all_detections, provider_risk_level, False, 0)
     pii_detected = len(all_detections)
@@ -339,10 +402,13 @@ async def relay_stream(
     provider = body.provider or pipeline.get("llm_provider", "anthropic")
     model = body.model or pipeline.get("llm_model")
 
-    protected_messages, all_detections, token_map, provider_risk_level = await _protect_messages(
+    protected_messages, all_detections, token_map, provider_risk_level, token_rows = await _protect_messages(
         body.messages, org_id, body.pipeline_id, provider,
         pipeline.get("sector", "general"), key_record.get("role", "developer"), body.options.mode,
+        conversation_id=body.conversation_id,
     )
+    if token_rows:
+        background_tasks.add_task(db.insert_tokens_batch, token_rows)
     risk_score = pe.compute_risk_score(all_detections, provider_risk_level, False, 0)
     pii_detected = len(all_detections)
     pii_masked = sum(1 for d in all_detections if d.action in ("tokenised", "anonymised"))

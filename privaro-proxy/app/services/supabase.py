@@ -386,11 +386,18 @@ async def find_existing_token(
     org_id: str,
     conversation_id: str,
     entity_type: str,
-    encrypted_value: str,
+    original_value_hash: str,
 ) -> dict | None:
     """
-    Look up an existing token for the same encrypted value within a conversation.
-    Enables token consistency: same PII = same token within a conversation.
+    Look up an existing token for the same ORIGINAL value (matched via a
+    deterministic SHA-256 hash) within a conversation. Enables token
+    consistency: same PII = same token within a conversation.
+
+    Fixed 2026-07-23: this used to match on encrypted_original, which never
+    worked because AES-256-GCM's random nonce means the same plaintext
+    never produces the same ciphertext twice — the lookup could never find
+    a hit. Now matches on original_value_hash (deterministic), computed by
+    the caller as sha256(original_value).hexdigest().
     """
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(
@@ -400,7 +407,7 @@ async def find_existing_token(
                 "org_id": f"eq.{org_id}",
                 "conversation_id": f"eq.{conversation_id}",
                 "entity_type": f"eq.{entity_type}",
-                "encrypted_original": f"eq.{encrypted_value}",
+                "original_value_hash": f"eq.{original_value_hash}",
                 "is_reversible": "eq.true",
                 "limit": "1",
                 "select": "id,token_value",
