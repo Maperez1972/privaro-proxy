@@ -17,7 +17,7 @@ import uuid
 import hashlib
 import os
 import base64
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
@@ -203,6 +203,7 @@ async def relay_complete(
     body: RelayRequest,
     background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
     Full-cycle privacy relay.
@@ -224,6 +225,16 @@ async def relay_complete(
     org_id = pipeline["org_id"]
     provider = body.provider or pipeline.get("llm_provider", "anthropic")
     model = body.model or pipeline.get("llm_model")
+
+    # Idempotency (roadmap #5) — this endpoint calls a REAL LLM, so a cache
+    # hit here also saves the partner from paying for a duplicate LLM call
+    # on retry, not just re-doing detection. Checked before quota so a
+    # retry never counts twice. Only successful completions are cached (see
+    # below) — an LLM-side failure must still be retryable for real.
+    if idempotency_key:
+        cached = await db.get_idempotent_response(org_id, idempotency_key, "relay_complete")
+        if cached:
+            return RelayResponse(**cached["response_body"])
 
     # ── 1b. Quota check (was missing here before 2026-07 — /relay/complete
     # is a real LLM call path, it must be metered like /proxy/protect) ──────
@@ -311,7 +322,7 @@ async def relay_complete(
         background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
                                    {"request_id": request_id, "provider": provider})
 
-    return RelayResponse(
+    final_relay_response = RelayResponse(
         request_id=request_id,
         provider=llm_result["provider"],
         model=llm_result["model"],
@@ -327,6 +338,14 @@ async def relay_complete(
         usage=llm_result.get("usage", {}),
         processing_ms=processing_ms,
     )
+
+    if idempotency_key:
+        background_tasks.add_task(
+            db.save_idempotent_response, org_id, idempotency_key, "relay_complete",
+            200, final_relay_response.model_dump(),
+        )
+
+    return final_relay_response
 
 
 @router.get("/providers")

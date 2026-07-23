@@ -5,6 +5,7 @@ All writes are validated and scoped by org_id before reaching this layer.
 """
 import httpx
 import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from app.config import settings
 
@@ -865,6 +866,45 @@ async def get_organization(org_id: str) -> Optional[Dict[str, Any]]:
         )
     rows = response.json() if response.status_code == 200 else []
     return rows[0] if rows else None
+
+
+# ── Idempotency (added 2026-07-23, roadmap item #5) ─────────────────────────
+# Standard Idempotency-Key pattern: a retried call with the same key gets
+# back the exact response already computed, without re-running detection
+# or re-incrementing quota. Scoped to non-streaming endpoints for v1.
+
+async def get_idempotent_response(org_id: str, key: str, endpoint: str) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/idempotency_keys",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}", "idempotency_key": f"eq.{key}",
+                "endpoint": f"eq.{endpoint}", "expires_at": f"gt.{datetime.now(timezone.utc).isoformat()}",
+                "select": "status_code,response_body", "limit": "1",
+            },
+        )
+    rows = response.json() if response.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+async def save_idempotent_response(
+    org_id: str, key: str, endpoint: str, status_code: int, response_body: Dict[str, Any],
+) -> None:
+    # Best-effort — if this fails (e.g. a genuine duplicate key race), the
+    # caller's actual response to the client is unaffected either way.
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            await client.post(
+                f"{SUPABASE_REST}/idempotency_keys",
+                headers={**SUPABASE_HEADERS, "Prefer": "resolution=ignore-duplicates"},
+                json={
+                    "org_id": org_id, "idempotency_key": key, "endpoint": endpoint,
+                    "status_code": status_code, "response_body": response_body,
+                },
+            )
+        except Exception as e:
+            print(f"[Idempotency] save failed (non-fatal): {e}")
 
 
 # ── Programmatic sub-account creation (added 2026-07) ───────────────────────

@@ -11,7 +11,7 @@ import os
 import base64
 import hashlib
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from typing import Dict, Any, Optional
 
 from app.models.schemas import (
@@ -68,7 +68,9 @@ async def _detect_with_timeout(prompt: str) -> list:
 @router.post("/detect", response_model=DetectResponse)
 async def detect_pii(
     body: DetectRequest,
+    background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """Analysis mode: detect PII without masking or storing."""
     t0 = time.monotonic()
@@ -79,24 +81,43 @@ async def detect_pii(
     if pipeline["org_id"] != key_record["org_id"]:
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
+    org_id = pipeline["org_id"]
+
+    # Idempotency (roadmap #5) — a retried call with the same key gets back
+    # the exact response already computed, without re-detecting or
+    # re-incrementing quota. Added after Octupus reported a real 6.6% error
+    # rate on their calls, which makes retries routine.
+    if idempotency_key:
+        cached = await db.get_idempotent_response(org_id, idempotency_key, "detect")
+        if cached:
+            return DetectResponse(**cached["response_body"])
+
     # Quota check — previously missing on /detect, meaning it was unmetered.
     # Soft-cap: never blocks, just counts (see quota.py).
-    await quota_svc.check_and_increment(pipeline["org_id"])
+    await quota_svc.check_and_increment(org_id)
 
     try:
         detections = await _detect_with_timeout(body.prompt)
     except DegradedModeError as e:
         # /detect is analysis-only (nothing to protect/mask) — on failure,
         # just return zero detections rather than fail the whole request.
-        print(f"[Resilience] /detect degraded ({e.reason}) org={pipeline['org_id']}")
+        print(f"[Resilience] /detect degraded ({e.reason}) org={org_id}")
         detections = []
     processing_ms = int((time.monotonic() - t0) * 1000)
 
-    return DetectResponse(
+    response = DetectResponse(
         request_id=f"req_{uuid.uuid4().hex[:8]}",
         detections=detections,
         stats=detector.build_stats(detections, processing_ms),
     )
+
+    if idempotency_key:
+        background_tasks.add_task(
+            db.save_idempotent_response, org_id, idempotency_key, "detect",
+            200, response.model_dump(),
+        )
+
+    return response
 
 
 # ── /proxy/protect ───────────────────────────────────────────────────────────
@@ -106,6 +127,7 @@ async def protect_prompt(
     body: ProtectRequest,
     background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
     CORE endpoint — Phase 7b: Contextual Policy Engine + Risk Scoring.
@@ -134,6 +156,15 @@ async def protect_prompt(
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
     org_id = pipeline["org_id"]
+
+    # Idempotency (roadmap #5) — checked BEFORE quota so a retry with the
+    # same key never counts twice against the partner's tier. Added after
+    # Octupus reported a real 6.6% error rate on their calls, which makes
+    # retries routine, not an edge case.
+    if idempotency_key:
+        cached = await db.get_idempotent_response(org_id, idempotency_key, "protect")
+        if cached:
+            return ProtectResponse(**cached["response_body"])
 
     # ── Step 1b: Quota check ─────────────────────────────────────────────────
     # Soft-cap: atomically increments the request counter (rolled up to the
@@ -174,6 +205,10 @@ async def protect_prompt(
             "conversation_id": body.conversation_id if body.conversation_id else None,
             "metadata": {"request_id": request_id, "degraded_reason": e.reason},
         })
+        # Deliberately NOT saved to the idempotency cache: this is a
+        # transient internal failure, not a "real" result. Caching it would
+        # freeze the degraded response for 24h on retry, even if the
+        # detector would have worked fine on the next attempt.
         return ProtectResponse(
             request_id=request_id,
             protected_prompt=body.prompt,  # unmodified — fail open
@@ -231,7 +266,7 @@ async def protect_prompt(
         })
         background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
                                    {"request_id": request_id})
-        return ProtectResponse(
+        blocked_response = ProtectResponse(
             request_id=request_id,
             protected_prompt="[BLOCKED: Policy violation — PII detected that cannot be processed]",
             detections=detections if body.options.include_detections else [],
@@ -241,6 +276,12 @@ async def protect_prompt(
             audit_log_id=audit_log_id,
             gdpr_compliant=False,
         )
+        if idempotency_key:
+            background_tasks.add_task(
+                db.save_idempotent_response, org_id, idempotency_key, "protect",
+                200, blocked_response.model_dump(),
+            )
+        return blocked_response
 
     # Apply replacements back-to-front to preserve offsets
     for detection in reversed(detections):
@@ -436,7 +477,7 @@ async def protect_prompt(
         processing_ms,
     )
 
-    return ProtectResponse(
+    final_response = ProtectResponse(
         request_id=request_id,
         protected_prompt=protected_prompt,
         detections=detections if body.options.include_detections else [],
@@ -444,6 +485,14 @@ async def protect_prompt(
         audit_log_id=audit_log_id,
         gdpr_compliant=stats["leaked"] == 0,
     )
+
+    if idempotency_key:
+        background_tasks.add_task(
+            db.save_idempotent_response, org_id, idempotency_key, "protect",
+            200, final_response.model_dump(),
+        )
+
+    return final_response
 
 
 # ── /proxy/test ──────────────────────────────────────────────────────────────
