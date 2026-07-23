@@ -38,9 +38,17 @@ class Settings(BaseSettings):
     INTERNAL_NOTIFY_SECRET: Optional[str] = None
 
     # ── CORS ───────────────────────────────────────────────────────
+    # Fixed 2026-07-23: "app.privaro.io" was never a real domain -- the
+    # app lives under privaro.ai itself (e.g. privaro.ai/app/...), not a
+    # separate subdomain, and never on a .io TLD. Confirmed against the
+    # frontend repo's own schema.org metadata (index.html), which only
+    # ever declares https://privaro.ai. This list is currently unused in
+    # practice since main.py sets allow_origins=["*"], but keeping it
+    # correct so it's safe to tighten CORS later without re-auditing.
     CORS_ORIGINS: List[str] = [
+        "https://privaro.ai",
+        "https://www.privaro.ai",
         "https://privaro.lovable.app",
-        "https://app.privaro.io",
         "http://localhost:5173",
         "http://localhost:3000",
     ]
