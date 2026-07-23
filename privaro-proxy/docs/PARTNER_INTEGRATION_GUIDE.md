@@ -1,6 +1,6 @@
 # Privaro — Guía de integración para partners
 
-**Versión:** v4
+**Versión:** v5
 **Última actualización:** 2026-07-23
 **Ámbito:** Partners tipo "agregador" (ISV que embebe Privaro en su propio producto y reparte el consumo entre sus clientes finales). Ejemplo de referencia: Octupus Technologies / Robin AI.
 
@@ -91,6 +91,10 @@ Cada llamada cuenta contra la cuota del partner (agregada), pero genera audit lo
 
 `/v1/proxy/detect` funciona igual, en modo solo-análisis (sin persistir).
 
+**Consistencia entre turnos (corregido 2026-07-23):** si se manda `conversation_id` en el body, el mismo dato personal recibe el mismo token en toda la conversación. Esto llevaba tiempo roto en el código (comparaba valores cifrados con nonce aleatorio, que nunca coinciden) — corregido con un hash determinista, y extendido a `/v1/relay/complete` y `/v1/relay/stream`, que antes no tenían ninguna consistencia entre turnos. El `conversation_id` es libre — no necesita corresponder a ninguna fila real dentro de Privaro (antes exigía una FK hacia la tabla interna de conversaciones, lo cual habría hecho fallar con 500 a cualquier partner que usara su propio id de sesión — corregido también).
+
+**Reintentos seguros (añadido 2026-07-23):** cabecera opcional `Idempotency-Key` en `/v1/proxy/protect`, `/v1/proxy/detect` y `/v1/relay/complete` (no en `/v1/relay/stream`). Un reintento con la misma clave devuelve la respuesta ya calculada sin volver a contar contra la cuota ni repetir la llamada al LLM. Válida 24h.
+
 **Streaming (añadido 2026-07-23):** si el producto del partner muestra las respuestas del LLM en streaming (la mayoría de chats modernos), existe una vía completa alternativa que también llama al LLM por vosotros:
 
 ```
@@ -178,4 +182,5 @@ Si lo activas, te avisamos automáticamente por email o webhook cuando el consum
 | v2 | 2026-07-02 | Corregido: codificación UTF-8 en respuestas JSON (afectaba a nombres con tildes/guiones en clientes como PowerShell). Corregido: `get_latest_dpo_report` buscaba `status='completed'`, el valor real es `'ready'` — el endpoint de informe DPO nunca habría devuelto nada. Añadido: notificaciones automáticas de consumo al 80%/100% del tier (Sección 3.6). Añadido: webhook `dpo_report.generated` hacia el partner cuando se genera un informe de un cliente final (Sección 3.5). |
 | v3 | 2026-07-23 | Corregido: nombre del partner de referencia (Octopus → Octupus). Añadido: Sección 3.2, activación de pago vía Stripe (link de pago + código promocional), con las dos lecciones aprendidas al hacerlo por primera vez (el código no puede ir restringido a un customer en un Payment Link genérico; Adaptive Pricing puede ofrecer monedas no deseadas si no se desactiva). Actualizado: la Sección 3.3 (antes 3.2) ya no es un alta manual de clientes finales por parte de Privaro — ahora es autoservicio real del partner desde "Mis clientes", probado end-to-end. Actualizado el checklist de arranque y el roadmap pendiente en consecuencia. |
 | v4 | 2026-07-23 | Añadido: streaming real (`/v1/relay/stream`), con toggle `streaming_enabled` por organización. Añadido: alta programática de sub-accounts vía API (`POST /v1/partner/sub-accounts`, permiso `partner:write_children`), alternativa a la UI para partners que quieran automatizar el alta de sus propios clientes. Añadido: aviso automático por email cuando el descuento pasa a fase de revisión (el cambio real del cupón en Stripe sigue siendo manual). Corregido: bug de seguridad real — las claves de proveedores LLM (BYOK) se guardaban sin cifrar; ahora se cifran server-side antes de guardarse. |
+| v5 | 2026-07-23 | Corregido: la consistencia de tokens entre turnos de conversación (`conversation_id`) nunca había funcionado — comparaba valores cifrados con nonce aleatorio, que nunca coinciden entre sí; arreglado con un hash determinista. Corregido: `conversation_id` en `/v1/proxy/protect` y `/v1/relay/*` exigía una foreign key hacia la tabla interna de conversaciones de Privaro, que un id de conversación de un partner nunca cumpliría — habría fallado con 500 en cuanto alguien lo usara de verdad. Extendida la consistencia de tokens a `/v1/relay/complete` y `/v1/relay/stream` (antes solo existía, rota, en `/v1/proxy/protect`). Añadido: cabecera `Idempotency-Key` en `/v1/proxy/protect`, `/v1/proxy/detect` y `/v1/relay/complete` — un reintento con la misma clave no cuenta dos veces contra la cuota ni repite la llamada al LLM. |
 

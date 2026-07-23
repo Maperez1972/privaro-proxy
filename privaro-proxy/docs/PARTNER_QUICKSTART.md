@@ -1,6 +1,6 @@
 # Privaro — Guía de integración rápida para partners
 
-**Versión:** v2
+**Versión:** v3
 **Última actualización:** 23 de julio de 2026
 
 Esta guía cubre únicamente los pasos que tu equipo tiene que ejecutar para integrar Privaro en vuestro producto. No incluye nada de cómo funciona Privaro por dentro — solo lo que necesitáis vosotros.
@@ -82,6 +82,24 @@ Body:
 ```
 
 Enviad `protected_prompt` (no el original) al proveedor del LLM. El `pipeline_id` de cada cliente os lo proporciona Privaro al darlo de alta.
+
+### Reintentos seguros — cabecera `Idempotency-Key`
+
+Con vuestra tasa de error reportada (~6,6%), los reintentos son habituales. Si mandáis la misma petición dos veces con la misma cabecera `Idempotency-Key`, Privaro os devuelve exactamente la misma respuesta que ya calculó la primera vez — sin volver a contar la petición contra vuestra cuota, y en `/v1/relay/complete`, sin volver a pagar la llamada al LLM:
+
+```
+POST https://api.privaro.ai/v1/proxy/protect
+Headers:
+  X-Privaro-Key: <API key del cliente final>
+  Idempotency-Key: <un identificador único vuestro para este intento lógico>
+  Content-Type: application/json
+```
+
+Usad un identificador que generéis vosotros por cada intento lógico (no por cada HTTP request — el mismo id en el reintento es lo que activa la reutilización). Válido durante 24h. Soportado en `/v1/proxy/protect`, `/v1/proxy/detect` y `/v1/relay/complete` — no en `/v1/relay/stream` (repetir un stream completo no tiene el mismo sentido que repetir una respuesta corta).
+
+### Coherencia entre turnos de una conversación — campo `conversation_id`
+
+Si mandáis un `conversation_id` propio (vuestro id de conversación/sesión, el que uséis en Robin) en el body de `/v1/proxy/protect`, `/v1/relay/complete` o `/v1/relay/stream`, Privaro reutiliza el mismo token para el mismo dato personal a lo largo de toda la conversación — si un email sale como `[EM-0001]` en el turno 1, sigue siendo `[EM-0001]` en el turno 5, no un token nuevo cada vez. No hace falta que ese id exista en ningún sitio de Privaro — es simplemente un identificador vuestro para agrupar los turnos.
 
 ### Modo solo-análisis (sin bloquear ni persistir)
 
