@@ -73,6 +73,10 @@ app.include_router(byok.router, tags=["BYOK"])
 from app.routers import partner
 app.include_router(partner.router, prefix="/v1/partner", tags=["Partner API"])
 
+# Internal — server-to-server only (never called from a browser)
+from app.routers import internal
+app.include_router(internal.router, tags=["Internal"])
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
