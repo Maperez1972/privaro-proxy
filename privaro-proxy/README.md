@@ -83,13 +83,13 @@ Después de añadir las variables → Railway redeploya automáticamente.
 ## PASO 4 — Railway: configurar dominio personalizado
 
 1. Railway → tu proyecto → **Settings** → **Networking** → **Custom Domain**
-2. Añadir: `proxy.privaro.io`
+2. Añadir: `api.privaro.ai` *(dominio real ya configurado en producción desde julio 2026 — sustituye al ejemplo `proxy.privaro.io` de versiones anteriores de este README)*
 3. Copiar el CNAME que Railway te da
-4. En tu DNS (Cloudflare/Namecheap/etc): añadir registro CNAME apuntando al valor de Railway
-5. Esperar propagación (1-5 min con Cloudflare)
+4. En tu DNS: añadir registro CNAME apuntando al valor de Railway
+5. Esperar propagación (confirmado: ya propagado y respondiendo `{"status":"ok", ...}` en `/health`)
 
 Si no tienes dominio todavía, Railway te asigna uno automático tipo:
-`privaro-proxy-production.up.railway.app` — úsalo mientras tanto.
+`privaro-proxy-production.up.railway.app` — sigue activo en paralelo, pero usa `api.privaro.ai` en toda documentación e integraciones nuevas.
 
 ---
 

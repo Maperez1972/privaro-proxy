@@ -82,7 +82,7 @@ Request access at: https://privaro.ai
 ### 2. Protect a prompt
 
 ```
-curl -X POST "https://privaro-proxy-production.up.railway.app/v1/proxy/protect" \
+curl -X POST "https://api.privaro.ai/v1/proxy/protect" \
   -H "Content-Type: application/json" \
   -H "X-Privaro-Key: YOUR_API_KEY" \
   -d '{
