@@ -53,6 +53,13 @@ class Settings(BaseSettings):
         "http://localhost:3000",
     ]
 
+    # ── Resilience / graceful degradation (added 2026-07) ───────────────────
+    # Max time budget for the detection + policy engine step in /protect and
+    # /detect. If exceeded, fails open (see proxy.py) rather than blocking
+    # the caller's traffic indefinitely — Privaro sits in Robin/Octupus's
+    # critical path, so an internal slowdown must never become their outage.
+    PROTECT_TIMEOUT_SECONDS: float = 2.0
+
     # ── Rate limiting ──────────────────────────────────────────────
     RATE_LIMIT_PER_MINUTE: int = 60
 

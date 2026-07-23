@@ -50,6 +50,13 @@ class ProtectResponse(BaseModel):
     stats: Dict[str, Any]
     audit_log_id: Optional[str] = None
     gdpr_compliant: bool = True
+    # Added 2026-07 — graceful degradation. When true, the detector/policy
+    # engine failed or timed out and protected_prompt is the ORIGINAL,
+    # UNMODIFIED prompt (fail-open, never blocks the caller's traffic).
+    # The event is still logged to audit_logs (event_type=degraded_bypass)
+    # so the DPO has visibility that unprotected data may have gone out.
+    degraded_mode: bool = False
+    degraded_reason: Optional[str] = None
 
 
 class DetectResponse(BaseModel):

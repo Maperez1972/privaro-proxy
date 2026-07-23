@@ -10,6 +10,7 @@ import uuid
 import os
 import base64
 import hashlib
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Dict, Any, Optional
 
@@ -28,6 +29,38 @@ from app.config import settings
 from app.services import quota as quota_svc
 
 router = APIRouter()
+
+
+# ── Resilience helper — added 2026-07 ───────────────────────────────────────
+# Privaro sits in the caller's critical path (every LLM call from Robin/
+# Octupus goes through here first). An internal slowdown or bug in the
+# detector/policy engine must never become an outage for the partner's own
+# product. This wraps the blocking detection step with a hard timeout and
+# fails OPEN (passes the original prompt through unmodified) rather than
+# raising a 500 — consistent with the existing soft-cap quota philosophy
+# ("never block the caller's traffic"). The event is still logged (see
+# callers) so this is never a silent bypass from a compliance standpoint.
+
+class DegradedModeError(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
+async def _detect_with_timeout(prompt: str) -> list:
+    """Runs the (synchronous, potentially slow) detector in a thread with a
+    hard timeout. Raises DegradedModeError on timeout or internal failure —
+    callers must catch this and fail open."""
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, detector.detect, prompt),
+            timeout=settings.PROTECT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise DegradedModeError("detector_timeout")
+    except Exception as e:
+        print(f"[Resilience] Detector error, failing open: {e}")
+        raise DegradedModeError("detector_error")
 
 
 # ── /proxy/detect ────────────────────────────────────────────────────────────
@@ -50,7 +83,13 @@ async def detect_pii(
     # Soft-cap: never blocks, just counts (see quota.py).
     await quota_svc.check_and_increment(pipeline["org_id"])
 
-    detections = detector.detect(body.prompt)
+    try:
+        detections = await _detect_with_timeout(body.prompt)
+    except DegradedModeError as e:
+        # /detect is analysis-only (nothing to protect/mask) — on failure,
+        # just return zero detections rather than fail the whole request.
+        print(f"[Resilience] /detect degraded ({e.reason}) org={pipeline['org_id']}")
+        detections = []
     processing_ms = int((time.monotonic() - t0) * 1000)
 
     return DetectResponse(
@@ -105,8 +144,47 @@ async def protect_prompt(
 
     agent_mode = body.options.agent_mode if hasattr(body.options, "agent_mode") else False
 
-    # ── Step 2: Detect PII ───────────────────────────────────────────────────
-    detections = detector.detect(body.prompt)
+    # Pre-generate the audit log id so we can (a) include it in the response
+    # and (b) insert the actual row as a background task without blocking
+    # the caller on it — see Step 6 below.
+    audit_log_id = str(uuid.uuid4())
+
+    # ── Step 2: Detect PII (resilient — fails open on timeout/error) ────────
+    try:
+        detections = await _detect_with_timeout(body.prompt)
+    except DegradedModeError as e:
+        # Detector failed or timed out. Privaro is in the critical path of
+        # every call Robin/Octupus makes to their LLM — we must not turn an
+        # internal hiccup into their outage. Pass the ORIGINAL prompt through
+        # unmodified (fail open), but log this as a distinct, high-severity
+        # audit event so the DPO can see that unprotected data may have gone
+        # out. This is not a silent bypass.
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[Resilience] /protect degraded ({e.reason}) org={org_id} pipeline={body.pipeline_id}")
+        background_tasks.add_task(db.insert_audit_log, {
+            "id": audit_log_id,
+            "org_id": org_id, "pipeline_id": body.pipeline_id,
+            "event_type": "degraded_bypass",
+            "entity_type": "unknown", "entity_category": "system",
+            "action_taken": "passthrough_unprotected", "severity": "critical",
+            "prompt_hash": hashlib.sha256(body.prompt.encode()).hexdigest(),
+            "pipeline_stage": "proxy", "processing_ms": processing_ms,
+            "ibs_status": "pending", "source": "proxy",
+            "risk_score": None, "agent_mode": agent_mode,
+            "conversation_id": body.conversation_id if body.conversation_id else None,
+            "metadata": {"request_id": request_id, "degraded_reason": e.reason},
+        })
+        return ProtectResponse(
+            request_id=request_id,
+            protected_prompt=body.prompt,  # unmodified — fail open
+            detections=[],
+            stats={"total_detected": 0, "total_masked": 0, "leaked": 0,
+                   "coverage_pct": 0.0, "processing_ms": processing_ms, "by_type": {}, "risk_score": None},
+            audit_log_id=audit_log_id,
+            gdpr_compliant=False,
+            degraded_mode=True,
+            degraded_reason=e.reason,
+        )
 
     # ── Step 3: Load policies + provider trust ────────────────────────────────
     policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
@@ -137,7 +215,8 @@ async def protect_prompt(
     if all(d.action == "blocked" for d in detections) and detections:
         processing_ms = int((time.monotonic() - t0) * 1000)
         risk_score = pe.compute_risk_score(detections, provider_risk_level, agent_mode, len(detections))
-        audit_log_id = await db.insert_audit_log({
+        background_tasks.add_task(db.insert_audit_log, {
+            "id": audit_log_id,
             "org_id": org_id, "pipeline_id": body.pipeline_id,
             "event_type": "request_blocked", "entity_type": detections[0].type,
             "entity_category": pe._get_category(detections[0].type),
@@ -150,9 +229,8 @@ async def protect_prompt(
             "metadata": {"request_id": request_id, "mode": body.options.mode.value,
                          "total_detected": len(detections), "total_masked": 0, "by_type": {}},
         })
-        if audit_log_id:
-            background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
-                                       {"request_id": request_id})
+        background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id,
+                                   {"request_id": request_id})
         return ProtectResponse(
             request_id=request_id,
             protected_prompt="[BLOCKED: Policy violation — PII detected that cannot be processed]",
@@ -216,6 +294,7 @@ async def protect_prompt(
     prompt_hash = hashlib.sha256(body.prompt.encode()).hexdigest()
 
     audit_payload = {
+        "id": audit_log_id,
         "org_id": org_id,
         "pipeline_id": body.pipeline_id,
         "event_type": event_type,
@@ -244,7 +323,12 @@ async def protect_prompt(
         },
     }
 
-    audit_log_id = await db.insert_audit_log(audit_payload)
+    # Was a blocking `await db.insert_audit_log(...)` — moved to a background
+    # task now that audit_log_id is pre-generated client-side (see top of
+    # this function). Supabase being slow no longer adds latency to every
+    # single request, and a transient Supabase failure here no longer turns
+    # into a 500 for a request Privaro actually protected successfully.
+    background_tasks.add_task(db.insert_audit_log, audit_payload)
 
     # ── Step 7: INSERT pii_detections ─────────────────────────────────────────
     if detections and audit_log_id:
