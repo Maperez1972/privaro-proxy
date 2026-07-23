@@ -860,6 +860,103 @@ async def get_organization(org_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+# ── Programmatic sub-account creation (added 2026-07) ───────────────────────
+# API-key-authenticated equivalent of the partner-sub-accounts Edge Function
+# (which is JWT/browser-session-authenticated, for "Mis clientes" in the
+# dashboard). This is for a partner's OWN BACKEND to call directly — e.g.
+# Robin auto-provisioning a Privaro sub-account the moment a new Robin
+# client signs up, with zero manual steps from Octupus. Same underlying
+# effect (org + pipeline + api_key, billing rolled up to the partner), same
+# rollback-on-partial-failure behaviour, just reachable via X-Privaro-Key
+# instead of a browser session.
+
+def _slugify_org_name(name: str) -> str:
+    import re
+    import uuid as _uuid
+    base = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return f"{base}-{_uuid.uuid4().hex[:6]}"
+
+
+async def create_sub_account_org(
+    name: str, parent_org_id: str, billing_account_id: str,
+) -> Optional[Dict[str, Any]]:
+    payload = {
+        "name": name,
+        "slug": _slugify_org_name(name),
+        "org_type": "sub_account",
+        "parent_org_id": parent_org_id,
+        "billing_account_id": billing_account_id,
+        "plan": "pro",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/organizations",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            json=payload,
+        )
+    if response.status_code in (200, 201):
+        rows = response.json()
+        return rows[0] if rows else None
+    print(f"[Partner API] create_sub_account_org failed: {response.status_code} {response.text}")
+    return None
+
+
+async def create_pipeline_for_org(
+    org_id: str, name: str, sector: str, llm_provider: str, llm_model: str,
+) -> Optional[Dict[str, Any]]:
+    payload = {
+        "org_id": org_id, "name": name, "sector": sector,
+        "llm_provider": llm_provider, "llm_model": llm_model,
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/pipelines",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            json=payload,
+        )
+    if response.status_code in (200, 201):
+        rows = response.json()
+        return rows[0] if rows else None
+    print(f"[Partner API] create_pipeline_for_org failed: {response.status_code} {response.text}")
+    return None
+
+
+async def create_api_key_for_org(
+    org_id: str, name: str, key_hash: str, key_prefix: str, pipeline_ids: list,
+) -> bool:
+    payload = {
+        "org_id": org_id, "name": name, "key_hash": key_hash,
+        "key_prefix": key_prefix, "pipeline_ids": pipeline_ids,
+        "permissions": ["proxy:write", "proxy:read"],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/api_keys", headers=SUPABASE_HEADERS, json=payload,
+        )
+    if response.status_code in (200, 201):
+        return True
+    print(f"[Partner API] create_api_key_for_org failed: {response.status_code} {response.text}")
+    return False
+
+
+async def delete_organization(org_id: str) -> None:
+    """Best-effort rollback helper — used if a later step in sub-account
+    creation fails, to avoid leaving an orphaned org behind."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.delete(
+            f"{SUPABASE_REST}/organizations", headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{org_id}"},
+        )
+
+
+async def delete_pipeline(pipeline_id: str) -> None:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.delete(
+            f"{SUPABASE_REST}/pipelines", headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{pipeline_id}"},
+        )
+
+
 async def verify_sub_account(partner_org_id: str, sub_org_id: str) -> bool:
     """True only if sub_org_id is a sub_account whose parent is partner_org_id."""
     sub_org = await get_organization(sub_org_id)
