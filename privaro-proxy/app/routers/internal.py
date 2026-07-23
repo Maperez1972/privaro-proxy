@@ -24,7 +24,6 @@ localStorage or gets echoed back.
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import os
 
 from app.config import settings
 from app.services.key_manager import encrypt_byok_key_for_storage
@@ -38,29 +37,6 @@ class EncryptKeyRequest(BaseModel):
 
 class EncryptKeyResponse(BaseModel):
     encrypted: str
-
-
-@router.get("/diag-secret")
-async def diag_secret():
-    """
-    TEMPORARY diagnostic (2026-07-23) — chasing a server_misconfigured
-    error where the user confirms INTERNAL_NOTIFY_SECRET is set in Railway
-    with the right name/value, but settings.INTERNAL_NOTIFY_SECRET still
-    reads as falsy. Compares os.environ directly against what pydantic-
-    settings loaded, without ever revealing the actual value. Remove once
-    resolved.
-    """
-    raw_env = os.environ.get("INTERNAL_NOTIFY_SECRET")
-    return {
-        "os_environ_present": raw_env is not None,
-        "os_environ_length": len(raw_env) if raw_env else 0,
-        "os_environ_has_leading_or_trailing_whitespace": (raw_env != raw_env.strip()) if raw_env else None,
-        "pydantic_settings_present": settings.INTERNAL_NOTIFY_SECRET is not None,
-        "pydantic_settings_length": len(settings.INTERNAL_NOTIFY_SECRET) if settings.INTERNAL_NOTIFY_SECRET else 0,
-        "pydantic_settings_truthy": bool(settings.INTERNAL_NOTIFY_SECRET),
-        "values_match": raw_env == settings.INTERNAL_NOTIFY_SECRET,
-        "environment": settings.ENVIRONMENT,
-    }
 
 
 @router.post("/encrypt-provider-key", response_model=EncryptKeyResponse)
