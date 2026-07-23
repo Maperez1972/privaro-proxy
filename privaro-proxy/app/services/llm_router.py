@@ -305,5 +305,130 @@ async def route(
     )
 
 
+# ── Streaming call implementations (added 2026-07) ──────────────────────────
+# Only Anthropic and OpenAI support streaming for now — Mistral/Gemini fall
+# back to a clear "not supported yet" error from route_stream() below rather
+# than silently behaving like the non-streaming path.
+
+async def _stream_anthropic(
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7,
+    system: Optional[str] = None,
+):
+    """Yields raw text deltas as they arrive from Anthropic's SSE stream."""
+    sys_msg = system or next((m["content"] for m in messages if m["role"] == "system"), None)
+    conv_messages = [m for m in messages if m["role"] != "system"]
+    body: Dict[str, Any] = {
+        "model": model or PROVIDERS["anthropic"]["default_model"],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": conv_messages,
+        "stream": True,
+    }
+    if sys_msg:
+        body["system"] = sys_msg
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST", "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json=body,
+        ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                raise LLMRouterError(f"Anthropic error {resp.status_code}: {error_body[:300]}",
+                                     "anthropic", resp.status_code)
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[len("data:"):].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    text = delta.get("text", "")
+                    if text:
+                        yield text
+
+
+async def _stream_openai(
+    model: str, messages: List[Dict], api_key: str,
+    max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
+):
+    """Yields raw text deltas as they arrive from OpenAI's SSE stream.
+    Also used for Azure OpenAI — same wire format."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST", "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model or PROVIDERS["openai"]["default_model"],
+                  "messages": messages, "max_tokens": max_tokens,
+                  "temperature": temperature, "stream": True},
+        ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                raise LLMRouterError(f"OpenAI error {resp.status_code}: {error_body[:300]}",
+                                     "openai", resp.status_code)
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[len("data:"):].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                choices = event.get("choices", [])
+                if choices:
+                    delta_text = choices[0].get("delta", {}).get("content", "")
+                    if delta_text:
+                        yield delta_text
+
+
+STREAM_CALLERS = {
+    "anthropic": _stream_anthropic,
+    "openai": _stream_openai,
+}
+
+
+async def route_stream(
+    provider: str,
+    messages: List[Dict],
+    org_id: str,
+    model: Optional[str] = None,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    system: Optional[str] = None,
+):
+    """
+    Same contract as route(), but yields text deltas as they arrive instead
+    of returning a single completed response. Raises LLMRouterError (before
+    yielding anything) if the provider doesn't support streaming yet, or if
+    the API key / provider config lookup fails — callers can catch this
+    before committing to a streaming HTTP response.
+    """
+    provider = _resolve_provider(provider)
+    caller = STREAM_CALLERS.get(provider)
+    if not caller:
+        raise LLMRouterError(
+            f"Streaming not yet supported for provider: {provider}. "
+            f"Supported for streaming: {list(STREAM_CALLERS.keys())}. "
+            f"Use /v1/relay/complete (non-streaming) for this provider instead.",
+            provider, 400
+        )
+    api_key = await get_customer_api_key(org_id, provider)
+    async for chunk in caller(
+        model=model, messages=messages, api_key=api_key,
+        max_tokens=max_tokens, temperature=temperature, system=system,
+    ):
+        yield chunk
+
+
 def list_providers() -> Dict:
     return {k: v for k, v in PROVIDERS.items()}

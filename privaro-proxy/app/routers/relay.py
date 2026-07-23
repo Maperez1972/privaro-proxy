@@ -16,6 +16,7 @@ import time
 import uuid
 import hashlib
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 
@@ -24,10 +25,77 @@ from app.services import supabase as db
 from app.services import ibs
 from app.services import detector
 from app.services import policy_engine as pe
+from app.services import quota as quota_svc
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
-from app.services.llm_router import route, LLMRouterError, list_providers
+from app.services.llm_router import route, route_stream, LLMRouterError, list_providers
 
 router = APIRouter(prefix="/v1/relay", tags=["relay"])
+
+PREFIX_MAP = {
+    "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
+    "credit_card": "CC", "email": "EM", "phone": "PH",
+    "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT",
+}
+
+
+async def _protect_messages(messages, org_id, pipeline_id, provider, sector, user_role, mode):
+    """
+    Shared PII-protection logic for both /complete and /stream. Factored out
+    2026-07 when adding streaming, so both paths run exactly the same
+    detection/tokenisation instead of it drifting between two copies.
+
+    Returns (protected_messages, all_detections, token_map).
+    """
+    policies = await db.get_policy_rules(org_id, pipeline_id=pipeline_id) or []
+    provider_trust = await db.get_provider_trust(provider, org_id)
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+
+    policy_context = {
+        "provider": provider,
+        "user_role": user_role,
+        "data_region": (provider_trust or {}).get("data_region", "EU"),
+        "agent_mode": False,
+        "pipeline_sector": sector,
+        "default_action": mode,
+    }
+
+    protected_messages = []
+    all_detections = []
+    token_map: Dict[str, str] = {}
+
+    for msg in messages:
+        detections = detector.detect(msg.content)
+        if detections and policies:
+            detections = pe.apply_policies(detections, policies, policy_context)
+        elif detections:
+            for d in detections:
+                d.action = mode if mode in ("tokenise", "anonymise", "block") else "tokenised"
+
+        protected_content = msg.content
+        counters: Dict[str, int] = {}
+
+        for d in reversed(detections):
+            if d.start is None or d.end is None:
+                continue
+            original_value = msg.content[d.start:d.end]
+            if d.action in ("tokenised", "pseudonymised", "tokenise"):
+                entity_type = d.type
+                counters[entity_type] = counters.get(entity_type, 0) + 1
+                prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
+                token = f"[{prefix}-{counters[entity_type]:04d}]"
+                d.token = token
+                d.action = "tokenised"
+                token_map[token] = original_value
+                protected_content = protected_content[:d.start] + token + protected_content[d.end:]
+            elif d.action in ("anonymised", "anonymise"):
+                d.action = "anonymised"
+                protected_content = (protected_content[:d.start] +
+                                     f"[{d.type.upper()}]" + protected_content[d.end:])
+
+        all_detections.extend(detections)
+        protected_messages.append({"role": msg.role, "content": protected_content})
+
+    return protected_messages, all_detections, token_map, provider_risk_level
 
 
 class RelayMessage(BaseModel):
@@ -97,70 +165,15 @@ async def relay_complete(
     provider = body.provider or pipeline.get("llm_provider", "anthropic")
     model = body.model or pipeline.get("llm_model")
 
+    # ── 1b. Quota check (was missing here before 2026-07 — /relay/complete
+    # is a real LLM call path, it must be metered like /proxy/protect) ──────
+    await quota_svc.check_and_increment(org_id)
+
     # ── 2. Protect all messages ───────────────────────────────────────────────
-    protected_messages = []
-    all_detections = []
-    token_map: Dict[str, str] = {}
-
-    enc_key_id = await get_org_default_key_id(org_id)
-    try:
-        enc_key = await resolve_encryption_key(enc_key_id, org_id)
-    except Exception:
-        from app.services.key_manager import _get_managed_key
-        enc_key = _get_managed_key()
-        enc_key_id = "key-v1"
-
-    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
-    provider_trust = await db.get_provider_trust(provider, org_id)
-    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
-
-    policy_context = {
-        "provider": provider,
-        "user_role": key_record.get("role", "developer"),
-        "data_region": (provider_trust or {}).get("data_region", "EU"),
-        "agent_mode": False,
-        "pipeline_sector": pipeline.get("sector", "general"),
-        "default_action": body.options.mode,
-    }
-
-    PREFIX_MAP = {
-        "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
-        "credit_card": "CC", "email": "EM", "phone": "PH",
-        "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT",
-    }
-
-    for msg in body.messages:
-        detections = detector.detect(msg.content)
-        if detections and policies:
-            detections = pe.apply_policies(detections, policies, policy_context)
-        elif detections:
-            for d in detections:
-                d.action = body.options.mode if body.options.mode in (
-                    "tokenise", "anonymise", "block") else "tokenised"
-
-        protected_content = msg.content
-        counters: Dict[str, int] = {}
-
-        for d in reversed(detections):
-            if d.start is None or d.end is None:
-                continue
-            original_value = msg.content[d.start:d.end]
-            if d.action in ("tokenised", "pseudonymised", "tokenise"):
-                entity_type = d.type
-                counters[entity_type] = counters.get(entity_type, 0) + 1
-                prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
-                token = f"[{prefix}-{counters[entity_type]:04d}]"
-                d.token = token
-                d.action = "tokenised"
-                token_map[token] = original_value
-                protected_content = protected_content[:d.start] + token + protected_content[d.end:]
-            elif d.action in ("anonymised", "anonymise"):
-                d.action = "anonymised"
-                protected_content = (protected_content[:d.start] +
-                                     f"[{d.type.upper()}]" + protected_content[d.end:])
-
-        all_detections.extend(detections)
-        protected_messages.append({"role": msg.role, "content": protected_content})
+    protected_messages, all_detections, token_map, provider_risk_level = await _protect_messages(
+        body.messages, org_id, body.pipeline_id, provider,
+        pipeline.get("sector", "general"), key_record.get("role", "developer"), body.options.mode,
+    )
 
     risk_score = pe.compute_risk_score(all_detections, provider_risk_level, False, 0)
     pii_detected = len(all_detections)
@@ -259,3 +272,133 @@ async def get_providers(
 ):
     """List supported LLM providers and their available models."""
     return {"providers": list_providers()}
+
+
+# ── /v1/relay/stream — added 2026-07 ────────────────────────────────────────
+# Same contract as /complete, but streams the LLM's response back as it's
+# generated (SSE), for chat products that show responses token-by-token.
+# Gated by organizations.streaming_enabled (default true) — an admin can
+# turn this off from their dashboard (Billing → Security Configuration) if
+# they'd rather every response go through the non-streaming /complete path.
+
+import json as _json
+
+
+def _find_safe_flush_point(buf: str) -> int:
+    """
+    Index up to which `buf` is safe to emit without risking cutting a
+    [XX-NNNN] token in half across two stream chunks. Looks for the last
+    unclosed '[' — if found, everything from there onward is held back
+    until a matching ']' arrives in a later chunk.
+    """
+    last_open = buf.rfind("[")
+    if last_open == -1:
+        return len(buf)
+    if "]" in buf[last_open:]:
+        return len(buf)
+    return last_open
+
+
+def _detokenise(text: str, token_map: Dict[str, str]) -> str:
+    for token, original in sorted(token_map.items(), key=lambda x: len(x[0]), reverse=True):
+        if token in text:
+            text = text.replace(token, original)
+    return text
+
+
+@router.post("/stream")
+async def relay_stream(
+    body: RelayRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+):
+    t0 = time.monotonic()
+    request_id = f"relaystream_{uuid.uuid4().hex[:12]}"
+    audit_log_id = str(uuid.uuid4())
+
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+
+    org_id = pipeline["org_id"]
+
+    org = await db.get_organization(org_id)
+    if org and org.get("streaming_enabled") is False:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "streaming_disabled",
+                    "message": "Streaming is turned off for this organization. "
+                               "An admin can enable it from Billing → Security "
+                               "Configuration, or use /v1/relay/complete instead."},
+        )
+
+    await quota_svc.check_and_increment(org_id)
+
+    provider = body.provider or pipeline.get("llm_provider", "anthropic")
+    model = body.model or pipeline.get("llm_model")
+
+    protected_messages, all_detections, token_map, provider_risk_level = await _protect_messages(
+        body.messages, org_id, body.pipeline_id, provider,
+        pipeline.get("sector", "general"), key_record.get("role", "developer"), body.options.mode,
+    )
+    risk_score = pe.compute_risk_score(all_detections, provider_risk_level, False, 0)
+    pii_detected = len(all_detections)
+    pii_masked = sum(1 for d in all_detections if d.action in ("tokenised", "anonymised"))
+
+    async def event_generator():
+        buf = ""
+        full_response_parts = []
+        try:
+            async for chunk in route_stream(
+                provider=provider, messages=protected_messages, org_id=org_id,
+                model=model, max_tokens=body.options.max_tokens,
+                temperature=body.options.temperature, system=body.options.system_prompt,
+            ):
+                buf += chunk
+                safe_point = _find_safe_flush_point(buf)
+                if safe_point > 0:
+                    to_emit = buf[:safe_point]
+                    buf = buf[safe_point:]
+                    if body.options.detokenise_response:
+                        to_emit = _detokenise(to_emit, token_map)
+                    full_response_parts.append(to_emit)
+                    yield f"data: {_json.dumps({'delta': to_emit})}\n\n"
+        except LLMRouterError as e:
+            yield f"data: {_json.dumps({'error': str(e), 'provider': e.provider})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        if buf:
+            if body.options.detokenise_response:
+                buf = _detokenise(buf, token_map)
+            full_response_parts.append(buf)
+            yield f"data: {_json.dumps({'delta': buf})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+        # Best-effort audit log after the stream completes — never blocks
+        # or delays anything the caller sees, same philosophy as /protect.
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        primary_msg = body.messages[0].content if body.messages else ""
+        await db.insert_audit_log({
+            "id": audit_log_id,
+            "org_id": org_id, "pipeline_id": body.pipeline_id,
+            "event_type": "relay_stream",
+            "entity_type": all_detections[0].type if all_detections else "none",
+            "entity_category": pe._get_category(all_detections[0].type) if all_detections else "none",
+            "action_taken": "tokenised" if pii_masked > 0 else "passed",
+            "severity": "high" if risk_score > 0.7 else "medium" if risk_score > 0.4 else "low",
+            "prompt_hash": hashlib.sha256(primary_msg.encode()).hexdigest(),
+            "pipeline_stage": "relay_stream",
+            "processing_ms": processing_ms,
+            "ibs_status": "pending", "source": "relay_stream",
+            "risk_score": risk_score, "agent_mode": False,
+            "conversation_id": body.conversation_id,
+            "metadata": {"request_id": request_id, "provider": provider, "model": model,
+                         "total_detected": pii_detected, "total_masked": pii_masked},
+        })
+        await ibs.certify_audit_log(audit_log_id, org_id, {"request_id": request_id, "provider": provider})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
