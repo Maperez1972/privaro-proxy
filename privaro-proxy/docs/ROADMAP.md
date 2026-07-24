@@ -91,6 +91,16 @@ Encontrado y arreglado desde el frontend (Lovable) + backend en la misma sesión
 - **Backend**: política RLS reemplazada por una restringida a `profiles.is_platform_admin` (vía función `is_platform_admin(uuid)` reutilizable, mismo patrón que `get_user_org_id()`). Verificado con datos reales: `true` para el superadmin, `false` para admins de Octupus/Partner Demo — el hueco real queda cerrado.
 - Los inserts desde `send-demo-request` no se ven afectados — confirmado que usa `SUPABASE_SERVICE_ROLE_KEY`, que bypasea RLS.
 
+### Segundo escaneo — 5 hallazgos, 3 falsos positivos + 2 críticos nuevos reales (24 de julio de 2026)
+
+Lovable volvió a reportar 5 críticos, 3 de los cuales resultaron ser **el mismo escaneo desactualizado** (los 3 hallazgos ya cerrados en la ronda anterior: `retention-cleanup`, `chat-completion`, `VITE_PROXY_API_KEY`) — confirmado contra el código real desplegado (versiones 9, 13 y el repo actual respectivamente, todos con el arreglo presente). No se tocó nada de estos tres, ya estaban bien.
+
+Los 2 hallazgos nuevos eran reales y graves:
+
+1. **`send-email-resend` sin verificación de firma**: el Auth Hook de "enviar email" no verificaba en absoluto que la petición viniera de Supabase — cualquiera que conociera la URL podía hacer que Privaro enviara un email con marca oficial a cualquier dirección, con enlaces/códigos elegidos por el atacante (phishing usando el propio dominio de Privaro). Arreglado con el patrón oficial de Supabase (`standardwebhooks`, verificación HMAC de los headers `webhook-id`/`webhook-timestamp`/`webhook-signature`). **Requiere que Miguel configure el secreto `SEND_EMAIL_HOOK_SECRET`** (generado desde Supabase Dashboard → Authentication → Hooks → Send Email) antes de desplegar el código — de lo contrario se cortaría el envío de todos los emails de autenticación. Código listo, pendiente de coordinar el despliegue.
+
+2. **`reveal-token` permitía descifrar PII de cualquier organización**: cualquier admin/dpo (de cualquier organización) podía descifrar el valor real de un token del vault (nombres, DNIs, IBANs) de otra organización con solo conocer su `token_id` — la comprobación de rol no estaba scoped por organización, y la búsqueda del token tampoco verificaba su `org_id`. Arreglado con el mismo patrón usado en el resto de hallazgos de hoy (resolver `org_id` real vía `profiles`, exigir coincidencia antes de descifrar). Desplegado (v20).
+
 ### Auditoría de seguridad — 3 hallazgos CRÍTICOS (24 de julio de 2026)
 
 Tras el escaneo anterior (4 warnings), un segundo escaneo de Lovable encontró 3 hallazgos marcados como **crítico**, los tres reales y confirmados contra el código/datos reales antes de arreglar:
