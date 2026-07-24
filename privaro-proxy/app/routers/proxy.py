@@ -20,7 +20,7 @@ from app.models.schemas import (
     Detection,
 )
 from app.services import detector
-from app.services.auth import verify_api_key_or_dev
+from app.services.auth import verify_api_key_or_dev, verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
@@ -69,7 +69,7 @@ async def _detect_with_timeout(prompt: str) -> list:
 async def detect_pii(
     body: DetectRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """Analysis mode: detect PII without masking or storing."""
@@ -126,7 +126,7 @@ async def detect_pii(
 async def protect_prompt(
     body: ProtectRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
