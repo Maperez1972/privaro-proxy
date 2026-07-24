@@ -73,3 +73,15 @@ Extendido a `/v1/relay/complete` y `/v1/relay/stream`, que antes no tenían ning
 ## Filosofía de esta sesión de trabajo
 
 Varios de estos puntos empezaron como "vamos a construir X" y terminaron siendo "X ya existía / estaba roto de una forma distinta a la esperada". El patrón que ha funcionado en todos los casos: **verificar contra el código y los datos reales antes de dar nada por bueno** — con dry-runs SQL antes de desplegar, pruebas end-to-end reales antes de cerrar un punto, y desconfianza sana hacia cualquier descripción de cambio ("hecho") que no se haya verificado directamente contra el repo o la base de datos.
+
+### Aprendizaje añadido — CI del SDK de JS (23 de julio de 2026)
+
+El caso del fallo de CI en Node 18 (`privaro-sdk-js`) es un ejemplo claro de este mismo patrón aplicado a tests: costaron **tres intentos** encontrar la causa real, y los dos primeros fueron razonamientos plausibles pero incompletos:
+
+1. Primer diagnóstico: `ReadableStream` inestable en Node 18 — **correcto como hallazgo, pero no era la causa del fallo real**.
+2. Segundo diagnóstico: `globalThis.crypto` no existe en Node 18 sin flag — **correcto, pero el arreglo (`shims: true` en tsup) solo protegía el código YA COMPILADO**, no el código fuente que Jest ejecuta directamente en los tests.
+3. Causa real, solo visible con el log completo del job (no con el resumen de GitHub ni con razonamiento por deducción): `import.meta.url` chocaba con la configuración de `ts-jest` del propio proyecto.
+
+**Lo que evitó un cuarto intento a ciegas**: escribir un test que **fuerza explícitamente** la rama de código que llevaba fallando (borrando `globalThis.crypto` temporalmente durante el test), en vez de confiar en que "debería funcionar" porque el razonamiento parecía sólido. Cada test de la suite corría en un entorno (Node 22 local) donde esa rama de fallback nunca se ejercitaba de verdad — así que "todos los tests pasan" no era evidencia real de que el fallback funcionara.
+
+**Regla general para el futuro**: cuando el código tiene una rama de fallback/compatibilidad (para una versión antigua, un entorno degradado, un fallo esperado), **el test debe forzar esa rama activamente**, no limitarse a probar el camino feliz en el entorno de desarrollo actual. Si una rama nunca se ejercita en los tests, "pasa el CI" no es garantía de que funcione en el entorno real donde sí se necesita.
