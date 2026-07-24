@@ -91,6 +91,23 @@ Encontrado y arreglado desde el frontend (Lovable) + backend en la misma sesión
 - **Backend**: política RLS reemplazada por una restringida a `profiles.is_platform_admin` (vía función `is_platform_admin(uuid)` reutilizable, mismo patrón que `get_user_org_id()`). Verificado con datos reales: `true` para el superadmin, `false` para admins de Octupus/Partner Demo — el hueco real queda cerrado.
 - Los inserts desde `send-demo-request` no se ven afectados — confirmado que usa `SUPABASE_SERVICE_ROLE_KEY`, que bypasea RLS.
 
+### Auditoría de seguridad — 3 hallazgos CRÍTICOS (24 de julio de 2026)
+
+Tras el escaneo anterior (4 warnings), un segundo escaneo de Lovable encontró 3 hallazgos marcados como **crítico**, los tres reales y confirmados contra el código/datos reales antes de arreglar:
+
+1. **`retention-cleanup` sin ninguna autenticación**: `verify_jwt=false` y sin ningún check de secreto en el código — cualquiera con la URL podía disparar el job destructivo (revoca tokens, anonimiza audit_logs, borra detecciones PII/mensajes/informes DPO) para **todas** las organizaciones, repetidamente. Arreglado con el mismo patrón de `X-Internal-Secret` usado en otros sitios; actualizado el cron diario (`pg_cron` + `pg_net`) para enviarlo.
+
+2. **`chat-completion` permitía usar el pipeline de otra organización**: el `pipeline_id` venía del cliente sin verificar que perteneciera a la organización real del usuario — cualquier autenticado que conociera/adivinara el `pipeline_id` de otra organización podía correr chats a través de él, usando la clave LLM real descifrada de esa organización ajena. Arreglado resolviendo el `org_id` real del caller y exigiendo que coincida con el del pipeline (404, no 403, para no confirmar que el ID existe en otro sitio).
+
+3. **API key de producción hardcodeada en el bundle del frontend** (`VITE_PROXY_API_KEY`): el chat principal del dashboard (`useChat.ts`), además de Onboarding y Sandbox, llamaban directamente al proxy desde el navegador con una clave real de producción (`"Lovable Production"`, perteneciente al propio pipeline "Legal Document Reviewer" de iCommunity Labs) embebida en el bundle — extraíble por cualquiera con las devtools, permitiendo consumir la cuota real de iCommunity Labs e inyectar audit_logs indefinidamente. Arreglado de punta a punta:
+   - Dos Edge Functions nuevas (`protect-chat-message`, `proxy-bridge`) que verifican el JWT, resuelven el `org_id` y pipeline reales del caller (nunca cayendo a un pipeline fijo de otra organización), y llaman al proxy con el secreto interno compartido.
+   - Extendido `/v1/proxy/protect` y `/v1/proxy/detect` (repo `privaro-proxy`) para aceptar este mecanismo como alternativa segura junto al camino normal de key real/dev — sin cambios para tráfico de partners/clientes reales.
+   - `useChat.ts` y `proxy-client.ts` ahora llaman a estas Edge Functions en vez de al proxy directamente.
+   - **La clave ya expuesta fue revocada en `api_keys`** (`is_active=false`) — seguía siendo válida hasta ese momento independientemente del arreglo de código.
+   - De paso, se quitó un fallback relacionado: `useChat.ts` caía al `pipeline_id` fijo de iCommunity Labs para el registro de auditoría de cualquier organización sin pipeline activo propio.
+
+**Pendiente manual**: quitar la variable de entorno `VITE_PROXY_API_KEY` de la configuración de build de Lovable — ya no se lee en ningún sitio del código, pero conviene borrarla para que no pueda reintroducirse por accidente. No pude probar el flujo end-to-end completo yo mismo (`api.privaro.ai` no está en mi lista de dominios permitidos) — pendiente de una prueba real del chat/sandbox/onboarding.
+
 ### Auditoría de seguridad — 4 hallazgos de Lovable + 2 adicionales (24 de julio de 2026)
 
 Lovable reportó 4 avisos de seguridad tras un escaneo. Se revisó cada uno contra el código real antes de decidir si merecía arreglo — dos resultaron ser código sin desplegar (sin riesgo activo), uno de impacto real bajo, y uno grave y confirmado:
