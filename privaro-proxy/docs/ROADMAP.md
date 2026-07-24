@@ -82,6 +82,15 @@ Método de verificación: en vez de crear cuentas de admin nuevas para Cliente A
 
 Varios de estos puntos empezaron como "vamos a construir X" y terminaron siendo "X ya existía / estaba roto de una forma distinta a la esperada". El patrón que ha funcionado en todos los casos: **verificar contra el código y los datos reales antes de dar nada por bueno** — con dry-runs SQL antes de desplegar, pruebas end-to-end reales antes de cerrar un punto, y desconfianza sana hacia cualquier descripción de cambio ("hecho") que no se haya verificado directamente contra el repo o la base de datos.
 
+### Hallazgo de seguridad real — fuga de leads comerciales (24 de julio de 2026)
+
+`demo_requests` (leads del formulario público — nombre, email, empresa, sector, cargo, necesidad expresada) tenía una política RLS que permitía leer **todos los leads** a **cualquier usuario `authenticated` con rol `admin` o `dpo` en cualquier organización**, sin ningún filtro de organización. Es decir: cualquier admin de cualquier cliente o partner (Partner Demo, futuros sub-accounts de Octupus, etc.) podía leer el pipeline comercial completo de iCommunity Labs.
+
+Encontrado y arreglado desde el frontend (Lovable) + backend en la misma sesión:
+- **Frontend**: nueva ruta protegida (`PlatformAdminRoute`, redirige si no eres superadmin), enlace del sidebar "Leads" condicionado a `profile.is_platform_admin`, y `AdminLeads.tsx` no consulta la tabla si el usuario no es platform admin — triple capa, verificada directamente contra el código del repo.
+- **Backend**: política RLS reemplazada por una restringida a `profiles.is_platform_admin` (vía función `is_platform_admin(uuid)` reutilizable, mismo patrón que `get_user_org_id()`). Verificado con datos reales: `true` para el superadmin, `false` para admins de Octupus/Partner Demo — el hueco real queda cerrado.
+- Los inserts desde `send-demo-request` no se ven afectados — confirmado que usa `SUPABASE_SERVICE_ROLE_KEY`, que bypasea RLS.
+
 ### Aprendizaje añadido — CI del SDK de JS (23 de julio de 2026)
 
 El caso del fallo de CI en Node 18 (`privaro-sdk-js`) es un ejemplo claro de este mismo patrón aplicado a tests: costaron **tres intentos** encontrar la causa real, y los dos primeros fueron razonamientos plausibles pero incompletos:
