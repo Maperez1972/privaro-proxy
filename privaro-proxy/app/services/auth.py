@@ -5,7 +5,7 @@ Format: prvr_xxxxxxxxxxxx (key_prefix visible, full key hashed in DB).
 """
 import hashlib
 import httpx
-from fastapi import HTTPException, Security
+from fastapi import HTTPException, Security, Header
 from fastapi.security import APIKeyHeader
 from typing import Optional, Dict, Any
 from app.config import settings
@@ -121,3 +121,45 @@ async def verify_api_key_or_dev(
         }
 
     return await verify_api_key(api_key)
+
+
+# ── Internal server-to-server auth (added 2026-07-23) ───────────────────────
+# For first-party Edge Functions calling on behalf of an ALREADY AUTHENTICATED
+# dashboard user (e.g. protect-document, called by a user uploading a file
+# from their own Privaro panel) — never for partner/customer API integration,
+# which always uses a real X-Privaro-Key.
+#
+# Why this exists: Privaro never stores a recoverable raw API key for any
+# organization (keys are SHA-256 hashed, by design, same as partner keys) --
+# so there is no "real" API key an Edge Function could look up and forward
+# on a user's behalf. The Edge Function already verifies the calling user's
+# identity via their Supabase session JWT and resolves their real org_id
+# before this is ever called; this endpoint trusts that org_id ONLY because
+# the request is also authenticated with a shared secret only Privaro's own
+# Edge Functions know (same INTERNAL_NOTIFY_SECRET already used for
+# encrypt/decrypt-provider-key) — never exposed to any customer or partner.
+#
+# Found and fixed 2026-07-23: protect-document previously used a single
+# shared PRIVARO_PRODUCTION_KEY for every org, which not only broke
+# isolation (all usage attributed to one org) but literally couldn't work
+# for any org other than that key's owner (org_id mismatch -> 403).
+
+async def verify_api_key_or_internal(
+    api_key: Optional[str] = Security(api_key_header),
+    x_internal_secret: Optional[str] = Header(None),
+    x_internal_org_id: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    if x_internal_secret and x_internal_org_id:
+        if not settings.INTERNAL_NOTIFY_SECRET:
+            raise HTTPException(status_code=500, detail={"error": "server_misconfigured"})
+        if x_internal_secret != settings.INTERNAL_NOTIFY_SECRET:
+            raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+        return {
+            "id": "internal",
+            "org_id": x_internal_org_id,
+            "name": "Internal (first-party dashboard)",
+            "pipeline_ids": None,
+            "permissions": ["proxy:write", "proxy:read"],
+            "role": "admin",
+        }
+    return await verify_api_key_or_dev(api_key)

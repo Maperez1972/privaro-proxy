@@ -25,7 +25,7 @@ from typing import Dict, Any, Optional
 
 from app.models.schemas import Detection
 from app.services import detector
-from app.services.auth import verify_api_key_or_dev
+from app.services.auth import verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
@@ -41,7 +41,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 @router.post("/protect-document")
 async def protect_document(
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
     file: UploadFile = File(...),
     pipeline_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
