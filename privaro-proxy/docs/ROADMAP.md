@@ -18,7 +18,7 @@ Origen: pensando en las necesidades reales de Octupus/Robin AI al integrar Priva
 | 6 | Alta de clientes vía API | ✅ Cerrado | `b4cee85` — `POST /v1/partner/sub-accounts`, permiso `partner:write_children` |
 | 7 | Detector regex → NER/ML | ✅ Cerrado (hallazgo, no desarrollo) | `09a69ba` — ver nota abajo |
 | 8 | Sync de descuento Supabase↔Stripe | ✅ Cerrado (aviso, no automatización completa) | Migración `notify_on_discount_phase_review` |
-| 9 | Página de estado pública | 🔲 Prompt de Lovable entregado, pendiente de desplegar | — |
+| 9 | Página de estado pública | ✅ Cerrado — verificado en producción (`https://privaro.ai/status` responde 200) | — |
 | 10 | Latencia multi-región (LatAm) | ⏸️ Pospuesto — clientes de Octupus son de España, no aplica hoy | — |
 | 11 | Contabilidad de consumo por cliente | ✅ Cerrado — verificado en navegador, 2 bugs reales encontrados y corregidos en el proceso | Ver sección propia abajo |
 
