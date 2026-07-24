@@ -91,6 +91,19 @@ Encontrado y arreglado desde el frontend (Lovable) + backend en la misma sesión
 - **Backend**: política RLS reemplazada por una restringida a `profiles.is_platform_admin` (vía función `is_platform_admin(uuid)` reutilizable, mismo patrón que `get_user_org_id()`). Verificado con datos reales: `true` para el superadmin, `false` para admins de Octupus/Partner Demo — el hueco real queda cerrado.
 - Los inserts desde `send-demo-request` no se ven afectados — confirmado que usa `SUPABASE_SERVICE_ROLE_KEY`, que bypasea RLS.
 
+### Auditoría de seguridad — 4 hallazgos de Lovable + 2 adicionales (24 de julio de 2026)
+
+Lovable reportó 4 avisos de seguridad tras un escaneo. Se revisó cada uno contra el código real antes de decidir si merecía arreglo — dos resultaron ser código sin desplegar (sin riesgo activo), uno de impacto real bajo, y uno grave y confirmado:
+
+1. **MCP público sin autenticación** (`mcp` edge function): revisado a fondo — las 11 herramientas expuestas son todas de solo lectura, sin acceso a datos de clientes ni a la base de datos real; el motor de detección PII es una réplica en JS que solo procesa el texto que el propio llamante envía, y el resto es información pública de marketing. Impacto real bajo. Pendiente de decisión de producto (¿es un gancho de marketing intencional, o se cierra con OAuth?).
+2. **Email enumeration en `invite-user`**: confirmado que esta función **no está desplegada** (404 Function not found) — sin riesgo activo. El código en el repo tiene el problema descrito, pendiente de arreglar antes de que alguien lo despliegue sin saberlo.
+3. **Errores internos crudos expuestos** (`err.message` devuelto directamente al cliente): confirmado en 7 funciones (`byok-admin`, `chat-completion`, `enforce-mfa`, `generate-dpo-report`, `protect-document`, `recertify-pending`, `send-email-resend`). Arreglado de forma consistente: se sigue logueando el error completo internamente, pero el cliente recibe siempre un mensaje genérico.
+4. **Mutación cross-tenant en `send-welcome-email`**: confirmado y grave — cualquier usuario autenticado (cualquier org, cualquier rol) podía marcar `welcome_email_sent`/`trial_started_at` de una organización ajena, sin ninguna comprobación de propiedad del `org_id`. Arreglado comparando contra `profiles.org_id` real del llamante.
+
+**Hallazgo adicional, no reportado por Lovable**, encontrado al revisar `generate-dpo-report` de cerca por el mismo patrón: la comprobación de rol admin no verificaba que fuera admin **de la organización solicitada**, solo que fuera admin de alguna organización — cualquier admin podía generar y leer el informe DPO de auditoría (metadatos de detección de PII, risk scores, hashes de blockchain) de una organización ajena. Arreglado y verificado contra el único caso de uso real del frontend (`ScheduledReports.tsx`, que siempre pasa `profile.org_id`).
+
+**Detalle menor, no arreglado (nota para el futuro)**: `recertify-pending` autentica comparando un fragmento del propio `SUPABASE_SERVICE_ROLE_KEY` con `.includes()` — funciona pero es un patrón débil; no se tocó para no romper cómo se invoca desde el cron sin confirmarlo antes.
+
 ### Aprendizaje añadido — CI del SDK de JS (23 de julio de 2026)
 
 El caso del fallo de CI en Node 18 (`privaro-sdk-js`) es un ejemplo claro de este mismo patrón aplicado a tests: costaron **tres intentos** encontrar la causa real, y los dos primeros fueron razonamientos plausibles pero incompletos:
