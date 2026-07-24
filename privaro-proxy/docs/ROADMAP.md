@@ -20,7 +20,7 @@ Origen: pensando en las necesidades reales de Octupus/Robin AI al integrar Priva
 | 8 | Sync de descuento Supabase↔Stripe | ✅ Cerrado (aviso, no automatización completa) | Migración `notify_on_discount_phase_review` |
 | 9 | Página de estado pública | 🔲 Prompt de Lovable entregado, pendiente de desplegar | — |
 | 10 | Latencia multi-región (LatAm) | ⏸️ Pospuesto — clientes de Octupus son de España, no aplica hoy | — |
-| 11 | Contabilidad de consumo por cliente | 🔲 Backend + 3 pantallas entregadas, pendiente de verificación real | Ver sección propia abajo |
+| 11 | Contabilidad de consumo por cliente | ✅ Cerrado — verificado en navegador, 2 bugs reales encontrados y corregidos en el proceso | Ver sección propia abajo |
 
 ---
 
@@ -66,7 +66,15 @@ Extendido a `/v1/relay/complete` y `/v1/relay/stream`, que antes no tenían ning
 - `PartnerClients.tsx` ("Mis clientes"): columna "Consumo este mes" por cliente.
 - `PlatformAdmin.tsx` (`/app/platform-admin`, nueva pantalla): tabla de todas las organizaciones, filtrable/ordenable, solo visible si `is_platform_admin=true`.
 
-**Pendiente:** verificación real en navegador por Miguel Ángel (las tres pantallas).
+**✅ Verificado en navegador (24 de julio de 2026), las tres pantallas — y se encontraron dos bugs reales en el proceso:**
+
+1. **Platform Admin**: confirmado con datos reales. De paso, se encontró y borró un registro huérfano de una prueba anterior ("Octopus", sub_account de Partner Demo sin uso real).
+2. **Mis clientes**: confirmado — Cliente A mostró "3", Cliente B "2", coincidiendo con tráfico de prueba generado para la ocasión.
+3. **Billing (vista de sub_account)**: aquí aparecieron los dos bugs reales:
+   - `billing_accounts` tenía RLS activo **sin ninguna política** (igual que `org_usage_monthly` antes) — el GRANT a nivel de tabla no servía de nada sin una policy, así que la tarjeta "Consumo agregado del partner" llevaba mostrando **0/0 para absolutamente cualquier organización**, no solo sub_accounts, desde que se arregló el GRANT original. Arreglada con la misma política (`get_user_org_id(auth.uid())`) usada en `org_usage_monthly`.
+   - `AdminBilling.tsx` calculaba el "ciclo actual" con `new Date()` (la fecha de HOY, truncada al mes) en vez de leer `billing.billing_cycle_start` — la tarjeta "Tu consumo este mes" buscaba siempre en el mes calendario en curso, nunca en el ciclo de facturación real de la cuenta. Arreglado por Lovable para derivar `cycleStart` del dato real.
+
+Método de verificación: en vez de crear cuentas de admin nuevas para Cliente A/B (sin herramienta de creación de usuarios disponible), se reasignó temporalmente el usuario de prueba ya existente (`maperez+partnerdemo@icommunity.io`) a la organización de Cliente A vía SQL directo (`profiles.org_id` + `user_roles.org_id`), y se revirtió a Partner Demo al terminar.
 
 ---
 
