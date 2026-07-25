@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.services.auth import verify_api_key_or_dev
+from app.services.auth import verify_api_key_or_dev, verify_api_key_or_internal
 from app.services.key_manager import (
     encrypt_byok_key_for_storage,
     generate_key_id,
@@ -60,7 +60,7 @@ class KeyResponse(BaseModel):
 
 @router.get("/keys", response_model=List[KeyResponse])
 async def list_keys(
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """List all encryption keys for the org. Admin/DPO only."""
     org_id = key_record["org_id"]
@@ -84,7 +84,7 @@ async def list_keys(
 @router.post("/keys", response_model=KeyResponse)
 async def register_key(
     body: RegisterKeyRequest,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """
     Register a new encryption key for the org.
@@ -180,7 +180,7 @@ async def register_key(
 @router.delete("/keys/{key_id}")
 async def deactivate_key(
     key_id: str,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """
     Deactivate a key. Does NOT delete it — tokens encrypted with this key
@@ -228,7 +228,7 @@ async def deactivate_key(
 @router.post("/keys/{key_id}/set-default")
 async def set_default_key(
     key_id: str,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """Set a key as the default for new token encryptions."""
     org_id = key_record["org_id"]

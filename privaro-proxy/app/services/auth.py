@@ -159,7 +159,12 @@ async def verify_api_key_or_internal(
             "org_id": x_internal_org_id,
             "name": "Internal (first-party dashboard)",
             "pipeline_ids": None,
-            "permissions": ["proxy:write", "proxy:read"],
+            # admin/dpo included: this mode is only reachable via a shared
+            # secret known exclusively to Privaro's own Edge Functions,
+            # and every caller (byok-admin, protect-document, etc.)
+            # already verifies the real user's role scoped to their real
+            # org_id before ever reaching this code path.
+            "permissions": ["proxy:write", "proxy:read", "admin", "dpo"],
             "role": "admin",
         }
     return await verify_api_key_or_dev(api_key)
