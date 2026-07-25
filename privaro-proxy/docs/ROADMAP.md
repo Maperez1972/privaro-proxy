@@ -99,6 +99,16 @@ Encontrado y arreglado desde el frontend (Lovable) + backend en la misma sesión
 - **Backend**: política RLS reemplazada por una restringida a `profiles.is_platform_admin` (vía función `is_platform_admin(uuid)` reutilizable, mismo patrón que `get_user_org_id()`). Verificado con datos reales: `true` para el superadmin, `false` para admins de Octupus/Partner Demo — el hueco real queda cerrado.
 - Los inserts desde `send-demo-request` no se ven afectados — confirmado que usa `SUPABASE_SERVICE_ROLE_KEY`, que bypasea RLS.
 
+### Tercer escaneo — hallazgo CRÍTICO más grave del día: gestión cruzada del cifrado maestro (24 de julio de 2026)
+
+`byok-admin` reenviaba **toda** petición de gestión de claves de cifrado (BYOK) al proxy usando una **única clave admin global** (`PRIVARO_ADMIN_API_KEY`), sin importar qué organización llamara. Verificado con datos reales: esa clave pertenece a **iCommunity Labs** (`"Admin Key (BYOK)"`, org `d4e09279-...`). Como el proxy scopea cada endpoint de `/v1/admin/keys` por el `org_id` resuelto a partir de la clave usada para autenticar, esto significaba que **cualquier admin/dpo de cualquier organización cliente o partner que abriera la pantalla de gestión BYOK estaba en realidad viendo y gestionando las claves de cifrado de la propia iCommunity Labs** — pudiendo verlas, registrar una nueva y marcarla como default (potencialmente comprometiendo la confidencialidad de datos futuros de la propia plataforma), o desactivar la activa.
+
+Es el hallazgo más grave de todos los de hoy: no es "un cliente ve datos de otro cliente", sino "cualquier cliente puede tomar el control del sistema de cifrado de la propia empresa que opera Privaro".
+
+Arreglado en dos partes:
+- **Proxy** (`byok.py`): los 4 endpoints (list/register/deactivate/set-default) extendidos a `verify_api_key_or_internal` (mismo patrón ya usado en `/v1/proxy/protect`/`/detect`). El modo interno ahora también incluye `admin`/`dpo` en sus permisos — seguro porque solo es alcanzable con el secreto compartido conocido exclusivamente por las Edge Functions propias, y cada una ya verifica el rol real del usuario antes de llegar aquí.
+- **`byok-admin`**: resuelve el `org_id` real del caller vía `profiles`, escopea la comprobación de rol admin/dpo a esa organización, y autentica al proxy con el secreto interno en vez de la clave admin fija.
+
 ### Segundo escaneo — 5 hallazgos, 3 falsos positivos + 2 críticos nuevos reales (24 de julio de 2026)
 
 Lovable volvió a reportar 5 críticos, 3 de los cuales resultaron ser **el mismo escaneo desactualizado** (los 3 hallazgos ya cerrados en la ronda anterior: `retention-cleanup`, `chat-completion`, `VITE_PROXY_API_KEY`) — confirmado contra el código real desplegado (versiones 9, 13 y el repo actual respectivamente, todos con el arreglo presente). No se tocó nada de estos tres, ya estaban bien.
