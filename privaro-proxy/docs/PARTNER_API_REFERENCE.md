@@ -41,7 +41,7 @@ Body:
     "reversible": true,                             // default: true
     "agent_mode": false                             // default: false — activa políticas más estrictas
   },
-  "conversation_id": "string opcional — ver sección 6"
+  "conversation_id": "UUID opcional — ver sección 6"
 }
 ```
 
@@ -108,7 +108,7 @@ Body:
     "temperature": 0.7,                // default
     "system_prompt": "string opcional"
   },
-  "conversation_id": "string opcional — ver sección 6"
+  "conversation_id": "UUID opcional — ver sección 6"
 }
 ```
 
@@ -176,7 +176,7 @@ data: [DONE]
 
 Si mandáis vuestro propio identificador de conversación/sesión (el que uséis en Robin) en el campo `conversation_id` de `/protect`, `/relay/complete` o `/relay/stream`, **el mismo dato personal recibe siempre el mismo token dentro de esa conversación**. Si "Juan Pérez" sale como `[NM-0001]` en el turno 1, sigue siendo `[NM-0001]` en el turno 5 — nunca un token nuevo para el mismo valor.
 
-Este campo es completamente libre — es solo un identificador vuestro para agrupar turnos, no necesita registrarse ni existir en ningún sitio dentro de Privaro de antemano.
+**Debe ser un UUID válido** (ej. `550e8400-e29b-41d4-a716-446655440000`) — se guarda en una columna `uuid` de nuestra base de datos. No necesita registrarse ni existir en ningún sitio dentro de Privaro de antemano, pero si Robin usa internamente otro formato de ID de conversación (numérico, con guiones, etc.), generad un UUID propio para asociarlo, en vez de reenviar vuestro ID interno directamente — un valor que no sea UUID se rechaza con un 422 claro en la petición.
 
 ---
 
@@ -228,7 +228,7 @@ Body:
 {
   "pipeline_id": "string",
   "text": "string (1-100000 caracteres) — puede contener 0 o más tokens",
-  "conversation_id": "string — MUY recomendado, ver aviso abajo"
+  "conversation_id": "UUID — MUY recomendado, ver aviso abajo"
 }
 ```
 
@@ -262,7 +262,7 @@ Body:
     "nombre_campo_1": "valor 1",
     "nombre_campo_2": "valor 2"
   },
-  "conversation_id": "string opcional"
+  "conversation_id": "UUID opcional"
 }
 ```
 

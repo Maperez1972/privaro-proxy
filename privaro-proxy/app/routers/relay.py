@@ -19,7 +19,8 @@ import os
 import base64
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from app.models.schemas import _validate_conversation_id
 from typing import Dict, Any, List, Optional
 
 from app.services.auth import verify_api_key_or_dev
@@ -179,6 +180,13 @@ class RelayRequest(BaseModel):
     model: Optional[str] = None         # Override pipeline model
     options: RelayOptions = RelayOptions()
     conversation_id: Optional[str] = None
+
+    # Fixed 2026-07-24 — same fix as ProtectRequest/DetokenizeRequest/
+    # ProtectStructuredRequest in schemas.py: conversation_id is stored in
+    # a Postgres uuid column, so a non-UUID value here would silently
+    # fail to save in the background token-insert task, same as it did
+    # for /protect before this fix.
+    _validate_conv_id = field_validator("conversation_id")(_validate_conversation_id)
 
 
 class RelayResponse(BaseModel):
