@@ -63,7 +63,9 @@ Body:
 
 **`degraded_mode: true`** significa que el detector falló o tardó demasiado (timeout de 2s) y `protected_prompt` es el prompt **original, sin proteger** (fail-open — nunca bloqueamos vuestro tráfico). Queda igualmente registrado como evento de auditoría de severidad crítica. Si veis esto de forma repetida, avisadnos.
 
-`detector` puede ser `"regex"` o `"presidio"` (motor NER, detecta nombres y otras entidades sin patrón fijo).
+`detector` puede ser `"regex"`, `"presidio"` (motor NER) o `"custom_pattern"` (regla de detección personalizada configurada para vuestro pipeline — contactad con nosotros para dar de alta patrones específicos de vuestro dominio, ej. formato de número de expediente).
+
+Tipos de entidad soportados: `dni`, `iban`, `credit_card`, `email`, `phone`, `health_record`, `ip_address`, `date_of_birth`, `full_name`, y `money` (importes/cifras de negocio, ej. `45.200 €` — categorizado como dato "financial" confidencial, no como dato personal RGPD).
 
 ---
 
@@ -213,7 +215,70 @@ Resumen ligero: eventos, fugas, eventos de alto riesgo en los últimos N días (
 
 ---
 
-## 9. Errores comunes
+## 9. POST /v1/proxy/detokenize — reversión automática en bulk
+
+Pensado para flujos agénticos con function-calling: si vuestro LLM decide, a partir de datos que solo vio tokenizados, escribir un registro real en vuestro sistema (crear un albarán, validar una venta), necesitáis los valores reales de vuelta — de golpe, sin intervención humana. Este endpoint encuentra **todos** los tokens Privaro (`[XX-0001]`) presentes en un texto y los revierte en una sola llamada.
+
+No es lo mismo que un flujo de "revelar un valor" pensado para un humano con contraseña — aquí os autenticáis con vuestra propia API key, igual que en `/protect`/`/detect`, y solo se revierten tokens que pertenezcan a vuestra organización.
+
+```
+POST /v1/proxy/detokenize
+Headers: X-Privaro-Key: prvr_xxxxx
+Body:
+{
+  "pipeline_id": "string",
+  "text": "string (1-100000 caracteres) — puede contener 0 o más tokens"
+}
+```
+
+**Respuesta (200):**
+```json
+{
+  "request_id": "req_xxxxxxxx",
+  "detokenized_text": "texto con los valores reales restituidos",
+  "tokens_reversed": 3,
+  "tokens_not_found": []
+}
+```
+
+`tokens_not_found` lista cualquier token con formato válido presente en el texto pero que no se encontró para vuestra organización (por ejemplo, si el LLM alucinó un token, o si ya expiró) — se dejan sin modificar en `detokenized_text`.
+
+---
+
+## 10. POST /v1/proxy/protect-structured — protección consciente de campos
+
+`/protect` opera sobre un único prompt de texto libre. Si vuestros datos vienen como **campos con nombre** (los resultados de una consulta a vuestro ERP, por ejemplo), este endpoint os permite indicar qué tipo de dato es cada campo por su **nombre**, no solo por su contenido — útil para casos donde el nombre del campo es señal más fiable que el contenido (por ejemplo, un campo `diagnostico` es dato de salud independientemente de qué enfermedad concreta mencione).
+
+```
+POST /v1/proxy/protect-structured
+Headers: X-Privaro-Key: prvr_xxxxx
+Body:
+{
+  "pipeline_id": "string",
+  "fields": {
+    "nombre_campo_1": "valor 1",
+    "nombre_campo_2": "valor 2"
+  },
+  "conversation_id": "string opcional"
+}
+```
+
+**Respuesta (200):**
+```json
+{
+  "request_id": "req_xxxxxxxx",
+  "protected_fields": { "nombre_campo_1": "...", "nombre_campo_2": "..." },
+  "detections_by_field": { "nombre_campo_1": [...], "nombre_campo_2": [...] },
+  "stats": {...},
+  "audit_log_id": "uuid"
+}
+```
+
+Para forzar el tipo de un campo por su nombre (en vez de depender solo del contenido), contactad con nosotros para configurar una regla `field_name_pattern` en vuestro pipeline — por ejemplo, cualquier campo que coincida con `diagnostic|patholog` se trata siempre como dato de salud, cualquier campo que coincida con `importe|facturac` se trata siempre como cifra de negocio confidencial. Los campos sin regla configurada pasan por la detección de contenido habitual (incluye ahora también importes monetarios en texto libre — ver sección de tipos de entidad).
+
+---
+
+## 11. Errores comunes
 
 | Código | Significado |
 |---|---|
@@ -230,4 +295,5 @@ Resumen ligero: eventos, fugas, eventos de alto riesgo en los últimos N días (
 
 | Versión | Fecha | Cambios |
 |---|---|---|
+| v2 | 2026-07-24 | Añadido `/v1/proxy/detokenize` (reversión en bulk para flujos agénticos), `/v1/proxy/protect-structured` (protección por campo con nombre, pensado para copilotos de ERP), y nuevo tipo de entidad `money` — a raíz del análisis de Robin AI/Octupus como copiloto de Odoo. |
 | v1 | 2026-07-24 | Primera versión — referencia completa de todos los endpoints, en respuesta a una pregunta real de integración (destokenización en streaming). |
