@@ -227,9 +227,12 @@ Headers: X-Privaro-Key: prvr_xxxxx
 Body:
 {
   "pipeline_id": "string",
-  "text": "string (1-100000 caracteres) — puede contener 0 o más tokens"
+  "text": "string (1-100000 caracteres) — puede contener 0 o más tokens",
+  "conversation_id": "string — MUY recomendado, ver aviso abajo"
 }
 ```
+
+**⚠️ Importante — pasad siempre `conversation_id`.** El literal de un token (ej. `[NM-0001]`) **no es único** dentro de vuestra organización a lo largo del tiempo — es solo un contador que empieza de nuevo en cada llamada a `/protect`. Sin `conversation_id`, si vuestra organización acumula muchas llamadas históricas, no hay garantía de que `[NM-0001]` se resuelva al valor de la petición que os interesa — el endpoint hace lo posible (toma la fila más reciente), pero solo `conversation_id` (el mismo que usasteis en el `/protect` original que generó esos tokens) da una resolución exacta y sin ambigüedad.
 
 **Respuesta (200):**
 ```json
@@ -295,5 +298,6 @@ Para forzar el tipo de un campo por su nombre (en vez de depender solo del conte
 
 | Versión | Fecha | Cambios |
 |---|---|---|
+| v3 | 2026-07-24 | `/v1/proxy/detokenize` ahora acepta `conversation_id` (muy recomendado) tras un fallo real detectado en pruebas en vivo — `token_value` no es único dentro de una organización a lo largo del tiempo. |
 | v2 | 2026-07-24 | Añadido `/v1/proxy/detokenize` (reversión en bulk para flujos agénticos), `/v1/proxy/protect-structured` (protección por campo con nombre, pensado para copilotos de ERP), y nuevo tipo de entidad `money` — a raíz del análisis de Robin AI/Octupus como copiloto de Odoo. |
 | v1 | 2026-07-24 | Primera versión — referencia completa de todos los endpoints, en respuesta a una pregunta real de integración (destokenización en streaming). |
