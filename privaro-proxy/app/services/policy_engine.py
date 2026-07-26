@@ -27,6 +27,9 @@ ENTITY_RISK_WEIGHTS = {
     "email":          0.5,
     "phone":          0.4,
     "ip_address":     0.3,
+    # Business-confidential, not personal data under GDPR — weighted low so
+    # it doesn't inflate the GDPR-oriented risk_score, but still tracked.
+    "money":          0.2,
 }
 
 PROVIDER_RISK_FACTORS = {
@@ -206,7 +209,7 @@ def _get_category(entity_type: str) -> str:
         "dni": "personal", "nie": "personal", "ssn": "personal",
         "full_name": "personal", "email": "personal",
         "phone": "personal", "ip_address": "personal", "date_of_birth": "personal",
-        "iban": "financial", "credit_card": "financial",
+        "iban": "financial", "credit_card": "financial", "money": "financial",
         "health_record": "special",
     }
     return categories.get(entity_type, "personal")

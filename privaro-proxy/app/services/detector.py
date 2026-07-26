@@ -15,7 +15,8 @@ Current coverage:
 """
 import re
 import uuid
-from typing import List, Tuple
+import logging
+from typing import List, Tuple, Optional, Dict
 from app.models.schemas import Detection
 
 
@@ -88,6 +89,22 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
          re.IGNORECASE
      ),
      0.80),
+
+    # Money / business amounts — added 2026-07-24 following the Octupus/Robin
+    # AI (Odoo copilot) analysis: ERP data is full of commercially sensitive
+    # figures (revenue, margins, contract values) that customers want kept
+    # from LLM providers for confidentiality reasons, independent of GDPR
+    # personal-data status. Covers symbol-before (€45.200,50) and
+    # symbol/code-after (45.200 € / 45,200.50 EUR) formats, ES and
+    # international thousand/decimal separator conventions.
+    ("money", "medium",
+     re.compile(
+         r'(?:[€$£]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?'
+         r'|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s?[€$£]'
+         r'|\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s?(?:EUR|USD|GBP)\b)',
+         re.IGNORECASE
+     ),
+     0.85),
 ]
 
 # ── Severity → category mapping ─────────────────────────────────────────────
@@ -117,6 +134,7 @@ TOKEN_PREFIX = {
     "ip_address": "IP",
     "date_of_birth": "DT",
     "ssn": "SS",
+    "money": "MN",
 }
 
 
@@ -125,13 +143,19 @@ def _make_token(entity_type: str, counter: int) -> str:
     return f"[{prefix}-{counter:04d}]"
 
 
-def detect(text: str, use_nlp: bool = True) -> List[Detection]:
+def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] = None) -> List[Detection]:
     """
-    Hybrid detection: Tier 1 (regex) + Tier 2 (Presidio NLP).
+    Hybrid detection: Tier 1 (regex) + Tier 1.5 (custom org/pipeline patterns)
+    + Tier 2 (Presidio NLP).
 
     Tier 1 runs first — high confidence, deterministic.
-    Tier 2 fills gaps — catches names, implicit PII, free text.
-    NLP results never override regex results (no duplicate spans).
+    Tier 1.5 fills gaps specific to a customer's own domain vocabulary
+    (e.g. a clinic's own list of diagnosis terms, a law firm's case-number
+    format) via policy_rules.custom_pattern — added 2026-07-24 following
+    the Octupus/Robin AI (Odoo copilot) analysis. This column existed in
+    the schema but was never wired into detection until now.
+    Tier 2 fills further gaps — catches names, implicit PII, free text.
+    Later tiers never override earlier ones (no duplicate spans).
     """
     detections: List[Detection] = []
     seen_spans: List[Tuple[int, int]] = []
@@ -164,6 +188,46 @@ def detect(text: str, use_nlp: bool = True) -> List[Detection]:
                 detector="regex",
             ))
 
+    # ── Tier 1.5: Custom org/pipeline patterns (policy_rules.custom_pattern) ──
+    if custom_rules:
+        for rule in custom_rules:
+            raw_pattern = rule.get("custom_pattern")
+            if not raw_pattern:
+                continue
+            entity_type = rule.get("entity_type")
+            if not entity_type:
+                continue
+            try:
+                compiled = re.compile(raw_pattern, re.IGNORECASE)
+            except re.error as e:
+                logging.getLogger(__name__).warning(
+                    f"[CustomPattern] Invalid regex for entity_type={entity_type}: {e}"
+                )
+                continue
+            severity = rule.get("severity_override") or "medium"
+            for match in compiled.finditer(text):
+                grp = next(
+                    (i for i in range(1, compiled.groups + 1) if match.group(i) is not None),
+                    None
+                ) if compiled.groups else None
+                start = match.start(grp) if grp else match.start()
+                end   = match.end(grp)   if grp else match.end()
+                if start == end:
+                    continue  # skip zero-width matches
+                if any(s <= start < e or s < end <= e for s, e in seen_spans):
+                    continue
+                seen_spans.append((start, end))
+                detections.append(Detection(
+                    type=entity_type,
+                    severity=severity,
+                    action="detected",
+                    token=None,
+                    start=start,
+                    end=end,
+                    confidence=0.9,
+                    detector="custom_pattern",
+                ))
+
     # ── Tier 2: Presidio NLP ─────────────────────────────────────────────────
     if use_nlp:
         try:
@@ -175,7 +239,6 @@ def detect(text: str, use_nlp: bool = True) -> List[Detection]:
             detections.extend(nlp_detections)
         except Exception as e:
             # NLP failure never breaks the request — Tier 1 results stand
-            import logging
             logging.getLogger(__name__).warning(f"[NLP] Tier 2 skipped: {e}")
 
     # Sort by position in text

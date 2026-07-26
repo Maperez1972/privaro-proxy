@@ -8,6 +8,7 @@ GET  /v1/proxy/test    — Health check with sample detection
 import time
 import uuid
 import os
+import re
 import base64
 import hashlib
 import asyncio
@@ -17,6 +18,7 @@ from typing import Dict, Any, Optional
 from app.models.schemas import (
     ProtectRequest, ProtectResponse,
     DetectRequest, DetectResponse,
+    DetokenizeRequest, DetokenizeResponse,
     Detection,
 )
 from app.services import detector
@@ -24,7 +26,7 @@ from app.services.auth import verify_api_key_or_dev, verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
-from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
+from app.services.key_manager import resolve_encryption_key, get_org_default_key_id, _decrypt_aes_gcm
 from app.config import settings
 from app.services import quota as quota_svc
 
@@ -46,14 +48,14 @@ class DegradedModeError(Exception):
         self.reason = reason
 
 
-async def _detect_with_timeout(prompt: str) -> list:
+async def _detect_with_timeout(prompt: str, custom_rules: Optional[list] = None) -> list:
     """Runs the (synchronous, potentially slow) detector in a thread with a
     hard timeout. Raises DegradedModeError on timeout or internal failure —
     callers must catch this and fail open."""
     loop = asyncio.get_event_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, detector.detect, prompt),
+            loop.run_in_executor(None, detector.detect, prompt, True, custom_rules),
             timeout=settings.PROTECT_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -96,8 +98,11 @@ async def detect_pii(
     # Soft-cap: never blocks, just counts (see quota.py).
     await quota_svc.check_and_increment(org_id)
 
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+
     try:
-        detections = await _detect_with_timeout(body.prompt)
+        detections = await _detect_with_timeout(body.prompt, custom_pattern_rules)
     except DegradedModeError as e:
         # /detect is analysis-only (nothing to protect/mask) — on failure,
         # just return zero detections rather than fail the whole request.
@@ -180,9 +185,16 @@ async def protect_prompt(
     # the caller on it — see Step 6 below.
     audit_log_id = str(uuid.uuid4())
 
+    # Moved earlier (2026-07-24, was after detection): policies must be loaded
+    # BEFORE detection now, since rules carrying a custom_pattern feed directly
+    # into the detector (Tier 1.5) instead of only shaping post-detection
+    # action. See detector.detect()'s custom_rules parameter.
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+
     # ── Step 2: Detect PII (resilient — fails open on timeout/error) ────────
     try:
-        detections = await _detect_with_timeout(body.prompt)
+        detections = await _detect_with_timeout(body.prompt, custom_pattern_rules)
     except DegradedModeError as e:
         # Detector failed or timed out. Privaro is in the critical path of
         # every call Robin/Octupus makes to their LLM — we must not turn an
@@ -221,8 +233,7 @@ async def protect_prompt(
             degraded_reason=e.reason,
         )
 
-    # ── Step 3: Load policies + provider trust ────────────────────────────────
-    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    # ── Step 3: Load provider trust (policies already loaded above, pre-detection) ──
     provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
 
     policy_context = {
@@ -527,6 +538,7 @@ TOKEN_PREFIX = {
     "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
     "credit_card": "CC", "email": "EM", "phone": "PH",
     "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT", "ssn": "SS",
+    "money": "MN",
 }
 
 def _make_token(entity_type: str, counter: int) -> str:
@@ -536,3 +548,108 @@ def _make_token(entity_type: str, counter: int) -> str:
 
 def _get_category(entity_type: str) -> str:
     return pe._get_category(entity_type)
+
+
+# ── /proxy/detokenize ─────────────────────────────────────────────────────────
+# Added 2026-07-24 following the Octupus/Robin AI (Odoo copilot) analysis.
+#
+# reveal-token (see privaro-7938a3bd) is a human-facing flow: a DPO/admin
+# re-enters their password to reveal ONE token at a time in the dashboard UI.
+# That doesn't fit an agentic write-back flow — e.g. an ERP copilot whose
+# LLM decided (via function-calling) to create a delivery note using data
+# it only ever saw as tokens; the actual Odoo write needs the real values,
+# automatically, with no human in the loop for every single field.
+#
+# This endpoint finds every Privaro-format token ([XX-0001]) in a body of
+# text and reverses all of them in one call, authenticated the same way as
+# /protect and /detect (the caller's own org API key) — never a password,
+# but STRICTLY scoped to tokens belonging to that same org_id, applying
+# the same discipline that fixed reveal-token's cross-tenant bug earlier
+# today: a caller can only ever be authenticated as one org, so only that
+# org's tokens are ever looked up or decrypted.
+
+TOKEN_PATTERN = re.compile(r'\[[A-Z]{2,4}-\d{4}\]')
+
+
+@router.post("/detokenize", response_model=DetokenizeResponse)
+async def detokenize_text(
+    body: DetokenizeRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+):
+    """Bulk, automated reversal of every Privaro token found in `text`,
+    scoped to the caller's own organization."""
+    t0 = time.monotonic()
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+
+    org_id = pipeline["org_id"]
+
+    found_tokens = sorted(set(TOKEN_PATTERN.findall(body.text)))
+    if not found_tokens:
+        return DetokenizeResponse(
+            request_id=request_id,
+            detokenized_text=body.text,
+            tokens_reversed=0,
+            tokens_not_found=[],
+        )
+
+    vault_rows = await db.get_tokens_by_values(org_id, found_tokens)
+    rows_by_token = {r["token_value"]: r for r in vault_rows}
+
+    detokenized_text = body.text
+    reversed_count = 0
+    reversal_updates = []
+
+    for token_value in found_tokens:
+        row = rows_by_token.get(token_value)
+        if not row:
+            continue  # not found for this org — left as-is, reported below
+        try:
+            enc_key = await resolve_encryption_key(row["encryption_key_id"], org_id)
+            original_value = _decrypt_aes_gcm(row["encrypted_original"], enc_key)
+        except Exception as e:
+            print(f"[Detokenize] Decrypt failed for {token_value}: {e}")
+            continue
+        detokenized_text = detokenized_text.replace(token_value, original_value)
+        reversed_count += 1
+        reversal_updates.append({"id": row["id"], "reversal_count": row.get("reversal_count") or 0})
+
+    tokens_not_found = [t for t in found_tokens if t not in rows_by_token]
+    processing_ms = int((time.monotonic() - t0) * 1000)
+
+    # Distinct event_type from reveal-token's human-facing "reveal" action in
+    # vault_access_log — a DPO should be able to tell an automated,
+    # pipeline-driven bulk reversal apart from a human manually unmasking a
+    # value in the dashboard.
+    background_tasks.add_task(db.insert_audit_log, {
+        "id": str(uuid.uuid4()),
+        "org_id": org_id, "pipeline_id": body.pipeline_id,
+        "event_type": "bulk_detokenize",
+        "entity_type": "multiple", "entity_category": "system",
+        "action_taken": "detokenized", "severity": "medium",
+        "prompt_hash": hashlib.sha256(body.text.encode()).hexdigest(),
+        "pipeline_stage": "proxy", "processing_ms": processing_ms,
+        "ibs_status": "pending", "source": "proxy",
+        "risk_score": None, "agent_mode": True,
+        "metadata": {
+            "request_id": request_id,
+            "tokens_reversed": reversed_count,
+            "tokens_not_found": len(tokens_not_found),
+        },
+    })
+
+    if reversal_updates:
+        background_tasks.add_task(db.bump_reversal_counts, reversal_updates)
+
+    return DetokenizeResponse(
+        request_id=request_id,
+        detokenized_text=detokenized_text,
+        tokens_reversed=reversed_count,
+        tokens_not_found=tokens_not_found,
+    )

@@ -65,6 +65,24 @@ class DetectResponse(BaseModel):
     stats: Dict[str, Any]
 
 
+class DetokenizeRequest(BaseModel):
+    """
+    Bulk, automated token reversal — for agentic write-back flows (e.g. an
+    Odoo copilot that needs real values to actually write a delivery note),
+    as opposed to reveal-token's human-facing, password-gated, one-token-
+    at-a-time flow. Added 2026-07-24 following the Octupus/Robin AI analysis.
+    """
+    pipeline_id: str
+    text: str = Field(..., min_length=1, max_length=100000)
+
+
+class DetokenizeResponse(BaseModel):
+    request_id: str
+    detokenized_text: str
+    tokens_reversed: int
+    tokens_not_found: List[str] = []
+
+
 class HealthResponse(BaseModel):
     status: str
     version: str

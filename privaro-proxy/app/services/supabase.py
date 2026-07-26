@@ -383,6 +383,72 @@ async def update_vault_access_log_ibs(
         return response.status_code in (200, 201, 204)
 
 
+async def get_tokens_by_values(org_id: str, token_values: list[str]) -> list[dict]:
+    """
+    Bulk lookup of tokens_vault rows by their literal token_value (e.g.
+    "[NM-0001]"), STRICTLY scoped to org_id. Added 2026-07-24 for the
+    /v1/proxy/detokenize endpoint (automated, machine-to-machine reversal
+    for agentic write-back flows, as opposed to reveal-token's
+    human-facing, password-gated, one-token-at-a-time flow).
+
+    The org_id filter here is not optional — this is exactly the class of
+    bug fixed today in reveal-token (any admin/dpo could decrypt another
+    org's vaulted PII by supplying its token_id). A caller can only ever
+    be authenticated as ONE org's API key, so every row returned here is
+    guaranteed to belong to that org already, but the filter is kept
+    explicit rather than relied upon implicitly.
+    """
+    if not token_values:
+        return []
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        # PostgREST "in" filter: in.(val1,val2,...) — values containing
+        # commas/parens would need quoting, but our token format ([XX-0001])
+        # never does, so a plain join is safe here.
+        values_filter = "(" + ",".join(token_values) + ")"
+        response = await client.get(
+            f"{SUPABASE_REST}/tokens_vault",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "token_value": f"in.{values_filter}",
+                "is_reversible": "eq.true",
+                "select": "id,token_value,encrypted_original,encryption_key_id,reversal_count",
+            },
+        )
+        if response.status_code == 200:
+            return response.json()
+        print(f"[Vault] Bulk token lookup failed: {response.status_code} {response.text[:200]}")
+        return []
+
+
+async def bump_reversal_counts(token_updates: list[dict], user_id: str | None = None) -> None:
+    """Increments reversal_count / updates last_reversed_at for a batch of
+    tokens after a successful bulk detokenize. Fire-and-forget — never
+    blocks the caller's response on this bookkeeping.
+
+    token_updates: [{"id": ..., "reversal_count": <current value from the
+    bulk lookup>}, ...] — the caller already has the current count from
+    get_tokens_by_values(), so we increment it here rather than needing a
+    round-trip read; PostgREST has no atomic increment across arbitrary
+    rows in a single call.
+    """
+    if not token_updates:
+        return
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for row in token_updates:
+            await client.patch(
+                f"{SUPABASE_REST}/tokens_vault",
+                headers=SUPABASE_HEADERS,
+                params={"id": f"eq.{row['id']}"},
+                json={
+                    "reversal_count": (row.get("reversal_count") or 0) + 1,
+                    "last_reversed_at": datetime.now(timezone.utc).isoformat(),
+                    **({"last_reversed_by": user_id} if user_id else {}),
+                },
+            )
+
+
+
 async def find_existing_token(
     org_id: str,
     conversation_id: str,
