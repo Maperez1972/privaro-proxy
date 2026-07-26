@@ -154,6 +154,15 @@ def _apply_tokenization(text: str, detections: list, counters: Dict[str, int]) -
         elif detection.action in ("anonymised", "anonymise", "anonymise_irreversible"):
             detection.action = "anonymised"
             replacement = f"[{entity_type.upper()}]"
+        elif detection.action == "blocked":
+            # Fixed 2026-07-24 — real bug found via live testing: a policy
+            # rule that resolves to "block" for a SPECIFIC entity (not the
+            # whole request) fell through to the "else" branch below and
+            # got silently tokenised instead of blocked — a DPO-configured
+            # block policy (e.g. "never let health_record leave this
+            # pipeline") was not actually being honored. No token is
+            # generated (nothing to reverse for data that was refused).
+            replacement = f"[BLOCKED:{entity_type.upper()}]"
         else:
             detection.action = "tokenised"
             counters[entity_type] = counters.get(entity_type, 0) + 1
