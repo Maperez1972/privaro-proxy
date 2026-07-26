@@ -19,6 +19,7 @@ from app.models.schemas import (
     ProtectRequest, ProtectResponse,
     DetectRequest, DetectResponse,
     DetokenizeRequest, DetokenizeResponse,
+    ProtectStructuredRequest, ProtectStructuredResponse,
     Detection,
 )
 from app.services import detector
@@ -126,6 +127,101 @@ async def detect_pii(
 
 
 # ── /proxy/protect ───────────────────────────────────────────────────────────
+
+def _apply_tokenization(text: str, detections: list, counters: Dict[str, int]) -> str:
+    """
+    Applies tokenisation/anonymisation replacements to `text` per each
+    detection's resolved .action, back-to-front to preserve offsets.
+    Mutates each detection's .token/.action in place. `counters` is shared
+    across calls within the same request so token numbering stays
+    consistent (e.g. across multiple fields in /protect-structured).
+
+    Extracted 2026-07-24 from /protect's inline loop so /protect-structured
+    can reuse the exact same tokenisation behavior per-field instead of
+    duplicating it.
+    """
+    for detection in reversed(detections):
+        if detection.start is None or detection.end is None:
+            continue
+        entity_type = detection.type
+
+        if detection.action in ("tokenised", "pseudonymised"):
+            counters[entity_type] = counters.get(entity_type, 0) + 1
+            token = _make_token(entity_type, counters[entity_type])
+            detection.token = token
+            detection.action = "tokenised"
+            replacement = token
+        elif detection.action in ("anonymised", "anonymise", "anonymise_irreversible"):
+            detection.action = "anonymised"
+            replacement = f"[{entity_type.upper()}]"
+        else:
+            detection.action = "tokenised"
+            counters[entity_type] = counters.get(entity_type, 0) + 1
+            token = _make_token(entity_type, counters[entity_type])
+            detection.token = token
+            replacement = token
+
+        text = text[:detection.start] + replacement + text[detection.end:]
+    return text
+
+
+async def _build_vault_rows(
+    text: str,
+    detections: list,
+    org_id: str,
+    pipeline_id: str,
+    conversation_id: Optional[str],
+    enc_key: bytes,
+    enc_key_id: str,
+) -> list:
+    """
+    Same encryption/token-consistency logic as /protect's inline Step 8,
+    extracted 2026-07-24 so /protect-structured can reuse it per-field
+    without duplicating the AES-GCM + conversation-reuse logic. /protect
+    itself is left untouched (still inline) to avoid re-touching that
+    endpoint's already-verified behavior.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    token_rows = []
+    for d in detections:
+        if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
+            original_value = text[d.start:d.end]
+            original_hash = hashlib.sha256(original_value.encode("utf-8")).hexdigest()
+            try:
+                aesgcm = AESGCM(enc_key)
+                nonce = os.urandom(12)
+                ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+                encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+            except Exception as e:
+                print(f"[Vault] Encryption error: {e}")
+                continue
+
+            if conversation_id:
+                existing = await db.find_existing_token(
+                    org_id=org_id,
+                    conversation_id=conversation_id,
+                    entity_type=d.type,
+                    original_value_hash=original_hash,
+                )
+                if existing:
+                    d.token = existing["token_value"]
+                    continue
+
+            token_rows.append({
+                "org_id": org_id,
+                "pipeline_id": pipeline_id,
+                "entity_type": d.type,
+                "token_value": d.token,
+                "encrypted_original": encrypted,
+                "original_value_hash": original_hash,
+                "encryption_key_id": enc_key_id,
+                "is_reversible": True,
+                "access_roles": ["admin", "dpo"],
+                "conversation_id": conversation_id,
+            })
+    return token_rows
+
 
 @router.post("/protect", response_model=ProtectResponse)
 async def protect_prompt(
@@ -295,28 +391,7 @@ async def protect_prompt(
         return blocked_response
 
     # Apply replacements back-to-front to preserve offsets
-    for detection in reversed(detections):
-        if detection.start is None or detection.end is None:
-            continue
-        entity_type = detection.type
-
-        if detection.action in ("tokenised", "pseudonymised"):
-            counters[entity_type] = counters.get(entity_type, 0) + 1
-            token = _make_token(entity_type, counters[entity_type])
-            detection.token = token
-            detection.action = "tokenised"
-            replacement = token
-        elif detection.action in ("anonymised", "anonymise", "anonymise_irreversible"):
-            detection.action = "anonymised"
-            replacement = f"[{entity_type.upper()}]"
-        else:
-            detection.action = "tokenised"
-            counters[entity_type] = counters.get(entity_type, 0) + 1
-            token = _make_token(entity_type, counters[entity_type])
-            detection.token = token
-            replacement = token
-
-        protected_prompt = protected_prompt[:detection.start] + replacement + protected_prompt[detection.end:]
+    protected_prompt = _apply_tokenization(protected_prompt, detections, counters)
 
     processing_ms = int((time.monotonic() - t0) * 1000)
     stats = detector.build_stats(detections, processing_ms)
@@ -652,4 +727,159 @@ async def detokenize_text(
         detokenized_text=detokenized_text,
         tokens_reversed=reversed_count,
         tokens_not_found=tokens_not_found,
+    )
+
+
+# ── /proxy/protect-structured ─────────────────────────────────────────────────
+# Added 2026-07-24 following the Octupus/Robin AI (Odoo copilot) analysis.
+#
+# /protect works on a single free-text prompt. An ERP copilot's queries
+# return typed database rows — many fields, each with its own semantics —
+# not prose. A field named "diagnostico" is strong, precise signal that
+# its value is health data even if the content itself (a specific
+# diagnosis name) isn't recognized by any pattern; a field named
+# "importe_facturacion" is confidential regardless of format. This
+# endpoint lets a field's NAME force its entity_type via
+# policy_rules.field_name_pattern, falling back to normal content-based
+# detection (including custom_pattern) for any field with no matching rule.
+
+@router.post("/protect-structured", response_model=ProtectStructuredResponse)
+async def protect_structured(
+    body: ProtectStructuredRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+):
+    t0 = time.monotonic()
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+    if not body.fields:
+        raise HTTPException(status_code=400, detail={"error": "fields must not be empty"})
+
+    org_id = pipeline["org_id"]
+    await quota_svc.check_and_increment(org_id)
+
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+    # Sorted by effective priority so the first match wins when more than
+    # one field_name_pattern could match the same field name.
+    field_name_rules = sorted(
+        (r for r in policies if r.get("field_name_pattern")),
+        key=lambda r: r.get("_effective_priority", r.get("priority", 0)),
+    )
+    compiled_field_rules = []
+    for r in field_name_rules:
+        try:
+            compiled_field_rules.append((re.compile(r["field_name_pattern"], re.IGNORECASE), r))
+        except re.error as e:
+            print(f"[ProtectStructured] Invalid field_name_pattern for entity_type={r.get('entity_type')}: {e}")
+
+    provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
+    policy_context = {
+        "provider": pipeline.get("llm_provider", ""),
+        "user_role": key_record.get("role", "developer"),
+        "data_region": (provider_trust or {}).get("data_region", "EU"),
+        "agent_mode": True,
+        "pipeline_sector": pipeline.get("sector", "general"),
+        "default_action": "tokenise",
+    }
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+
+    enc_key_id = await get_org_default_key_id(org_id)
+    try:
+        enc_key = await resolve_encryption_key(enc_key_id, org_id)
+    except Exception as e:
+        print(f"[ProtectStructured] Key resolution failed, falling back to managed: {e}")
+        from app.services.key_manager import _get_managed_key
+        enc_key = _get_managed_key()
+        enc_key_id = "key-v1"
+
+    protected_fields: Dict[str, str] = {}
+    detections_by_field: Dict[str, list] = {}
+    all_detections = []
+    all_vault_rows = []
+    counters: Dict[str, int] = {}
+
+    for field_name, field_value in body.fields.items():
+        # 1. Field-name-forced entity type — whole value, no content parsing
+        forced_rule = next(
+            (rule for pattern, rule in compiled_field_rules if pattern.search(field_name)),
+            None,
+        )
+        if forced_rule:
+            field_detections = [Detection(
+                type=forced_rule["entity_type"],
+                severity=forced_rule.get("severity_override") or "high",
+                action="detected",
+                token=None,
+                start=0,
+                end=len(field_value),
+                confidence=0.95,
+                detector="field_name_rule",
+            )]
+        else:
+            # 2. Normal content-based detection (regex + custom_pattern + NLP)
+            field_detections = await _detect_with_timeout(field_value, custom_pattern_rules)
+
+        if policies and field_detections:
+            field_detections = pe.apply_policies(field_detections, policies, policy_context)
+        else:
+            for d in field_detections:
+                d.action = "tokenised"
+
+        protected_value = _apply_tokenization(field_value, field_detections, counters)
+        protected_fields[field_name] = protected_value
+        detections_by_field[field_name] = field_detections
+        all_detections.extend(field_detections)
+
+        field_vault_rows = await _build_vault_rows(
+            field_value, field_detections, org_id, body.pipeline_id,
+            body.conversation_id, enc_key, enc_key_id,
+        )
+        all_vault_rows.extend(field_vault_rows)
+
+    processing_ms = int((time.monotonic() - t0) * 1000)
+    risk_score = pe.compute_risk_score(
+        all_detections, provider_risk_level=provider_risk_level,
+        agent_mode=True, leaked_count=0,
+    )
+    stats = detector.build_stats(all_detections, processing_ms)
+    stats["risk_score"] = risk_score
+
+    audit_log_id = str(uuid.uuid4())
+    background_tasks.add_task(db.insert_audit_log, {
+        "id": audit_log_id,
+        "org_id": org_id, "pipeline_id": body.pipeline_id,
+        "event_type": "structured_protect" if all_detections else "request_clean",
+        "entity_type": "multiple" if all_detections else "none",
+        "entity_category": "system",
+        "action_taken": "tokenised" if all_detections else "passed",
+        "severity": "medium" if all_detections else "low",
+        "prompt_hash": hashlib.sha256(str(body.fields).encode()).hexdigest(),
+        "pipeline_stage": "proxy", "processing_ms": processing_ms,
+        "ibs_status": "pending", "source": "proxy",
+        "risk_score": risk_score, "agent_mode": True,
+        "conversation_id": body.conversation_id if body.conversation_id else None,
+        "metadata": {
+            "request_id": request_id, "fields_count": len(body.fields),
+            "total_detected": len(all_detections),
+        },
+    })
+
+    if all_vault_rows:
+        background_tasks.add_task(db.insert_tokens_batch, all_vault_rows)
+        background_tasks.add_task(db.increment_encryption_key_usage, enc_key_id, len(all_vault_rows))
+
+    background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id, {"request_id": request_id})
+
+    return ProtectStructuredResponse(
+        request_id=request_id,
+        protected_fields=protected_fields,
+        detections_by_field=detections_by_field,
+        stats=stats,
+        audit_log_id=audit_log_id,
     )

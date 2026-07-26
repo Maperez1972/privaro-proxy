@@ -83,6 +83,28 @@ class DetokenizeResponse(BaseModel):
     tokens_not_found: List[str] = []
 
 
+class ProtectStructuredRequest(BaseModel):
+    """
+    Field-aware protection for structured payloads (e.g. an Odoo record's
+    fields), as opposed to /protect's single free-text prompt. Added
+    2026-07-24 following the Octupus/Robin AI analysis: ERP query results
+    are typed rows with many fields, not prose — a field literally named
+    "diagnostico" is strong, precise signal on its own, independent of
+    whether its content matches any free-text medical-term pattern.
+    """
+    pipeline_id: str
+    fields: Dict[str, str]
+    conversation_id: Optional[str] = None
+
+
+class ProtectStructuredResponse(BaseModel):
+    request_id: str
+    protected_fields: Dict[str, str]
+    detections_by_field: Dict[str, List[Detection]]
+    stats: Dict[str, Any]
+    audit_log_id: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     status: str
     version: str
