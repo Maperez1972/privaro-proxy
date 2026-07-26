@@ -82,11 +82,22 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
 
     # Full name heuristic — keyword-triggered, group 1 = name only
     # Keywords: solicitante covers mortgage/loan context (Gibobs use case)
+    #
+    # Fixed 2026-07-24 — REAL bug found via live testing: the global
+    # re.IGNORECASE flag defeated the capitalization requirement entirely.
+    # Under IGNORECASE, [A-ZÁÉÍÓÚÑ] also matches lowercase letters, so the
+    # name group would greedily swallow the next lowercase word too --
+    # "cliente Juan García Ruiz tiene" -> captured "Juan García Ruiz tiene",
+    # silently deleting the real word "tiene" from the protected output
+    # (not just a labeling bug -- actual content loss). Switched to an
+    # inline (?i:...) group scoped ONLY to the trigger keyword, so
+    # "CLIENTE"/"Cliente"/"cliente" all still match, but the name capture
+    # group is genuinely case-sensitive again -- verified against the
+    # exact failing case plus an all-caps-keyword case.
     ("full_name", "low",
      re.compile(
-         r'(?:paciente|solicitante|nombre|cliente|empleado|trabajador|cotitular'
-         r'|sr\.?|sra\.?|don|doña|mr\.?|ms\.?|mrs\.?)[\s:]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})',
-         re.IGNORECASE
+         r'(?i:paciente|solicitante|nombre|cliente|empleado|trabajador|cotitular'
+         r'|sr\.?|sra\.?|don|doña|mr\.?|ms\.?|mrs\.?)[\s:]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})'
      ),
      0.80),
 
