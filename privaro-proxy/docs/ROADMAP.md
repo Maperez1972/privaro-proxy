@@ -24,6 +24,22 @@ Origen: pensando en las necesidades reales de Octupus/Robin AI al integrar Priva
 
 ---
 
+### Ronda de pruebas en vivo — 4 bugs reales encontrados y arreglados (24 de julio de 2026)
+
+Tras construir las 4 capacidades nuevas (arriba), se probaron en producción real con datos reales (clave de prueba generada para iCommunity Labs, pipeline "Legal Document Reviewer"). El proceso de prueba en sí sacó a la luz **4 bugs reales**, ninguno de ellos hipotético:
+
+1. **`money`, `field_name_pattern` y detección normal**: confirmados funcionando correctamente a la primera.
+
+2. **Acción "block" ignorada en peticiones parciales**: una regla de política preexistente en el pipeline (bloquear `health_record`, prioridad 1) se evaluaba correctamente por el motor de políticas (visible en los logs: `action=block`), pero el código de tokenización nunca contemplaba el caso "blocked" — caía en un `else` que lo tokenizaba de todas formas. Bug preexistente en `/protect` (no introducido hoy), nunca antes ejercitado porque nunca había habido una regla de bloqueo real configurada en un pipeline con detecciones mixtas. Arreglado: ahora genera `[BLOCKED:TIPO]` sin token, y el guardado en `tokens_vault` lo omite correctamente.
+
+3. **Pérdida real de contenido — el patrón `full_name` se comía la siguiente palabra**: `"cliente Juan García Ruiz tiene un saldo..."` perdía la palabra "tiene" en el texto protegido. Causa raíz: `re.IGNORECASE` aplicado a *todo* el patrón regex (incluida la palabra clave disparadora Y el grupo de captura del nombre) anulaba por completo la exigencia de mayúscula inicial — bajo IGNORECASE, `[A-Z...]` también coincide con minúsculas, así que el patrón podía extender la captura a palabras minúsculas siguientes. Bug preexistente desde que se escribió el patrón, no introducido hoy — solo salió a la luz porque la frase de prueba tenía justo esta estructura. Arreglado limitando `IGNORECASE` a la palabra clave únicamente (`(?i:...)` inline), dejando el grupo del nombre genuinamente sensible a mayúsculas. De paso se arregló también un problema similar (aunque menos grave) en el motor Presidio/NLP, que tampoco recortaba el span tras su propio filtro de validación.
+
+4. **`/detokenize` podía devolver el valor equivocado**: al revertir `[NM-0001]`, devolvió "Ana Pérez" en vez de "Juan García Ruiz". Causa raíz confirmada con datos reales: `token_value` no es único dentro de una organización a lo largo del tiempo — es solo un contador que reinicia en cada llamada a `/protect`. Se encontraron **47 filas** distintas con el literal `[NM-0001]` para la misma organización, acumuladas desde marzo. Arreglado añadiendo `conversation_id` (opcional pero fuertemente recomendado) para desambiguar con precisión, con un fallback de "mejor esfuerzo" (fila más reciente) documentado cuando no se proporciona.
+
+Todos los arreglos verificados con pruebas reales end-to-end tras cada despliegue, no solo compilación. Ninguno de estos 4 bugs se habría encontrado sin probar contra producción real con datos reales — la disciplina de "no dar nada por bueno sin verificarlo" se demostró valiosa una vez más.
+
+
+
 ## Nuevas capacidades a raíz del análisis de Octupus/Robin AI (24 de julio de 2026)
 
 Análisis en profundidad de robin-ia.com (producto, seguridad, FAQ) para identificar mejoras de Privaro relevantes para el caso de uso real de un copiloto de IA dentro de Odoo. Se priorizaron los dos hallazgos con evidencia más sólida (verificados contra el código real del detector, no solo especulación):
@@ -43,6 +59,8 @@ Documentado en `PARTNER_API_REFERENCE.md` (v2) para que Octupus pueda descubrir 
 ---
 
 
+
+## Notas relevantes por punto
 
 ### 7 — Detector NER (hallazgo, no desarrollo)
 
