@@ -41,7 +41,7 @@ Body:
     "reversible": true,                             // default: true
     "agent_mode": false                             // default: false — activa políticas más estrictas
   },
-  "conversation_id": "UUID opcional — ver sección 6"
+  "conversation_id": "UUID — obligatorio si reversible=true (el valor por defecto); opcional si reversible=false"
 }
 ```
 
@@ -108,7 +108,7 @@ Body:
     "temperature": 0.7,                // default
     "system_prompt": "string opcional"
   },
-  "conversation_id": "UUID opcional — ver sección 6"
+  "conversation_id": "UUID opcional — pero sin él los tokens no se guardan en absoluto, ver aviso abajo"
 }
 ```
 
@@ -172,11 +172,20 @@ data: [DONE]
 
 ---
 
-## 6. `conversation_id` — coherencia entre turnos
+## 6. `conversation_id` — coherencia entre turnos, y cuándo es obligatorio
 
-Si mandáis vuestro propio identificador de conversación/sesión (el que uséis en Robin) en el campo `conversation_id` de `/protect`, `/relay/complete` o `/relay/stream`, **el mismo dato personal recibe siempre el mismo token dentro de esa conversación**. Si "Juan Pérez" sale como `[NM-0001]` en el turno 1, sigue siendo `[NM-0001]` en el turno 5 — nunca un token nuevo para el mismo valor.
+Si mandáis vuestro propio identificador de conversación/sesión (el que uséis en Robin) en el campo `conversation_id`, **el mismo dato personal recibe siempre el mismo token dentro de esa conversación**. Si "Juan Pérez" sale como `[NM-0001]` en el turno 1, sigue siendo `[NM-0001]` en el turno 5 — nunca un token nuevo para el mismo valor.
 
-**Debe ser un UUID válido** (ej. `550e8400-e29b-41d4-a716-446655440000`) — se guarda en una columna `uuid` de nuestra base de datos. No necesita registrarse ni existir en ningún sitio dentro de Privaro de antemano, pero si Robin usa internamente otro formato de ID de conversación (numérico, con guiones, etc.), generad un UUID propio para asociarlo, en vez de reenviar vuestro ID interno directamente — un valor que no sea UUID se rechaza con un 422 claro en la petición.
+**Debe ser un UUID válido** (ej. `550e8400-e29b-41d4-a716-446655440000`) — se guarda en una columna `uuid` de nuestra base de datos. No necesita registrarse ni existir en ningún sitio dentro de Privaro de antemano, pero si Robin usa internamente otro formato de ID de conversación (numérico, con guiones, etc.), generad un UUID propio para asociarlo — un valor que no sea UUID se rechaza con un 422 claro.
+
+**¿Cuándo es obligatorio, no solo recomendado?** El literal de un token (ej. `[NM-0001]`) nunca es único dentro de vuestra organización a lo largo del tiempo — sin un identificador que agrupe qué tokens pertenecen a qué interacción concreta, revertirlos más tarde es ambiguo (confirmado con datos reales: 47 filas históricas compartiendo un mismo literal para una sola organización). Por eso:
+
+| Endpoint | ¿`conversation_id` obligatorio? |
+|---|---|
+| `/protect` (y `/detect`, aunque no persiste nada) | **Sí, si `options.reversible=true`** (el valor por defecto). Si mandáis `reversible=false`, no se persiste ningún token y `conversation_id` es opcional. |
+| `/protect-structured` | **Sí, siempre** — no existe un modo no-reversible para este endpoint. |
+| `/detokenize` | **Sí, siempre** — el propio propósito del endpoint es la reversión precisa; sin él no hay forma segura de saber a qué token os referís. |
+| `/relay/complete`, `/relay/stream` | Opcional — pero si no lo mandáis, los tokens generados **no se guardan en la base de datos en absoluto** (solo se destokenizan en la propia respuesta de esa llamada gracias a `detokenise_response`). Si necesitáis poder revertir esos tokens más adelante (ej. `/detokenize` en un flujo agéntico posterior), tenéis que mandar `conversation_id` aquí también. |
 
 ---
 
@@ -228,11 +237,11 @@ Body:
 {
   "pipeline_id": "string",
   "text": "string (1-100000 caracteres) — puede contener 0 o más tokens",
-  "conversation_id": "UUID — MUY recomendado, ver aviso abajo"
+  "conversation_id": "UUID — OBLIGATORIO, ver aviso abajo"
 }
 ```
 
-**⚠️ Importante — pasad siempre `conversation_id`.** El literal de un token (ej. `[NM-0001]`) **no es único** dentro de vuestra organización a lo largo del tiempo — es solo un contador que empieza de nuevo en cada llamada a `/protect`. Sin `conversation_id`, si vuestra organización acumula muchas llamadas históricas, no hay garantía de que `[NM-0001]` se resuelva al valor de la petición que os interesa — el endpoint hace lo posible (toma la fila más reciente), pero solo `conversation_id` (el mismo que usasteis en el `/protect` original que generó esos tokens) da una resolución exacta y sin ambigüedad.
+**⚠️ `conversation_id` es obligatorio en este endpoint.** El literal de un token (ej. `[NM-0001]`) **no es único** dentro de vuestra organización a lo largo del tiempo — es solo un contador que empieza de nuevo en cada llamada a `/protect`. Sin `conversation_id`, no hay garantía de que `[NM-0001]` se resuelva al valor de la petición que os interesa — confirmado con datos reales: una sola organización puede acumular decenas de filas históricas compartiendo el mismo literal. Pasad el mismo `conversation_id` (UUID) que usasteis en el `/protect` o `/protect-structured` original que generó esos tokens.
 
 **Respuesta (200):**
 ```json
@@ -262,9 +271,11 @@ Body:
     "nombre_campo_1": "valor 1",
     "nombre_campo_2": "valor 2"
   },
-  "conversation_id": "UUID opcional"
+  "conversation_id": "UUID — OBLIGATORIO"
 }
 ```
+
+`conversation_id` es obligatorio aquí — este endpoint no tiene un modo "no reversible", así que siempre puede persistir tokens, y sin un identificador de conversación no hay forma segura de revertirlos después (ver sección 6).
 
 **Respuesta (200):**
 ```json
@@ -298,6 +309,7 @@ Para forzar el tipo de un campo por su nombre (en vez de depender solo del conte
 
 | Versión | Fecha | Cambios |
 |---|---|---|
+| v4 | 2026-07-24 | `conversation_id` ahora es **obligatorio** en `/detokenize` y `/protect-structured` (antes solo recomendado), y en `/protect` cuando `options.reversible=true` (el valor por defecto) — cierra de raíz la ambigüedad del literal de token, no solo la mitiga. `/relay/*` se deja opcional deliberadamente (ver sección 6). |
 | v3 | 2026-07-24 | `/v1/proxy/detokenize` ahora acepta `conversation_id` (muy recomendado) tras un fallo real detectado en pruebas en vivo — `token_value` no es único dentro de una organización a lo largo del tiempo. |
 | v2 | 2026-07-24 | Añadido `/v1/proxy/detokenize` (reversión en bulk para flujos agénticos), `/v1/proxy/protect-structured` (protección por campo con nombre, pensado para copilotos de ERP), y nuevo tipo de entidad `money` — a raíz del análisis de Robin AI/Octupus como copiloto de Odoo. |
 | v1 | 2026-07-24 | Primera versión — referencia completa de todos los endpoints, en respuesta a una pregunta real de integración (destokenización en streaming). |
