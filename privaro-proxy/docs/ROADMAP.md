@@ -24,7 +24,25 @@ Origen: pensando en las necesidades reales de Octupus/Robin AI al integrar Priva
 
 ---
 
-## Notas relevantes por punto
+## Nuevas capacidades a raíz del análisis de Octupus/Robin AI (24 de julio de 2026)
+
+Análisis en profundidad de robin-ia.com (producto, seguridad, FAQ) para identificar mejoras de Privaro relevantes para el caso de uso real de un copiloto de IA dentro de Odoo. Se priorizaron los dos hallazgos con evidencia más sólida (verificados contra el código real del detector, no solo especulación):
+
+1. **Tipo de entidad `money`**: la propia web de seguridad de Robin muestra un ejemplo de tokenización que incluye un importe de facturación junto a PII clásica — su concepto de "sensible" incluye datos comercialmente confidenciales, no solo PII bajo RGPD. Confirmado que el detector no tenía ningún tipo `MONEY`/`AMOUNT`. Añadido, categorizado como `financial` (no `personal`) y con peso bajo en el risk_score para no contaminar las métricas orientadas a RGPD. Patrón probado exhaustivamente contra falsos positivos y contra el propio ejemplo textual de Robin (que inicialmente fallaba por un problema de `\b` con el símbolo `€`, corregido).
+
+2. **`custom_pattern` de `policy_rules`, completado**: existía en el esquema desde hace tiempo sin usarse en ningún sitio del código — infraestructura preparada y olvidada. Ahora se integra como "Tier 1.5" en el detector, permitiendo que cada cliente final de Octupus (un despacho con su propio formato de expediente, una clínica con su propia codificación de historia clínica) extienda la taxonomía sin necesitar ingeniería de Privaro. Requirió reordenar `/protect` y `/detect` para cargar las políticas antes de la detección (antes se cargaban después).
+
+3. **`POST /v1/proxy/detokenize`**: reversión automática en bulk de todos los tokens presentes en un texto, pensado para flujos agénticos con function-calling (el LLM decide escribir un registro real en Odoo a partir de datos que solo vio tokenizados) — a diferencia de `reveal-token`, que es un flujo humano con contraseña, uno a uno. Aplicada desde el diseño la misma disciplina de scope por organización que costó arreglar hoy en `reveal-token` (`get_tokens_by_values` filtra explícitamente por `org_id`).
+
+4. **`POST /v1/proxy/protect-structured`**: protección consciente de campos con nombre (no solo texto libre), con una nueva columna `policy_rules.field_name_pattern` que reutiliza toda la infraestructura de scope/prioridad ya existente. Permite forzar el tipo de entidad de un campo por su nombre (ej. cualquier campo `diagnostico` se trata siempre como dato de salud, independientemente de si el contenido coincide con algún patrón de texto libre) — más preciso que intentar NER médico genérico, que requeriría un diccionario extenso que no existe hoy.
+
+**Estado de verificación**: todo compila limpio (`py_compile` en cada archivo tocado). La lógica central del detector (patrón `money`, `custom_pattern`, selección de reglas por nombre de campo) se probó de forma aislada con casos reales, con resultados correctos. El endpoint `/protect-structured` en sí **no se ha probado con una llamada real end-to-end** — sus dependencias (Supabase REST, servicio de quota) no son mockeables desde este entorno. Pendiente de una prueba real antes de darlo por completamente verificado. Tampoco se ha podido confirmar el despliegue en Railway directamente (`api.privaro.ai` no está en la lista de dominios accesibles desde aquí).
+
+Documentado en `PARTNER_API_REFERENCE.md` (v2) para que Octupus pueda descubrir y usar estas capacidades.
+
+---
+
+
 
 ### 7 — Detector NER (hallazgo, no desarrollo)
 
