@@ -135,6 +135,26 @@ def detect_nlp(
                 )
                 continue
 
+            # ── Trim span to the leading run of capitalized words only ────────
+            # Fixed 2026-07-24 — real bug found via live testing: Presidio's
+            # raw span sometimes runs on past the actual name into the next
+            # word (e.g. "Juan García Ruiz tiene" for "... Ruiz tiene un
+            # saldo..."), and that trailing lowercase word/verb was being
+            # tokenised away along with the name, silently deleting real
+            # content from the user's text. The >=2-capitalized-words check
+            # above only decided accept/reject, never adjusted start/end.
+            word_pattern = _re.compile(r'\S+')
+            trimmed_end_offset = None
+            for m in word_pattern.finditer(span_text):
+                word = m.group()
+                if _re.match(r'^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñA-ZÁÉÍÓÚÜÑ]*$', word):
+                    trimmed_end_offset = m.end()
+                else:
+                    break
+            if trimmed_end_offset is not None and trimmed_end_offset < len(span_text):
+                end = start + trimmed_end_offset
+                span_text = text[start:end]
+
             # ── Additional filter: reject ALL-CAPS domain/financial terms ──────
             # Presidio sometimes classifies financial/document header terms as
             # PERSON when they appear in ALL-CAPS (e.g. "SCORING HIPOTECARIO",
