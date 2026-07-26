@@ -38,6 +38,8 @@ Tras construir las 4 capacidades nuevas (arriba), se probaron en producción rea
 
 Todos los arreglos verificados con pruebas reales end-to-end tras cada despliegue, no solo compilación. Ninguno de estos 4 bugs se habría encontrado sin probar contra producción real con datos reales — la disciplina de "no dar nada por bueno sin verificarlo" se demostró valiosa una vez más.
 
+**Cierre final del hallazgo #4** (a petición explícita, tras confirmar que el arreglo original — recomendar `conversation_id` — no eliminaba el riesgo del todo): `conversation_id` pasó de "recomendado" a **obligatorio** allí donde genera ambigüedad real — `/protect` cuando `options.reversible=true` (el valor por defecto), y siempre en `/detokenize`/`/protect-structured` (que no tienen modo no-reversible). Se dejó deliberadamente opcional en `/relay/complete`/`/relay/stream`, tras verificar que su guardado en vault ya depende silenciosamente de ese campo hoy (`if conversation_id and enc_key:`) — sin él simplemente no persiste nada, así que no hay riesgo de ambigüedad, solo la limitación conocida de "no será reversible más tarde". Hacerlo obligatorio ahí habría sido un cambio disruptivo sin beneficio de seguridad correspondiente, dado que Octupus está integrando activamente ahora mismo. De paso se corrigió una afirmación incorrecta preexistente en la documentación (decía que el campo era "completamente libre" — en realidad siempre ha tenido que ser un UUID válido para la columna de Postgres).
+
 
 
 ## Nuevas capacidades a raíz del análisis de Octupus/Robin AI (24 de julio de 2026)
