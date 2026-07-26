@@ -1,9 +1,30 @@
 """
 Pydantic models — request/response validation for all proxy endpoints.
 """
-from pydantic import BaseModel, Field
+import uuid as _uuid
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
+
+
+def _validate_conversation_id(v: Optional[str]) -> Optional[str]:
+    """
+    Fixed 2026-07-24 — found via live testing: conversation_id is stored
+    in a Postgres `uuid` column, but the request models accepted any
+    plain string with no validation. Passing something like
+    "test-conversation-001" made the tokens_vault INSERT fail silently
+    (it runs as a background task -- the caller gets a normal-looking
+    200 response, then /detokenize later reports 0 tokens reversed with
+    no indication why). Now rejected immediately with a clear 422 at
+    request time instead of a confusing silent failure minutes later.
+    """
+    if v is None:
+        return v
+    try:
+        _uuid.UUID(v)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"conversation_id must be a valid UUID, got: {v!r}")
+    return v
 
 
 class DetectionMode(str, Enum):
@@ -24,6 +45,8 @@ class ProtectRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=50000)
     options: ProxyOptions = ProxyOptions()
     conversation_id: Optional[str] = None  # Token scoping: reuse tokens within same conversation
+
+    _validate_conv_id = field_validator("conversation_id")(_validate_conversation_id)
 
 
 class DetectRequest(BaseModel):
@@ -83,6 +106,8 @@ class DetokenizeRequest(BaseModel):
     # /protect-structured) call that generated these tokens.
     conversation_id: Optional[str] = None
 
+    _validate_conv_id = field_validator("conversation_id")(_validate_conversation_id)
+
 
 class DetokenizeResponse(BaseModel):
     request_id: str
@@ -103,6 +128,8 @@ class ProtectStructuredRequest(BaseModel):
     pipeline_id: str
     fields: Dict[str, str]
     conversation_id: Optional[str] = None
+
+    _validate_conv_id = field_validator("conversation_id")(_validate_conversation_id)
 
 
 class ProtectStructuredResponse(BaseModel):
