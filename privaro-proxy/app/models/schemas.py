@@ -74,6 +74,14 @@ class DetokenizeRequest(BaseModel):
     """
     pipeline_id: str
     text: str = Field(..., min_length=1, max_length=100000)
+    # Fixed 2026-07-24 (found via live testing): token_value is NOT unique
+    # within an org over time -- it's just a per-request counter that
+    # restarts at 0001 every /protect call. Without conversation_id there
+    # is no way to disambiguate which of possibly dozens of historical
+    # rows sharing the literal token string is the right one. Strongly
+    # recommended: pass the same conversation_id used in the /protect (or
+    # /protect-structured) call that generated these tokens.
+    conversation_id: Optional[str] = None
 
 
 class DetokenizeResponse(BaseModel):

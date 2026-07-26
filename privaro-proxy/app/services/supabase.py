@@ -383,7 +383,11 @@ async def update_vault_access_log_ibs(
         return response.status_code in (200, 201, 204)
 
 
-async def get_tokens_by_values(org_id: str, token_values: list[str]) -> list[dict]:
+async def get_tokens_by_values(
+    org_id: str,
+    token_values: list[str],
+    conversation_id: str | None = None,
+) -> list[dict]:
     """
     Bulk lookup of tokens_vault rows by their literal token_value (e.g.
     "[NM-0001]"), STRICTLY scoped to org_id. Added 2026-07-24 for the
@@ -397,28 +401,49 @@ async def get_tokens_by_values(org_id: str, token_values: list[str]) -> list[dic
     be authenticated as ONE org's API key, so every row returned here is
     guaranteed to belong to that org already, but the filter is kept
     explicit rather than relied upon implicitly.
+
+    Fixed 2026-07-24 (found via live testing, same day): token_value is
+    NOT unique within an org — it's just a per-request counter that
+    restarts at 0001 for every /protect call. A real org can easily
+    accumulate dozens of unrelated rows sharing the literal string
+    "[NM-0001]" over time. Without disambiguation this silently returned
+    an arbitrary (wrong) row. Now: if conversation_id is given, filter by
+    it too (the same scoping already used elsewhere for token reuse
+    within a conversation — this makes the lookup precise). If not
+    given, take only the MOST RECENT row per token_value as a documented
+    best-effort fallback, rather than an unordered/arbitrary one.
     """
     if not token_values:
         return []
     async with httpx.AsyncClient(timeout=5.0) as client:
-        # PostgREST "in" filter: in.(val1,val2,...) — values containing
-        # commas/parens would need quoting, but our token format ([XX-0001])
-        # never does, so a plain join is safe here.
         values_filter = "(" + ",".join(token_values) + ")"
+        params = {
+            "org_id": f"eq.{org_id}",
+            "token_value": f"in.{values_filter}",
+            "is_reversible": "eq.true",
+            "select": "id,token_value,encrypted_original,encryption_key_id,reversal_count,created_at",
+            "order": "created_at.desc",
+        }
+        if conversation_id:
+            params["conversation_id"] = f"eq.{conversation_id}"
         response = await client.get(
             f"{SUPABASE_REST}/tokens_vault",
             headers=SUPABASE_HEADERS,
-            params={
-                "org_id": f"eq.{org_id}",
-                "token_value": f"in.{values_filter}",
-                "is_reversible": "eq.true",
-                "select": "id,token_value,encrypted_original,encryption_key_id,reversal_count",
-            },
+            params=params,
         )
-        if response.status_code == 200:
-            return response.json()
-        print(f"[Vault] Bulk token lookup failed: {response.status_code} {response.text[:200]}")
-        return []
+        if response.status_code != 200:
+            print(f"[Vault] Bulk token lookup failed: {response.status_code} {response.text[:200]}")
+            return []
+        rows = response.json()
+        # Keep only the first (most recent, thanks to order=created_at.desc)
+        # row per distinct token_value.
+        seen: set[str] = set()
+        deduped = []
+        for row in rows:
+            if row["token_value"] not in seen:
+                seen.add(row["token_value"])
+                deduped.append(row)
+        return deduped
 
 
 async def bump_reversal_counts(token_updates: list[dict], user_id: str | None = None) -> None:

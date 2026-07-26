@@ -683,7 +683,7 @@ async def detokenize_text(
             tokens_not_found=[],
         )
 
-    vault_rows = await db.get_tokens_by_values(org_id, found_tokens)
+    vault_rows = await db.get_tokens_by_values(org_id, found_tokens, body.conversation_id)
     rows_by_token = {r["token_value"]: r for r in vault_rows}
 
     detokenized_text = body.text
