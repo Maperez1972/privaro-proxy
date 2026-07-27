@@ -131,7 +131,19 @@ Método de verificación: en vez de crear cuentas de admin nuevas para Cliente A
 
 ---
 
-## Filosofía de esta sesión de trabajo
+## Aviso de consumo — de papel mojado a automático (27 de julio de 2026)
+
+Pregunta real de Miguel al revisar la documentación del template de n8n: si el modelo de cuota es "soft-cap" (nunca bloquea peticiones al superar el plan), ¿cómo se entera él o el cliente de que lo ha superado?
+
+Verificado: el mecanismo de notificación (`usage_threshold` 80% / `usage_overage` 100%, en `quota.py`/`send_usage_notification`) existe en el código desde hace tiempo, pero depende de una fila de configuración manual en `org_notifications` por organización — y **solo 2 organizaciones la tenían configurada** (iCommunity Labs, sin `usage_overage`; y Partner Demo, el sandbox). **Octupus —el único partner real activo— no tenía nada.** Si superaba su plan, nadie se enteraba: ni el cliente, ni Miguel.
+
+Decisión de mantener el soft-cap tal cual (no cambiar a bloqueo duro tipo OpenAI/Anthropic) — coherente con cómo operan otras infraestructuras B2B críticas (Twilio, SendGrid): cortar producción de un partner activo por unas peticiones de más sería más dañino para la relación comercial que el coste de esas peticiones.
+
+Arreglado el problema real (que el aviso nunca llegaba a nadie), no el modelo de cuota:
+- Trigger en `user_roles` (no en `organizations`, que no tiene columna de email de admin) que se dispara al asignar el primer rol admin a una organización, creando automáticamente `usage_threshold` + `usage_overage` con destinatarios = [email del admin] + [Miguel, como superadmin, en toda organización sin excepción].
+- Backfill ejecutado para todos los admins ya asignados antes de hoy — cubrió Octupus, completó el `usage_overage` que le faltaba a iCommunity Labs, añadió a Miguel a Partner Demo, y de paso configuró automáticamente una organización de prueba (Acme Corp) que ni siquiera se sabía que existía — confirma que el mecanismo cubre cualquier organización, no solo las conocidas explícitamente.
+
+
 
 Varios de estos puntos empezaron como "vamos a construir X" y terminaron siendo "X ya existía / estaba roto de una forma distinta a la esperada". El patrón que ha funcionado en todos los casos: **verificar contra el código y los datos reales antes de dar nada por bueno** — con dry-runs SQL antes de desplegar, pruebas end-to-end reales antes de cerrar un punto, y desconfianza sana hacia cualquier descripción de cambio ("hecho") que no se haya verificado directamente contra el repo o la base de datos.
 
