@@ -62,7 +62,22 @@ Documentado en `PARTNER_API_REFERENCE.md` (v2) para que Octupus pueda descubrir 
 
 
 
-## Notas relevantes por punto
+## Análisis en profundidad #2 — necesidades reales de Octupus/Robin con Odoo (24 de julio de 2026)
+
+Continuación del análisis inicial (arriba), esta vez centrado en qué módulos concretos de Odoo podría estar usando Robin y qué huecos reales de producto emergen de ahí.
+
+**Cerrado hoy mismo**: `field_name_pattern` (la funcionalidad de protección por nombre de campo, construida en la sesión anterior) no tenía ninguna interfaz de configuración — solo se podía dar de alta por SQL directo, que es como lo probé yo mismo para la demo de `health_record`/`diagnostic`. Construida la pantalla de autoservicio en `Policies.tsx`/`PolicyDialog.tsx`, replicando el patrón ya existente para `custom_pattern`, con la distinción explicada en la propia UI: `custom_pattern` filtra por contenido del mensaje (solo tiene sentido para el tipo "custom"), `field_name_pattern` filtra por el nombre del campo estructurado y funciona con cualquier tipo de entidad — tal como se demostró en la prueba real de hoy (`entity_type: health_record` + `field_name_pattern: diagnostic`, un tipo *ya existente*, no uno personalizado).
+
+**Preguntas enviadas a Octupus** (por email, pendientes de respuesta) para priorizar qué construir después con base en su uso real, no en suposiciones:
+1. ¿Robin da acceso a datos de RRHH/nóminas, o el uso es sobre todo cara al cliente?
+2. ¿Usan el módulo de Selección/Reclutamiento? (datos de candidatos, retención distinta a la de clientes/empleados)
+3. ¿La política de protección debería variar según qué usuario de Odoo pregunta, no solo por organización/pipeline?
+4. ¿Tienen flujos donde Robin actúa disparado automáticamente por Odoo (sin humano escribiendo), y cómo gestionan el identificador de sesión en esos casos? — relevante dado que hoy hicimos `conversation_id` obligatorio para peticiones reversibles, un concepto pensado para sesiones humanas.
+5. ¿Operan o tienen previsto operar fuera de España? (la detección hoy está orientada a formatos españoles — DNI, teléfono ES)
+
+**Hallazgo arquitectónico propio, no dependiente de la respuesta de Octupus — derecho al olvido / supresión RGPD por persona**: hoy no existe ninguna forma de decir "borra todos los tokens que existen sobre esta persona concreta" en `tokens_vault`. Cada token se vincula a un valor original por el hash de su cadena de texto EXACTA (`original_value_hash`), no por una identidad de persona real — así que si "Juan Pérez" aparece tokenizado en 10 conversaciones distintas con ligeras variaciones de formato ("Juan Pérez", "D. Juan Pérez García", etc.), no hay ningún vínculo entre esas 10 filas que permita purgarlas todas de una vez ante una solicitud de supresión real. Hoy la única purga posible es por organización + antigüedad (`retention-cleanup`, arreglado hoy) o por tipo de entidad — nunca por persona específica. Dado el volumen de PII que procesa un ERP como Odoo (mucho más alto que un chat simple), esto podría convertirse en un problema real de cumplimiento si un cliente de Octupus recibe una solicitud de supresión GDPR sobre un individuo concreto. No es urgente hoy, pero es un rediseño de fondo (requeriría algún tipo de índice/vínculo por persona, no solo por hash de valor exacto) que vale la pena tener en el radar antes de que escale el volumen de uso.
+
+
 
 ### 7 — Detector NER (hallazgo, no desarrollo)
 
