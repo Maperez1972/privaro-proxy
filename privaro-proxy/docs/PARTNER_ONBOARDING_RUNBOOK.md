@@ -108,7 +108,34 @@ ON CONFLICT (user_id, org_id) DO UPDATE SET role = EXCLUDED.role;
 
 ---
 
-## 4. Verificación antes de avisar al partner
+## 3.5. Crear la clave de API de partner (SIEMPRE, no opcional)
+
+**Actualizado 2026-07-27** tras un caso real: Octupus tuvo que pedir por email, uno a uno y con días de diferencia, `partner:write_children` y luego `partner:read_children` — algo completamente previsible, ya que **todo partner real va a querer gestionar sus propias sub-cuentas por API**, no solo desde el dashboard. Este paso ya no es opcional ni "a posteriori" — se hace en el alta, siempre, con ambos permisos desde el primer día.
+
+```sql
+-- Sustituye [PARTNER_ORG_ID] por el id del paso 1. Genera un hash real
+-- (no el valor crudo) — mismo patrón validado hoy para Octupus/Robin AI.
+with new_key as (
+  select 'prvr_' || encode(gen_random_bytes(20), 'hex') as raw_key
+)
+insert into api_keys (org_id, name, key_hash, key_prefix, is_active, permissions, display_permissions)
+select
+  '[PARTNER_ORG_ID]',
+  '[NOMBRE DEL PARTNER] — Partner API',
+  encode(digest(raw_key, 'sha256'), 'hex'),
+  left(raw_key, 12),
+  true,
+  array['proxy:read', 'proxy:write', 'partner:read_children', 'partner:write_children'],
+  array['detect', 'protect', 'partner_read', 'partner_write']
+from new_key
+returning (select raw_key from new_key) as raw_key_para_el_partner, key_prefix, id;
+```
+
+**Entrégale al partner el `raw_key_para_el_partner`** — se muestra una única vez, guárdalo bien en ese momento (no queda recuperable después). Incluye `proxy:read`/`proxy:write` también, por si el partner quiere hacer llamadas directas de prueba con su propio pipeline además de gestionar sub-cuentas.
+
+---
+
+
 
 ```sql
 select
@@ -139,10 +166,12 @@ Una vez verificado:
 
 ## 6. Cosas que NO hace este runbook (todavía)
 
-- No crea el webhook `dpo_report.generated` del partner — si lo quiere, pídele URL + genera un secreto y da de alta una fila en `org_webhooks` con `events = ARRAY['dpo_report.generated']`.
-- No activa notificaciones de consumo 80%/100% — si las quiere, inserta filas en `org_notifications` (`type='usage_threshold'` y `type='usage_overage'`) con sus destinatarios.
-- No genera la partner API key de solo-lectura (`/v1/partner/*`, para que el partner embeba compliance en su propio producto) — eso es aparte del acceso de dashboard; créala igual que se hizo para Partner Demo si el partner la va a usar.
+- No crea el webhook `dpo_report.generated` del partner — si lo quiere, pídele URL + genera un secreto y da de alta una fila en `org_webhooks` con `events = ARRAY['dpo_report.generated']`. Esto sí depende genuinamente de cada partner (necesitas su URL real), así que sigue siendo manual y caso por caso.
 - **El cambio de cupón de Stripe en la fecha de revisión sigue siendo manual** (aunque desde 2026-07-23 recibes un email automático a soporte@icommunity.io en el momento exacto en que `discount_phase` pasa a `reviewed` — ver `apply_discount_reviews()`. El aviso es automático; el cambio real de `PARTNER20` a `PARTNER15` en el Dashboard de Stripe, no.
+
+**Ya resuelto, no hace falta hacer nada manual para esto:**
+- ~~No genera la partner API key~~ — desde el 2026-07-27, es el paso 3.5 de este mismo runbook, siempre, con ambos permisos por defecto.
+- ~~No activa notificaciones de consumo 80%/100%~~ — desde el 2026-07-27, un trigger en `user_roles` las crea automáticamente en el momento del paso 3 (cuando se inserta el admin con `role='admin'`), con ese admin + Miguel como destinatarios. Verificado con datos reales el mismo día (Octupus, iCommunity Labs, Partner Demo, y una organización de prueba que ni siquiera sabíamos que existía — el trigger cubrió las cuatro sin distinción).
 
 ---
 
@@ -150,6 +179,7 @@ Una vez verificado:
 
 | Fecha | Partner | Resultado |
 |---|---|---|
+| 2026-07-27 | Octupus Technologies — caso real que motivó esta actualización | Su clave inicial se creó sin ningún permiso `partner:*` (solo `proxy:read`/`proxy:write`), porque el runbook de entonces no contemplaba la clave de partner como paso estándar. Michel tuvo que pedir `partner:write_children` y `partner:read_children` por email, uno detrás de otro. Añadido el paso 3.5 (siempre, ambos permisos por defecto) para que esto no vuelva a pasar con el siguiente partner. De paso, corregida la Sección 6: las notificaciones de consumo que decía como pendientes de activar a mano ya se resuelven solas desde el trigger de `user_roles` de ese mismo día. |
 | 2026-07-02 | Partner Demo (ficticio, pruebas) | Validado end-to-end: agregación de cuota, soft-cap, reset, aislamiento — ver conversación de referencia. Dos bugs reales encontrados y corregidos en el proceso (columna ambigua en RPC, codificación UTF-8). |
 | 2026-07-03 | Partner Demo — alta de usuario admin (`maperez+partnerdemo@icommunity.io`) | Encontrado y documentado: trigger de auto-asignación (`developer` @ iCommunity Labs) en usuarios nuevos, que rompía `partner-sub-accounts` por `.maybeSingle()` con filas duplicadas. Corregido en el runbook (ver aviso en Sección 2). |
 | 2026-07-03 | Prueba end-to-end de la pantalla "Mis clientes" | **Bug de infraestructura, no de esta función en concreto**: la tabla `billing_accounts` (creada por migración SQL manual) nunca recibió los privilegios `SELECT/INSERT/UPDATE/DELETE` para `service_role`/`authenticated` — solo `REFERENCES/TRIGGER/TRUNCATE`. Cualquier tabla creada así en el futuro tendría el mismo problema silencioso (las pruebas vía `execute_sql` no lo detectan porque ese canal usa un rol con privilegios de administrador, no `service_role`). Corregido con `GRANT` explícito + `ALTER DEFAULT PRIVILEGES` para que no vuelva a pasar. **Lección: cualquier tabla nueva creada por migración debe verificarse contra `information_schema.role_table_grants` antes de darla por lista para producción, no solo probarse por SQL directo.** También corregidos en el camino: `auth.getClaims()` no disponible en esta función (cambiado a `auth.getUser()`), y el `join` embebido de PostgREST devolviendo array en vez de objeto. |
