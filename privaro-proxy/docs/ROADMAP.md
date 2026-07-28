@@ -225,3 +225,15 @@ El caso del fallo de CI en Node 18 (`privaro-sdk-js`) es un ejemplo claro de est
 **Lo que evitó un cuarto intento a ciegas**: escribir un test que **fuerza explícitamente** la rama de código que llevaba fallando (borrando `globalThis.crypto` temporalmente durante el test), en vez de confiar en que "debería funcionar" porque el razonamiento parecía sólido. Cada test de la suite corría en un entorno (Node 22 local) donde esa rama de fallback nunca se ejercitaba de verdad — así que "todos los tests pasan" no era evidencia real de que el fallback funcionara.
 
 **Regla general para el futuro**: cuando el código tiene una rama de fallback/compatibilidad (para una versión antigua, un entorno degradado, un fallo esperado), **el test debe forzar esa rama activamente**, no limitarse a probar el camino feliz en el entorno de desarrollo actual. Si una rama nunca se ejercita en los tests, "pasa el CI" no es garantía de que funcione en el entorno real donde sí se necesita.
+
+---
+
+## Revisión proactiva del flujo de creación de sub-cuentas — 27 de julio de 2026
+
+A raíz de que Octupus pidiera activar `partner:write_children` (para crear sub-cuentas por API, una por cada organización de su sistema), revisión completa del endpoint `POST /v1/partner/sub-accounts` antes de que empiecen a usarlo a volumen:
+
+- **Facturación heredada del padre confirmada en código** (`billing_account_id = partner_org["billing_account_id"]`) — las notificaciones de consumo configuradas hoy para Octupus ya cubren automáticamente todas sus futuras sub-cuentas, sin acción adicional.
+- **Sin usuario humano creado en este flujo** (solo organización + pipeline + clave) — el trigger de notificaciones de hoy nunca se dispara aquí, pero no es un problema real dado el punto anterior.
+- **Hueco real encontrado**: no existe ningún endpoint para configurar el proveedor LLM (OpenAI/Anthropic/etc.) de una sub-cuenta recién creada, ni ningún mecanismo de herencia automática desde el padre (`chat-completion`/`relay` buscan `llm_providers` filtrando estrictamente por el `org_id` del propio pipeline, sin fallback). Esto contradice la propia promesa del comentario del código ("cero pasos manuales en la UI de Privaro") — falta justo el paso que hace fallar la automatización completa si van a crear muchas organizaciones de golpe.
+
+Pendiente de la respuesta de Michel a una pregunta clave antes de construir nada: ¿cada cliente final de Octupus tiene su propia clave de proveedor LLM (facturación independiente), o Octupus gestiona una única clave compartida para todos? La respuesta determina si la solución es "heredar automáticamente la configuración del padre" o "añadir un campo al propio POST de creación para pasarla directamente".
