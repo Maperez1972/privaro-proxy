@@ -10,7 +10,17 @@ documento para el historial).
 
 ---
 
-## 0. Antes de arrancar — datos que necesitas tener ya decididos
+## 0. Cuestionario previo — todo esto se pregunta ANTES de tocar nada técnico
+
+**Por qué existe esta sección así de larga:** Octupus fue nuestro primer
+partner real, y fuimos aprendiendo sus necesidades sobre la marcha, por
+email, una a una, durante días (permisos de partner pedidos por separado,
+pregunta del modelo de proveedor LLM descubierta tarde, etc.). Cada
+pregunta de abajo nace de algo concreto que tuvimos que resolver a
+posteriori con Octupus. La idea es que el **siguiente** partner se
+configure de una sola sesión, sin ninguna vuelta atrás.
+
+### Básico (ya existía)
 
 - [ ] Nombre del partner
 - [ ] Tier de peticiones/mes acordado (ver `2. Tabla Tiers` del Excel de pricing)
@@ -18,6 +28,35 @@ documento para el historial).
 - [ ] Fecha del escalón de descuento (normalmente despliegue + 6 meses)
 - [ ] Email del primer usuario admin del partner (quien va a gestionar sus clientes)
 - [ ] Confirmación de que el pago/contrato ya está cerrado — este alta da acceso real
+
+### Modelo de proveedor LLM — determina si hace falta construir algo antes de escalar
+
+- [ ] **¿Cada cliente final del partner tiene su propia clave de LLM (OpenAI/Anthropic/etc.), o el partner gestiona una única clave compartida para todos?**
+      *Por qué importa:* si crean sub-cuentas por API (ver siguiente bloque), hoy no hay forma de configurar el proveedor LLM en esa misma llamada — hay que entrar al dashboard a mano para cada una. Si el modelo es "clave compartida", hay que construir un mecanismo de herencia automática del proveedor del padre ANTES de que empiecen a escalar, no después. (Pendiente de resolver con Octupus — primer caso real que hizo saltar esta pregunta, 2026-07-27.)
+
+### Uso de la API de partner (sub-cuentas)
+
+- [ ] **¿Van a gestionar sus clientes finales por API (no solo desde "Mis clientes" en el dashboard)?**
+      *Si la respuesta es "no lo sabemos todavía" o "probablemente sí": dale igualmente ambos permisos desde el alta (ver paso 3.5) — no cuesta nada tenerlos activados aunque no los usen desde el primer día, y evita la vuelta atrás que tuvimos con Octupus.*
+- [ ] **¿Cuántas organizaciones/clientes finales esperan dar de alta, aproximadamente?**
+      *Por qué importa:* si son decenas o cientos, vale la pena confirmar que no hay ningún límite de tasa/cap real en `POST /v1/partner/sub-accounts` antes de que empiecen (a fecha de 2026-07-27, no lo hay — pero si el volumen es grande, probarlo con un lote pequeño primero igualmente).
+
+### Encaje con su vertical/producto (relevante si el partner construye un copiloto de IA sobre un ERP/CRM, como Octupus/Robin AI sobre Odoo — pero aplica a cualquier "AI Partner" vertical)
+
+- [ ] **¿Su producto toca datos de RRHH/nóminas de sus propios clientes (salarios, datos bancarios de nómina)?** — categoría de dato distinta a la de clientes finales, con implicaciones de confidencialidad propias.
+- [ ] **¿Usan algún módulo de Selección/Reclutamiento (datos de candidatos)?** — plazos de retención distintos a los de clientes/empleados en muchas legislaciones.
+- [ ] **¿La protección debería variar según qué usuario final pregunta (no solo por organización/pipeline)?** — hoy el motor de políticas de Privaro no distingue por usuario final, solo por organización.
+- [ ] **¿Tienen flujos donde su producto llama a Privaro sin que haya un humano escribiendo (acciones automáticas/programadas)?** Si es así: **¿qué usan como identificador único de esos flujos?** — relevante porque `conversation_id` es obligatorio en varias llamadas reversibles, y ese campo asume una sesión con identidad propia; para flujos de sistema, hay que generar un UUID por ejecución, no reutilizar uno fijo.
+- [ ] **¿Necesitan poder marcar campos concretos de su estructura de datos como sensibles por su NOMBRE** (ej. un campo `diagnostico` siempre es dato de salud, sin importar el contenido)? — esto ya existe (`field_name_pattern`, con pantalla propia en Privaro → Políticas), pero hay que decirles que existe, no esperar a que lo pidan.
+- [ ] **¿Operan o tienen previsto operar fuera de España?** — la detección de Privaro hoy está orientada a formatos españoles (DNI, teléfono ES). Si hay demanda internacional real, es una conversación de producto a tener pronto, no una sorpresa después.
+
+### Notificaciones y webhooks (lo automático ya no hace falta preguntarlo)
+
+- [ ] ~~¿Quieren activar notificaciones de consumo 80%/100%?~~ — **ya no hace falta preguntarlo**, se activa solo en el paso 3 (ver Sección 6, "Ya resuelto"). Sí puedes preguntar si quieren AÑADIR más destinatarios además del admin + Miguel.
+- [ ] **¿Quieren el webhook `dpo_report.generated`** para recibir el aviso en su propio sistema cuando se genera un informe DPO de un cliente suyo? Si sí: pídeles la URL ahora, no cuando lo necesiten.
+
+---
+
 
 ---
 
@@ -179,6 +218,7 @@ Una vez verificado:
 
 | Fecha | Partner | Resultado |
 |---|---|---|
+| 2026-07-27 | Ampliación de la Sección 0 a cuestionario completo | A petición explícita de Miguel: "somos el primer partner con quien estamos aprendiendo, pero hay que automatizarlo al máximo para los siguientes". Cada pregunta nueva nace de algo real descubierto tarde con Octupus (permisos pedidos uno a uno, modelo de proveedor LLM sin resolver, necesidades de su vertical Odoo sin preguntar de antemano). Objetivo: que el próximo partner se configure en una sola sesión. |
 | 2026-07-27 | Octupus Technologies — caso real que motivó esta actualización | Su clave inicial se creó sin ningún permiso `partner:*` (solo `proxy:read`/`proxy:write`), porque el runbook de entonces no contemplaba la clave de partner como paso estándar. Michel tuvo que pedir `partner:write_children` y `partner:read_children` por email, uno detrás de otro. Añadido el paso 3.5 (siempre, ambos permisos por defecto) para que esto no vuelva a pasar con el siguiente partner. De paso, corregida la Sección 6: las notificaciones de consumo que decía como pendientes de activar a mano ya se resuelven solas desde el trigger de `user_roles` de ese mismo día. |
 | 2026-07-02 | Partner Demo (ficticio, pruebas) | Validado end-to-end: agregación de cuota, soft-cap, reset, aislamiento — ver conversación de referencia. Dos bugs reales encontrados y corregidos en el proceso (columna ambigua en RPC, codificación UTF-8). |
 | 2026-07-03 | Partner Demo — alta de usuario admin (`maperez+partnerdemo@icommunity.io`) | Encontrado y documentado: trigger de auto-asignación (`developer` @ iCommunity Labs) en usuarios nuevos, que rompía `partner-sub-accounts` por `.maybeSingle()` con filas duplicadas. Corregido en el runbook (ver aviso en Sección 2). |
