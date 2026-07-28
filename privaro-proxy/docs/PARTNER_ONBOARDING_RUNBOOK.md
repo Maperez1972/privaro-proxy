@@ -38,8 +38,7 @@ configure de una sola sesión, sin ninguna vuelta atrás.
 
 - [ ] **¿Van a gestionar sus clientes finales por API (no solo desde "Mis clientes" en el dashboard)?**
       *Si la respuesta es "no lo sabemos todavía" o "probablemente sí": dale igualmente ambos permisos desde el alta (ver paso 3.5) — no cuesta nada tenerlos activados aunque no los usen desde el primer día, y evita la vuelta atrás que tuvimos con Octupus.*
-- [ ] **¿Cuántas organizaciones/clientes finales esperan dar de alta, aproximadamente?**
-      *Por qué importa:* si son decenas o cientos, vale la pena confirmar que no hay ningún límite de tasa/cap real en `POST /v1/partner/sub-accounts` antes de que empiecen (a fecha de 2026-07-27, no lo hay — pero si el volumen es grande, probarlo con un lote pequeño primero igualmente).
+- [ ] ~~¿Cuántas organizaciones/clientes finales esperan dar de alta, aproximadamente?~~ — **no preguntar esto de antemano.** Si el partner va a crear sus sub-cuentas por su propia API (que es lo normal — protección de datos de sus propios clientes, no van a querer pasárnoslos a nosotros), el volumen es asunto suyo, no algo que necesitemos saber para configurar nada. Solo entra en juego si ELLOS mismos plantean un problema de volumen/límite — en ese momento sí se investiga si hace falta algo (rate limit, creación en bloque, etc.), no antes. (Aprendido con Octupus, 2026-07-27 — la pregunta original asumía que nosotros probaríamos el volumen por ellos, cuando en realidad lo harán ellos mismos con su propia integración.)
 
 ### Encaje con su vertical/producto (relevante si el partner construye un copiloto de IA sobre un ERP/CRM, como Octupus/Robin AI sobre Odoo — pero aplica a cualquier "AI Partner" vertical)
 
