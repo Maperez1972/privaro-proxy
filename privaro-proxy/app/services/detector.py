@@ -24,17 +24,43 @@ from app.models.schemas import Detection
 # Each entry: (entity_type, severity, pattern, confidence)
 PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
 
-    # DNI / NIF: optional "DNI:" prefix + 8 digits + letter
-    # Group 1 captures ONLY the number — excludes "DNI: " prefix from span.
-    # Standalone 8-digit+letter without prefix also matched (group 1 only).
+    # DNI / NIF / NIE: optional "DNI:"/"NIF:"/"NIE:" prefix + digits + letter
+    # Group captures ONLY the number — excludes the keyword prefix from span.
+    #
+    # Fixed 2026-07-30 — real gap found: a bare NIE (letter + 7 digits +
+    # letter, e.g. "X1234567L") with NO "NIE:" label in front never matched
+    # the old standalone branch, which required exactly 8 digits regardless
+    # of the leading letter — that's the DNI shape, not the NIE shape. A
+    # real Spanish DNI has no leading letter and exactly 8 digits; a real
+    # NIE has a leading X/Y/Z and exactly 7 digits. The standalone branch
+    # now requires the correct digit count for each shape instead of always
+    # demanding 8.
     ("dni", "critical",
-     re.compile(r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b|\b([XYZxyz]?\d{8}[A-Za-z])\b'),
+     re.compile(
+         r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b'
+         r'|\b([XYZxyz]\d{7}[A-Za-z])\b'   # bare NIE: letter + 7 digits + letter
+         r'|\b(\d{8}[A-Za-z])\b'           # bare DNI: 8 digits + letter, no leading letter
+     ),
      0.95),
 
     # IBAN ES: ES + 2 check digits + 20 digits (spaces optional)
     ("iban", "critical",
      re.compile(r'\bES\d{2}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'),
      0.99),
+
+    # IBAN — any other country (generic format: 2 letters + 2 check digits +
+    # up to 30 alphanumeric chars, per ISO 13616). Added 2026-07-30 — real
+    # gap: the ES-only pattern above left every non-Spanish IBAN (DE, FR,
+    # IT, PT, NL...) completely unprotected, which matters for any org with
+    # EU clients/suppliers outside Spain. Slightly lower confidence than the
+    # ES-specific pattern since the generic shape is looser (a coincidental
+    # 2-letter+2-digit+alphanumeric string is more plausible than the exact
+    # ES structure), and explicitly excludes ES here to avoid double-firing
+    # with the stricter pattern above (seen_spans dedup would handle it
+    # anyway, but keeping the intent explicit).
+    ("iban", "critical",
+     re.compile(r'\b(?!ES)[A-Z]{2}\d{2}[\s-]?(?:[A-Z0-9]{4}[\s-]?){2,7}[A-Z0-9]{1,4}\b'),
+     0.85),
 
     # Credit card: 13-19 digits with spacing patterns (Luhn not checked in MVP)
     ("credit_card", "critical",
@@ -70,6 +96,42 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      re.compile(r'\b(?:SIP|TSI|CIP)[\s:]*([A-Z0-9]{8,16})\b', re.IGNORECASE),
      0.85),
 
+    # Medical record / case number (generic) — added 2026-07-30 following
+    # the real leak found in a genetic test report: "Nº de historia:
+    # 00183370" was previously undetected entirely (only SIP/TSI/CIP
+    # regional health-card codes were covered), and its digits were even
+    # being misclassified as a phone number by the loose international
+    # phone pattern below. Covers "historia clínica", "nº historia",
+    # "medical record", "record number", "expediente médico" followed by
+    # a numeric/alphanumeric identifier. Keyword-anchored (not standalone)
+    # since a bare number with no context is indistinguishable from any
+    # other business ID.
+    ("health_record", "critical",
+     re.compile(
+         r'(?i:n[úu]mero\s+de\s+historia|historia\s+cl[íi]nica|n[º°o]\.?\s*de\s+historia'
+         r'|expediente\s+m[ée]dico|medical\s+record(?:\s+number)?|record\s+number|mrn)'
+         r'(?:\s+n[úu]mero|\s+n[º°o]\.?)?'
+         r'[\s:#]*([A-Z0-9][A-Z0-9\-]{4,15})\b'
+     ),
+     0.85),
+
+    # Spanish passport — 3 letters + 6 digits, always keyword-anchored to
+    # avoid false positives against other 9-char alphanumeric business
+    # codes (SKUs, batch numbers, etc. share this shape). Added 2026-07-30.
+    ("passport", "critical",
+     re.compile(r'(?i:pasaporte|passport)[\s:#]*([A-Za-z]{3}\d{6})\b'),
+     0.90),
+
+    # Spanish Social Security affiliation number (NUSS) — 12 digits,
+    # keyword-anchored. Added 2026-07-30: previously undetected entirely.
+    ("ssn", "critical",
+     re.compile(
+         r'(?i:n[úu]mero\s+de\s+afiliaci[óo]n|n[úu]mero\s+de\s+la\s+seguridad\s+social'
+         r'|seguridad\s+social|n\.?a\.?f\.?|nuss)'
+         r'[\s:#]*(\d{2}[\s-]?\d{8}[\s-]?\d{2})\b'
+     ),
+     0.90),
+
     # IPv4
     ("ip_address", "medium",
      re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'),
@@ -81,23 +143,52 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      0.85),
 
     # Full name heuristic — keyword-triggered, group 1 = name only
-    # Keywords: solicitante covers mortgage/loan context (Gibobs use case)
     #
-    # Fixed 2026-07-24 — REAL bug found via live testing: the global
-    # re.IGNORECASE flag defeated the capitalization requirement entirely.
-    # Under IGNORECASE, [A-ZÁÉÍÓÚÑ] also matches lowercase letters, so the
-    # name group would greedily swallow the next lowercase word too --
-    # "cliente Juan García Ruiz tiene" -> captured "Juan García Ruiz tiene",
-    # silently deleting the real word "tiene" from the protected output
-    # (not just a labeling bug -- actual content loss). Switched to an
-    # inline (?i:...) group scoped ONLY to the trigger keyword, so
-    # "CLIENTE"/"Cliente"/"cliente" all still match, but the name capture
-    # group is genuinely case-sensitive again -- verified against the
-    # exact failing case plus an all-caps-keyword case.
+    # v2 (2026-07-30) — rewritten after a real production leak: a genetic
+    # test report with "Paciente: PURIFICACION GARCIA DIAZ" (ALL-CAPS,
+    # tabular label:value layout typical of lab/clinical reports) passed
+    # through completely untokenised. Root causes found and fixed here:
+    #
+    #   1. Word shape only accepted Title Case ([A-Z][a-z]+) — ALL-CAPS
+    #      names never matched at all. Now each word may be Title Case
+    #      OR fully uppercase.
+    #   2. Keyword list was missing "médico", "doctor", "dr./dra.",
+    #      "titular", "firmado por", "derivad[oa] por", "remitente",
+    #      "destinatario" — common in clinical/legal documents.
+    #   3. Every word in the name had to start with a capital letter, so
+    #      lowercase particles ("de", "la", "del", "van", "von", "di")
+    #      silently truncated names like "María de la Cruz Gómez" at
+    #      "María". Now an optional lowercase-particle segment is allowed
+    #      between capitalised words.
+    #   4. Minimum 2 words were required — single-word names/aliases
+    #      ("Cliente: Madonna") never matched. Now 1 word is enough
+    #      (still capped at 4 total to limit over-capture).
+    #
+    # Known remaining limitation (documented, not fixed here — needs NLP):
+    # if the word immediately after a real name is ALSO capitalised and
+    # looks name-shaped (a company name, "Empresa", "SL", another proper
+    # noun), it can still be swallowed into the match — a short blocklist
+    # of common non-name trailing words is included to cut the most
+    # frequent cases, but this is a heuristic, not a full fix.
     ("full_name", "low",
      re.compile(
          r'(?i:paciente|solicitante|nombre|cliente|empleado|trabajador|cotitular'
-         r'|sr\.?|sra\.?|don|doña|mr\.?|ms\.?|mrs\.?)[\s:]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){1,3})'
+         r'|sr\.?|sra\.?|don|doña|dña\.?|dr\.?|dra\.?|d\.?/d.?a\.?|médico|medico|doctor|doctora'
+         r'|mr\.?|ms\.?|mrs\.?'
+         r'|titular|remitente|destinatario|derivad[oa]\s+por|firmad[oa]\s+por)[\s:]+'
+         r'('
+         r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+|[A-ZÁÉÍÓÚÑ]{2,})'
+         # Continuation words stay on the SAME line ([ \t-]+, never \n) —
+         # fixed 2026-07-30: the previous [\s-]+ included newlines, so a
+         # tabular field like "Paciente: JUAN PEREZ\nMédico: Ana..." greedily
+         # swallowed the next line's label ("...PEREZ\nMédico") whenever that
+         # label also happened to be capitalised. Multi-word names are
+         # space-separated on one line in practice; a name never legitimately
+         # continues onto the next line in this label:value document style.
+         r'(?:[ \t-]+(?:de\s+la\s+|de\s+los\s+|de\s+las\s+|de\s+|del\s+|la\s+|van\s+|von\s+|di\s+|do\s+|dos\s+)?'
+         r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+|[A-ZÁÉÍÓÚÑ]{2,})){0,3}'
+         r')'
+         r'(?!\s+(?:Empresa|Sociedad|Compañ[íi]a|Corp|Inc|Ltd|LLC|S\.?A\.?U?\.?|S\.?L\.?U?\.?|SL|SA)\b)'
      ),
      0.80),
 
@@ -130,6 +221,7 @@ ENTITY_CATEGORY = {
     "ip_address": "personal",
     "date_of_birth": "personal",
     "ssn": "personal",
+    "passport": "personal",
 }
 
 # ── Token counters per type (per-request, reset each call) ──────────────────
@@ -145,6 +237,7 @@ TOKEN_PREFIX = {
     "ip_address": "IP",
     "date_of_birth": "DT",
     "ssn": "SS",
+    "passport": "PP",
     "money": "MN",
 }
 
@@ -171,6 +264,16 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
     detections: List[Detection] = []
     seen_spans: List[Tuple[int, int]] = []
 
+    # A full_name capture that consists ONLY of a title abbreviation itself
+    # (no actual name attached) is a harmless-but-noisy false positive: e.g.
+    # "Médico: Dr./Dra. Ana..." — the "médico" keyword's [\s:]+ lands right
+    # on "Dr", which superficially satisfies the name-word shape, before the
+    # separate "Dra." trigger correctly catches the real name right after.
+    # The real name is never left unprotected either way; this just skips
+    # tokenising the meaningless "Dr" fragment on its own. Found 2026-07-30
+    # while validating the full_name rewrite.
+    _TITLE_ONLY_RE = re.compile(r'^(?:dr|dra|sr|sra|don|doña|dña|mr|ms|mrs|d)\.?$', re.IGNORECASE)
+
     # ── Tier 1: Regex ────────────────────────────────────────────────────────
     for entity_type, severity, pattern, confidence in PATTERNS:
         for match in pattern.finditer(text):
@@ -185,6 +288,9 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
             end   = match.end(grp)   if grp else match.end()
 
             if any(s <= start < e or s < end <= e for s, e in seen_spans):
+                continue
+
+            if entity_type == "full_name" and _TITLE_ONLY_RE.match(text[start:end]):
                 continue
 
             seen_spans.append((start, end))
