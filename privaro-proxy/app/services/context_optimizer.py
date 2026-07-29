@@ -22,6 +22,7 @@ proxy: never let an optimization break correctness).
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Dict, List, Tuple
 
 from headroom import compress
@@ -34,6 +35,42 @@ _TOKEN_RE = re.compile(r"\[[A-Z]{2,4}-\d{4}\]")
 # Placeholder shape chosen so it never collides with real content and is
 # short enough not to distort Headroom's token-count-based decisions.
 _PLACEHOLDER_TMPL = "\u2060PVR{idx}\u2060"  # word-joiner-wrapped, invisible-ish
+
+
+def warmup_kompress(timeout_seconds: float = 30.0) -> bool:
+    """
+    Force-load the Kompress prose-compression model synchronously and BLOCK
+    until it's ready (or the timeout elapses).
+
+    Why this exists — real finding from validation (2026-07-29): Kompress
+    loads its weights via a one-shot, non-blocking background download
+    (KompressCompressor.ensure_background_load() / is_ready()). Without
+    calling this explicitly, the FIRST requests handled by any fresh
+    instance of this service silently skip prose compression — compress()
+    just returns tokens_saved=0 with a log warning, never an error. That's
+    invisible in production traffic and would make ratio numbers look
+    inconsistent/broken for no visible reason.
+
+    Call this once from the app's startup/lifespan handler, BEFORE serving
+    traffic, so every instance starts warm. Returns True if the model
+    became ready within timeout_seconds, False otherwise (the service
+    should still start — compression just fails open with 0% ratio on
+    prose until the model finishes loading, same as any cold instance
+    would today).
+    """
+    from headroom.transforms.kompress_compressor import KompressCompressor
+
+    compressor = KompressCompressor()
+    if compressor.is_ready():
+        return True
+
+    compressor.ensure_background_load()
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if compressor.is_ready():
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def _shield_tokens(text: str) -> Tuple[str, Dict[str, str]]:

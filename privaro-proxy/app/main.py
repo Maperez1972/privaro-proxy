@@ -34,6 +34,17 @@ async def lifespan(app: FastAPI):
             print(f"[iBS] Webhook error (non-critical): {e}")
     else:
         print("[iBS] IBS_API_KEY not set — blockchain disabled")
+
+    if settings.CONTEXT_OPTIMIZATION_WARMUP:
+        import asyncio
+        from app.services.context_optimizer import warmup_kompress
+        print("[ContextOpt] Warming up Kompress model (blocking, off event loop)...")
+        loop = asyncio.get_event_loop()
+        ready = await loop.run_in_executor(None, warmup_kompress, 30.0)
+        print(f"[ContextOpt] Kompress ready: {'✅' if ready else '⚠️ timed out — will lazy-load on first use'}")
+    else:
+        print("[ContextOpt] Warmup disabled (CONTEXT_OPTIMIZATION_WARMUP=false) — model loads lazily on first optimize_context=True call")
+
     yield
     print("🛑 Privaro Proxy API shutting down")
 
