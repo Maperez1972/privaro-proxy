@@ -31,6 +31,7 @@ from app.services import policy_engine as pe
 from app.services import quota as quota_svc
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 from app.services.llm_router import route, route_stream, LLMRouterError, list_providers
+from app.services.context_optimizer import compress_protected_messages
 
 router = APIRouter(prefix="/v1/relay", tags=["relay"])
 
@@ -171,6 +172,7 @@ class RelayOptions(BaseModel):
     max_tokens: int = 2048
     temperature: float = 0.7
     system_prompt: Optional[str] = None
+    optimize_context: bool = False  # opt-in: compress tokenised messages before the LLM call
 
 
 class RelayRequest(BaseModel):
@@ -204,6 +206,7 @@ class RelayResponse(BaseModel):
     tokens_replaced: int = 0
     usage: Dict[str, Any] = {}
     processing_ms: int = 0
+    compression_stats: Dict[str, Any] = {}
 
 
 @router.post("/complete", response_model=RelayResponse)
@@ -256,6 +259,19 @@ async def relay_complete(
     )
     if token_rows:
         background_tasks.add_task(db.insert_tokens_batch, token_rows)
+
+    # ── Context Optimization (opt-in, gated by options.optimize_context) ────
+    # Runs strictly AFTER tokenisation, never before. Privaro tokens
+    # ([XX-0001]) are shielded from the compressor and their exact presence
+    # is verified post-compression; on any mismatch or internal error this
+    # fails open and returns protected_messages unmodified — same
+    # philosophy as the rest of this proxy (never let an optimization
+    # become a correctness incident).
+    compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
+    if getattr(body.options, "optimize_context", False):
+        protected_messages, compression_stats = compress_protected_messages(
+            protected_messages, model=model,
+        )
 
     risk_score = pe.compute_risk_score(all_detections, provider_risk_level, False, 0)
     pii_detected = len(all_detections)
@@ -345,6 +361,7 @@ async def relay_complete(
         tokens_replaced=tokens_replaced,
         usage=llm_result.get("usage", {}),
         processing_ms=processing_ms,
+        compression_stats=compression_stats,
     )
 
     if idempotency_key:
