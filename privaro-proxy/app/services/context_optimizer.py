@@ -37,7 +37,7 @@ _TOKEN_RE = re.compile(r"\[[A-Z]{2,4}-\d{4}\]")
 _PLACEHOLDER_TMPL = "\u2060PVR{idx}\u2060"  # word-joiner-wrapped, invisible-ish
 
 
-def warmup_kompress(timeout_seconds: float = 30.0) -> bool:
+def warmup_kompress(timeout_seconds: float = 30.0, retries: int = 2) -> bool:
     """
     Force-load the Kompress prose-compression model synchronously and BLOCK
     until it's ready (or the timeout elapses).
@@ -51,12 +51,21 @@ def warmup_kompress(timeout_seconds: float = 30.0) -> bool:
     invisible in production traffic and would make ratio numbers look
     inconsistent/broken for no visible reason.
 
+    Retry note (2026-07-30, second validation round): a single attempt can
+    return False on a transient HuggingFace Hub blip (a slow HEAD/redirect
+    on the first request) even though the model is perfectly downloadable —
+    confirmed by re-running immediately after and getting a clean ~9s load.
+    Rather than let one unlucky network hiccup at startup permanently doom
+    an instance to serving 0%-ratio prose compression until its next
+    restart, this retries `retries` additional times (each with a fresh
+    `timeout_seconds` window and a short backoff) before giving up.
+
     Call this once from the app's startup/lifespan handler, BEFORE serving
     traffic, so every instance starts warm. Returns True if the model
-    became ready within timeout_seconds, False otherwise (the service
-    should still start — compression just fails open with 0% ratio on
-    prose until the model finishes loading, same as any cold instance
-    would today).
+    became ready within any attempt, False otherwise (the service should
+    still start — compression just fails open with 0% ratio on prose
+    until the model finishes loading, same as any cold instance would
+    today).
     """
     from headroom.transforms.kompress_compressor import KompressCompressor
 
@@ -64,12 +73,16 @@ def warmup_kompress(timeout_seconds: float = 30.0) -> bool:
     if compressor.is_ready():
         return True
 
-    compressor.ensure_background_load()
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if compressor.is_ready():
-            return True
-        time.sleep(0.5)
+    attempts = max(1, retries + 1)
+    for attempt in range(attempts):
+        compressor.ensure_background_load()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if compressor.is_ready():
+                return True
+            time.sleep(0.5)
+        if attempt < attempts - 1:
+            time.sleep(2.0)  # short backoff before the next attempt
     return False
 
 
