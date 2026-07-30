@@ -75,13 +75,26 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
     # Spanish phone — covers all common ES formats:
     #   677 23 45 67  (3+2+2+2)
     #   677 234 567   (3+3+3)
-    #   677-23-45-67  (dashes)
-    #   +34 677 234 567
+    # Spanish mobile/landline: 9\d{2}|6\d{2}|7[1-9]\d prefix + exactly 6 more
+    # digits (grouped as 3+3 or 2+2+2 — the two conventional Spanish
+    # formattings), for exactly 9 digits total.
+    #   677 23 45 67  677234567  677-23-45-67  +34 677 234 567
     # Anchored: must NOT be preceded or followed by a digit (avoids IBAN/CC fragments)
+    #
+    # Fixed 2026-07-30 — real bug found via domain battery testing: the
+    # previous `(?:[\s-]?\d{2,3}){2,3}` allowed a variable 7-12 digit total,
+    # so an 8-digit fragment (the numeric part of a SIP health-card code,
+    # "SIP: CD98765432" -> "98765432") satisfied the shape and got
+    # misclassified as a phone number. Because overlapping spans are
+    # resolved by pattern-list order (first match wins), that false "phone"
+    # detection then BLOCKED the correct health_record detection at the
+    # same position — a real card number leaked untokenised. Now the total
+    # digit count after the prefix is fixed at exactly 6 (via explicit
+    # 3+3 / 2+2+2 alternation) instead of a loose range.
     ("phone", "high",
      re.compile(
          r'(?<!\d)(?:\+34[\s-]?)?(?:6\d{2}|7[1-9]\d|9\d{2})'
-         r'(?:[\s-]?\d{2,3}){2,3}'
+         r'(?:(?:[\s-]?\d{3}){2}|(?:[\s-]?\d{2}){3})'
          r'(?!\d)'
      ),
      0.90),
@@ -128,7 +141,7 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      re.compile(
          r'(?i:n[úu]mero\s+de\s+afiliaci[óo]n|n[úu]mero\s+de\s+la\s+seguridad\s+social'
          r'|seguridad\s+social|n\.?a\.?f\.?|nuss)'
-         r'[\s:#]*(\d{2}[\s-]?\d{8}[\s-]?\d{2})\b'
+         r'[\s:#]*(\d{2}[\s-]?\d{7,8}[\s-]?\d{2})\b'
      ),
      0.90),
 
@@ -175,7 +188,10 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
          r'(?i:paciente|solicitante|nombre|cliente|empleado|trabajador|cotitular'
          r'|sr\.?|sra\.?|don|doña|dña\.?|dr\.?|dra\.?|d\.?/d.?a\.?|médico|medico|doctor|doctora'
          r'|mr\.?|ms\.?|mrs\.?'
-         r'|titular|remitente|destinatario|derivad[oa]\s+por|firmad[oa]\s+por)[\s:]+'
+         r'|titular|remitente|destinatario|derivad[oa]\s+por|firmad[oa]\s+por'
+         r'|asegurad[oa]|tomador|beneficiari[oa]|responsable'
+         r'|compareciente|a\s+favor\s+de'
+         r'|atendid[oa]\s+por|gestionad[oa]\s+por|tramitad[oa]\s+por|recibid[oa]\s+por)[\s:]+'
          r'('
          r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+|[A-ZÁÉÍÓÚÑ]{2,})'
          # Continuation words stay on the SAME line ([ \t-]+, never \n) —
