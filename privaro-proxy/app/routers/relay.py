@@ -38,6 +38,7 @@ PREFIX_MAP = {
     "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
     "credit_card": "CC", "email": "EM", "phone": "PH",
     "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT",
+    "ssn": "SS", "passport": "PP",
 }
 
 

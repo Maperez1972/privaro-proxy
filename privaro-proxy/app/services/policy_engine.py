@@ -20,6 +20,7 @@ ENTITY_RISK_WEIGHTS = {
     "dni":            0.9,
     "nie":            0.9,
     "ssn":            0.9,
+    "passport":       0.9,
     "iban":           0.9,
     "credit_card":    0.9,
     "full_name":      0.6,
@@ -206,7 +207,7 @@ def compute_risk_score(
 
 def _get_category(entity_type: str) -> str:
     categories = {
-        "dni": "personal", "nie": "personal", "ssn": "personal",
+        "dni": "personal", "nie": "personal", "ssn": "personal", "passport": "personal",
         "full_name": "personal", "email": "personal",
         "phone": "personal", "ip_address": "personal", "date_of_birth": "personal",
         "iban": "financial", "credit_card": "financial", "money": "financial",
