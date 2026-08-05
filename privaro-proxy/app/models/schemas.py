@@ -177,3 +177,4 @@ class HealthResponse(BaseModel):
     environment: str
     detector: str
     supabase: str
+    nlp_active: bool = True
