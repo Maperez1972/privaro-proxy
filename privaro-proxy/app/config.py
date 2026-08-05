@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     IBS_WEBHOOK_SECRET: str = ""
     IBS_API_BASE: str = "https://api.icommunitylabs.com/v2"
 
+    # ── Context Optimization ────────────────────────────────────────
+    # If True, the prose-compression model (Kompress) is force-loaded at
+    # startup (blocking, off the event loop) so no request has to eat the
+    # cold-start download. If False (default), the model loads lazily on
+    # first use of optimize_context=True, and early requests during that
+    # window simply skip prose compression (fail-open — see
+    # context_optimizer.py). Enable this in production once
+    # optimize_context is actually exposed to customers.
+    CONTEXT_OPTIMIZATION_WARMUP: bool = False
+
     # ── Development only ───────────────────────────────────────────
     PRIVARO_DEV_KEY: Optional[str] = None
     DEV_ORG_ID: Optional[str] = None
