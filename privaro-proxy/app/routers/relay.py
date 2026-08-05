@@ -340,6 +340,7 @@ async def relay_complete(
             "total_masked": pii_masked,
             "tokens_replaced_in_response": tokens_replaced,
             "usage": llm_result.get("usage", {}),
+            "compression_stats": compression_stats,
         },
     })
 
