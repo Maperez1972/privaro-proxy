@@ -28,6 +28,7 @@ from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id, _decrypt_aes_gcm
+from app.services.context_optimizer import compress_protected_messages
 from app.config import settings
 from app.services import quota as quota_svc
 
@@ -402,6 +403,22 @@ async def protect_prompt(
     # Apply replacements back-to-front to preserve offsets
     protected_prompt = _apply_tokenization(protected_prompt, detections, counters)
 
+    # ── Context Optimization (opt-in, gated by options.optimize_context) ────
+    # Added 2026-07-30 — this endpoint (/v1/proxy/protect) is what the
+    # dashboard Sandbox actually calls (via the proxy-bridge Edge
+    # Function), not /v1/relay/complete. Compression was previously only
+    # wired into relay.py, leaving this the missing half of PR #1. Same
+    # fail-open contract as relay.py: any integrity mismatch or internal
+    # error discards the compression result and returns protected_prompt
+    # unmodified.
+    compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
+    if getattr(body.options, "optimize_context", False):
+        compressed_messages, compression_stats = compress_protected_messages(
+            [{"role": "user", "content": protected_prompt}],
+            model=pipeline.get("llm_model", "claude-sonnet-4-6"),
+        )
+        protected_prompt = compressed_messages[0]["content"]
+
     processing_ms = int((time.monotonic() - t0) * 1000)
     stats = detector.build_stats(detections, processing_ms)
 
@@ -579,6 +596,7 @@ async def protect_prompt(
         stats=stats,
         audit_log_id=audit_log_id,
         gdpr_compliant=stats["leaked"] == 0,
+        compression_stats=compression_stats,
     )
 
     if idempotency_key:
