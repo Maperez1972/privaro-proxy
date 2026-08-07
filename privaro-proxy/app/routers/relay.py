@@ -152,8 +152,13 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
                 protected_content = protected_content[:d.start] + token + protected_content[d.end:]
             elif d.action in ("anonymised", "anonymise"):
                 d.action = "anonymised"
+                # Fixed 2026-08-07 — same bug as proxy.py's
+                # _apply_tokenization: raw entity_type.upper() exposed
+                # internal English identifiers ("[HEALTH_RECORD]") instead
+                # of following the [XX-0001]-style convention.
+                label = PREFIX_MAP.get(d.type, d.type[:2].upper())
                 protected_content = (protected_content[:d.start] +
-                                     f"[{d.type.upper()}]" + protected_content[d.end:])
+                                     f"[{label}-REDACTED]" + protected_content[d.end:])
 
         all_detections.extend(detections)
         protected_messages.append({"role": msg.role, "content": protected_content})

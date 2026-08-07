@@ -208,6 +208,45 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      ),
      0.80),
 
+    # ── Bare ALL-CAPS name safety net — added 2026-08-07 ──────────────────
+    # Real finding from a genetic report PDF: the extracted text had the
+    # patient's name (PURIFICACION GARCIA DIAZ) with NO keyword adjacent
+    # to it at all — the PDF's tabular layout got scrambled during text
+    # extraction, so "Paciente:" and the actual name ended up separated
+    # by unrelated reordered content in the raw character stream. Every
+    # full_name pattern above requires an adjacent keyword, so none of
+    # them can ever catch this — it's a structural gap, not a regex bug.
+    # Presidio (Tier 2 NLP) is supposed to be the safety net for
+    # keyword-less names, but standard NER models rely heavily on
+    # capitalisation patterns (Title Case) to recognise names; ALL-CAPS
+    # text loses that signal and measurably hurts NER recall — so Tier 2
+    # can miss exactly this case too.
+    #
+    # This pattern catches ANY standalone run of 2-4 consecutive
+    # ALL-CAPS words (3+ letters each, pure alphabetic — gene names like
+    # PMS2 or acronyms with digits don't qualify), regardless of context.
+    #
+    # KNOWN TRADE-OFF, accepted deliberately: this also flags non-name
+    # ALL-CAPS phrases as false positives — clinic names ("CLINICA
+    # VISTAHERMOSA"), sample types ("SANGRE PERIFERICA"), document
+    # titles ("INFORME GENETICO"). This is intentional: over-tokenising
+    # a clinic name is a far more acceptable failure than leaking a real
+    # patient's name.
+    #
+    # Confidence set to 0.75, not lower: /v1/agent/protect has its own
+    # confidence gate (_is_valid_name(), agent.py) that silently drops
+    # any full_name detection below 0.75 — found while implementing this,
+    # a real example of the endpoint-drift this codebase already has
+    # (see the duplicated PREFIX_MAP history). Keeping this pattern above
+    # that threshold means it actually takes effect on all three
+    # endpoints (/v1/proxy/protect, /v1/relay/complete, /v1/agent/protect)
+    # instead of silently working on two of them and not the third.
+    ("full_name", "low",
+     re.compile(
+         r'\b(?:[A-ZÁÉÍÓÚÑ]{3,}(?:-[A-ZÁÉÍÓÚÑ]{3,})?[ \t]+){1,3}[A-ZÁÉÍÓÚÑ]{3,}(?:-[A-ZÁÉÍÓÚÑ]{3,})?\b'
+     ),
+     0.75),
+
     # Money / business amounts — added 2026-07-24 following the Octupus/Robin
     # AI (Odoo copilot) analysis: ERP data is full of commercially sensitive
     # figures (revenue, margins, contract values) that customers want kept
