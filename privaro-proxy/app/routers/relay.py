@@ -31,7 +31,7 @@ from app.services import policy_engine as pe
 from app.services import quota as quota_svc
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 from app.services.llm_router import route, route_stream, LLMRouterError, list_providers
-from app.services.context_optimizer import compress_protected_messages
+from app.services.context_optimizer import compress_with_timeout
 
 router = APIRouter(prefix="/v1/relay", tags=["relay"])
 
@@ -273,9 +273,18 @@ async def relay_complete(
     # fails open and returns protected_messages unmodified — same
     # philosophy as the rest of this proxy (never let an optimization
     # become a correctness incident).
+    #
+    # Fixed 2026-08-07 — CRITICAL, same finding as proxy.py: this called
+    # compress_protected_messages() directly (sync, no await, no
+    # executor), blocking the entire asyncio event loop for the whole
+    # duration of a real transformer model's CPU inference (30+ seconds
+    # observed on a ~14K char document) — freezing every other
+    # concurrent request on this worker, not just this one. Now uses
+    # compress_with_timeout(), offloaded to a thread pool with a bounded
+    # worst-case latency (fails open past the timeout).
     compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
     if getattr(body.options, "optimize_context", False):
-        protected_messages, compression_stats = compress_protected_messages(
+        protected_messages, compression_stats = await compress_with_timeout(
             protected_messages, model=model,
         )
 

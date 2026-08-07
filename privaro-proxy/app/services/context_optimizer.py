@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from headroom import compress
 
@@ -174,3 +174,56 @@ def compress_protected_messages(
         # already successfully protected.
         stats["skipped_reason"] = f"compressor_error: {e}"
         return messages, stats
+
+
+async def compress_with_timeout(
+    messages: List[Dict[str, Any]],
+    model: str,
+    timeout_seconds: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Async, non-blocking, time-bounded wrapper around
+    compress_protected_messages() — added 2026-08-07 after a real
+    production finding: all three callers (proxy.py, relay.py, agent.py)
+    called compress_protected_messages() DIRECTLY inside an `async def`
+    endpoint, with no `await`, no `run_in_executor`. Kompress is a real
+    transformer model running on CPU; on a ~14K character document it
+    took 30+ seconds end to end. Calling it synchronously like that
+    doesn't just make ONE request slow — it BLOCKS THE ENTIRE ASYNCIO
+    EVENT LOOP for that worker process for the whole duration, freezing
+    every other concurrent request (other customers' /protect, /detect,
+    /relay, even /health) on that worker until it returns. Two customers
+    hitting Context Optimization on large documents at the same time
+    would serialize behind each other and could look like a full outage.
+
+    This runs the (synchronous) compression in a thread pool executor —
+    same pattern already used for warmup_kompress() at startup and for
+    detector.detect() in _detect_with_timeout() — and bounds worst-case
+    latency with a timeout. On timeout, fails open exactly like every
+    other resilience mechanism in this proxy: returns the original
+    (already-tokenised, still fully protected) messages unmodified,
+    just without the token-count reduction for that one request.
+    """
+    import asyncio
+    from app.config import settings
+
+    effective_timeout = timeout_seconds if timeout_seconds is not None else settings.CONTEXT_OPTIMIZATION_TIMEOUT_SECONDS
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, compress_protected_messages, messages, model),
+            timeout=effective_timeout,
+        )
+    except asyncio.TimeoutError:
+        return messages, {
+            "tokens_saved": 0,
+            "compression_ratio": 0.0,
+            "skipped_reason": f"timeout_after_{effective_timeout}s",
+        }
+    except Exception as e:  # noqa: BLE001 — same fail-open philosophy
+        return messages, {
+            "tokens_saved": 0,
+            "compression_ratio": 0.0,
+            "skipped_reason": f"executor_error: {e}",
+        }
+
