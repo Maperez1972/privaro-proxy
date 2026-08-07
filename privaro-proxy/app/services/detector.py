@@ -342,7 +342,24 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
             start = match.start(grp) if grp else match.start()
             end   = match.end(grp)   if grp else match.end()
 
-            if any(s <= start < e or s < end <= e for s, e in seen_spans):
+            # Fixed 2026-08-07 — real bug found via a garbled tokenization
+            # report: the old check (s <= start < e or s < end <= e) only
+            # catches PARTIAL overlaps where one span's boundary falls
+            # inside the other. It misses full containment — a span that
+            # starts before AND ends after an existing one satisfies
+            # neither clause, since neither of ITS boundaries falls inside
+            # the existing span. Real example that slipped through: an
+            # existing regex span (13720,13734) and a new candidate
+            # (13716,13738) that fully contains it — old check: false on
+            # both clauses, so the containing span was kept too. Two
+            # overlapping detections both got tokenised, and
+            # _apply_tokenization's back-to-front replacement corrupted
+            # the text between them (stale offsets after the inner
+            # replacement shifted the string length). The correct general
+            # interval-overlap test is start1 < end2 AND start2 < end1 —
+            # used here and in the two other places this exact same
+            # pattern was duplicated (see nlp_engine.py's detect_nlp()).
+            if any(start < e and s < end for s, e in seen_spans):
                 continue
 
             if entity_type == "full_name" and _TITLE_ONLY_RE.match(text[start:end]):
@@ -386,7 +403,9 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
                 end   = match.end(grp)   if grp else match.end()
                 if start == end:
                     continue  # skip zero-width matches
-                if any(s <= start < e or s < end <= e for s, e in seen_spans):
+                # Same interval-overlap fix as the Tier 1 loop above —
+                # see the detailed comment there.
+                if any(start < e and s < end for s, e in seen_spans):
                     continue
                 seen_spans.append((start, end))
                 detections.append(Detection(

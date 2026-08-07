@@ -104,9 +104,29 @@ def detect_nlp(
     for result in results:
         start, end = result.start, result.end
 
-        # Skip if overlaps with already-detected regex span
-        if any(s <= start < e2 or s < end <= e2
-               for s, e2 in existing_spans):
+        # Skip if overlaps with already-detected regex span.
+        #
+        # Fixed 2026-08-07 — CRITICAL, this was the actual root cause of a
+        # real production bug (garbled tokenisation in a document
+        # signature block, e.g. "[NM-0007]l." instead of a clean token).
+        # The old check (s <= start < e2 or s < end <= e2) only catches
+        # PARTIAL overlaps where one span's boundary falls inside the
+        # other — it misses full containment, where a Presidio span
+        # starts before AND ends after an existing Tier-1 regex span.
+        # Real numbers from the incident: existing regex span
+        # (13720,13734), Presidio candidate (13716,13738) — fully
+        # containing it. Old check: false on both clauses, so BOTH
+        # detections were kept and both got tokenised.
+        # _apply_tokenization applies replacements back-to-front by start
+        # position; once the inner (regex) span was replaced first, the
+        # outer (Presidio) span's stored [start:end] offsets no longer
+        # matched the now-shifted string, so its replacement sliced into
+        # the wrong characters — corrupting everything after the overlap
+        # point. The correct general interval-overlap test is
+        # start1 < end2 AND start2 < end1, which catches every overlap
+        # case (partial in either direction, and full containment in
+        # either direction).
+        if any(start < e2 and s < end for s, e2 in existing_spans):
             continue
 
         mapping = PRESIDIO_TO_PRIVARO.get(result.entity_type)
