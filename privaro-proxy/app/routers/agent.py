@@ -26,6 +26,7 @@ from app.config import settings
 
 from fastapi import BackgroundTasks
 from app.routers.webhooks import maybe_dispatch_agent_step, dispatch_run_completed
+from app.services.context_optimizer import compress_protected_messages
 
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 
@@ -59,6 +60,7 @@ class AgentProtectRequest(BaseModel):
     messages: List[AgentMessage] = Field(..., min_items=1, max_items=50)
     step_index: Optional[int] = None
     mode: str = Field("tokenise", description="tokenise|anonymise|block")
+    optimize_context: bool = False  # opt-in: compress tokenised messages, same as /v1/proxy/protect and /v1/relay/complete
 
 
 class ProtectedMessage(BaseModel):
@@ -79,6 +81,7 @@ class AgentProtectResponse(BaseModel):
     risk_score: float
     gdpr_compliant: bool
     audit_step_id: Optional[str] = None
+    compression_stats: Dict[str, Any] = {}
 
 
 class AgentRevealRequest(BaseModel):
@@ -213,6 +216,23 @@ async def agent_protect(
     gdpr_ok = all(d.action != "blocked" or d.severity != "critical" for d in all_detections)
     processing_ms = int((time.monotonic() - t0) * 1000)
 
+    # ── Context Optimization (opt-in, gated by body.optimize_context) ────────
+    # Added 2026-07-30 — found missing during a full integration audit of
+    # Context Optimization: /v1/agent/protect is a real, actively-used
+    # governance path (documented in privaro-agents, exercised by
+    # privaro-openai-agents-example and the async SDK client), completely
+    # separate from /v1/proxy/protect and /v1/relay/complete, and had no
+    # Context Optimization wiring at all until now. Same fail-open
+    # contract as the other two endpoints.
+    compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
+    if body.optimize_context and protected_messages:
+        compressible = [{"role": m.role, "content": m.content} for m in protected_messages]
+        compressed, compression_stats = compress_protected_messages(
+            compressible, model=pipeline.get("llm_model", "claude-sonnet-4-6"),
+        )
+        for m, c in zip(protected_messages, compressed):
+            m.content = c["content"]
+
     step_id = await db.create_agent_step(
         agent_run_id=body.agent_run_id,
         org_id=org_id,
@@ -251,6 +271,7 @@ async def agent_protect(
         risk_score=round(risk_score, 4),
         gdpr_compliant=gdpr_ok,
         audit_step_id=step_id,
+        compression_stats=compression_stats,
     )
 
 
@@ -388,7 +409,7 @@ def _make_token(entity_type: str, counter: int) -> str:
     PREFIX_MAP = {
         "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
         "phone": "PH", "iban": "BK", "credit_card": "CC",
-        "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR",
+        "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR", "ssn": "SS", "passport": "PP",
     }
     prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
     return f"[{prefix}-{counter:04d}]"
@@ -460,7 +481,7 @@ async def _apply_agent_tokenisation(
         PREFIX_MAP = {
             "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
             "phone": "PH", "iban": "BK", "credit_card": "CC",
-            "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR",
+            "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR", "ssn": "SS", "passport": "PP",
         }
         prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
         token = f"[{prefix}-{counters[entity_type]:04d}]"
