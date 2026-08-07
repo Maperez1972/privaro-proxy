@@ -191,7 +191,27 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
          r'|titular|remitente|destinatario|derivad[oa]\s+por|firmad[oa]\s+por'
          r'|asegurad[oa]|tomador|beneficiari[oa]|responsable'
          r'|compareciente|a\s+favor\s+de'
-         r'|atendid[oa]\s+por|gestionad[oa]\s+por|tramitad[oa]\s+por|recibid[oa]\s+por)[\s:]+'
+         r'|atendid[oa]\s+por|gestionad[oa]\s+por|tramitad[oa]\s+por|recibid[oa]\s+por'
+         # "Fdo."/"Fda." (Firmado/Firmada) — common in document signature
+         # blocks, added 2026-08-07 after a real gap: a name with no
+         # preceding keyword ("Fdo. Marina Sánchez Soler") never matched
+         # any pattern above at all. Guarded with a negative lookahead:
+         # when Fdo. is immediately followed by ANOTHER title keyword
+         # (Dr./Dra./D./Sr./Sra./Don/Doña), let THAT keyword fire instead
+         # and skip Fdo. here. Without this guard, "Fdo. Dr. Antonio
+         # Urbano" would match "Fdo. Dr" as a name candidate (capturing
+         # just "Dr", stripped of its period, discarded by the
+         # title-only filter below) — but the regex engine's scan
+         # position has already advanced past "Dr" by then, so the
+         # separate "Dr." keyword can never fire afterward at its own
+         # position. Net effect without the guard: the name would go
+         # completely undetected instead of just partially. With the
+         # guard, Fdo. simply doesn't match at all when a more specific
+         # title follows, letting the engine's next scan position land
+         # cleanly on "Dr." itself.
+         r'|fdo\.?(?!\s+(?:dr\.?|dra\.?|d\.?/d\.?a\.?|sr\.?|sra\.?|don\b|doña\b|dña\.?)\s)'
+         r'|fda\.?(?!\s+(?:dr\.?|dra\.?|d\.?/d\.?a\.?|sr\.?|sra\.?|don\b|doña\b|dña\.?)\s)'
+         r')[\s:]+'
          r'('
          r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+|[A-ZÁÉÍÓÚÑ]{2,})'
          # Continuation words stay on the SAME line ([ \t-]+, never \n) —
