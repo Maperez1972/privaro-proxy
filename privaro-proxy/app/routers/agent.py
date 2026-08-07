@@ -404,13 +404,22 @@ def _decrypt_aes_gcm(encrypted_b64: str, key: bytes) -> str:
 
 # ── Tokenisation helper ────────────────────────────────────────────────────────
 
+# Moved to module level 2026-08-07 — was defined twice as a LOCAL variable
+# inside two different functions (_make_token and, separately, inside
+# _apply_agent_tokenisation's loop body), which meant neither copy was
+# actually in scope where the anonymise-label fix needed it. One shared
+# constant, consistent with proxy.py/relay.py's own copies of this map
+# (still duplicated across files — see PR #1's tech-debt note about
+# consolidating all four copies into a shared module).
+PREFIX_MAP = {
+    "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
+    "phone": "PH", "iban": "BK", "credit_card": "CC",
+    "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR", "ssn": "SS", "passport": "PP",
+}
+
+
 def _make_token(entity_type: str, counter: int) -> str:
     """Generate a token like [NM-0001], [ID-0002], etc."""
-    PREFIX_MAP = {
-        "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
-        "phone": "PH", "iban": "BK", "credit_card": "CC",
-        "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR", "ssn": "SS", "passport": "PP",
-    }
     prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
     return f"[{prefix}-{counter:04d}]"
 
@@ -466,7 +475,12 @@ async def _apply_agent_tokenisation(
 
     for d in sorted_dets:
         if d.action == "anonymised":
-            protected_text = protected_text[:d.start] + "[REDACTED]" + protected_text[d.end:]
+            # Fixed 2026-08-07 — aligned with proxy.py/relay.py: was a
+            # generic "[REDACTED]" with no entity-type info at all (a
+            # third, different anonymise format from the other two
+            # endpoints). Now consistent everywhere: [XX-REDACTED].
+            label = PREFIX_MAP.get(d.type, d.type[:2].upper())
+            protected_text = protected_text[:d.start] + f"[{label}-REDACTED]" + protected_text[d.end:]
             continue
         if d.action == "blocked":
             protected_text = protected_text[:d.start] + "[BLOCKED]" + protected_text[d.end:]
@@ -478,11 +492,6 @@ async def _apply_agent_tokenisation(
         entity_type = d.type
         counters[entity_type] = counters.get(entity_type, 0) + 1
 
-        PREFIX_MAP = {
-            "full_name": "NM", "dni": "ID", "nie": "ID", "email": "EM",
-            "phone": "PH", "iban": "BK", "credit_card": "CC",
-            "ip_address": "IP", "date_of_birth": "DT", "health_record": "HR", "ssn": "SS", "passport": "PP",
-        }
         prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
         token = f"[{prefix}-{counters[entity_type]:04d}]"
         d.token = token

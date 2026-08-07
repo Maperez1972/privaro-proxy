@@ -154,7 +154,17 @@ def _apply_tokenization(text: str, detections: list, counters: Dict[str, int]) -
             replacement = token
         elif detection.action in ("anonymised", "anonymise", "anonymise_irreversible"):
             detection.action = "anonymised"
-            replacement = f"[{entity_type.upper()}]"
+            # Fixed 2026-08-07 — real finding: this used the raw internal
+            # entity_type identifier verbatim (e.g. "[HEALTH_RECORD]"),
+            # an English snake_case string with no relation to the
+            # [XX-0001] token convention used everywhere else — visibly
+            # inconsistent (and oddly English) in the middle of a Spanish
+            # document, and it exposes Privaro's internal naming rather
+            # than looking like an intentional, professional redaction
+            # marker. Anonymise is deliberately irreversible (no numbered
+            # token, since there's nothing to reverse), but the label
+            # itself should still follow the same TOKEN_PREFIX convention.
+            replacement = f"[{TOKEN_PREFIX.get(entity_type, entity_type[:2].upper())}-REDACTED]"
         elif detection.action == "blocked":
             # Fixed 2026-07-24 — real bug found via live testing: a policy
             # rule that resolves to "block" for a SPECIFIC entity (not the
