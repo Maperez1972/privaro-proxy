@@ -189,3 +189,4 @@ class HealthResponse(BaseModel):
     detector: str
     supabase: str
     nlp_active: bool = True
+    kompress_ready: bool = False
