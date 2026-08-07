@@ -38,6 +38,7 @@ class ProxyOptions(BaseModel):
     include_detections: bool = True
     reversible: bool = True
     agent_mode: bool = False          # Phase 7b: triggers stricter policies
+    optimize_context: bool = False    # opt-in: compress tokenised prompt before returning
 
 
 class ProtectRequest(BaseModel):
@@ -102,6 +103,16 @@ class ProtectResponse(BaseModel):
     # so the DPO has visibility that unprotected data may have gone out.
     degraded_mode: bool = False
     degraded_reason: Optional[str] = None
+    # Added 2026-07-30 — Context Optimization for /v1/proxy/protect (the
+    # endpoint the dashboard Sandbox actually calls, via proxy-bridge).
+    # Was previously only wired into /v1/relay/complete (PR #1), leaving
+    # the Sandbox's "Context Optimization" toggle a silent no-op: the
+    # frontend already sent options.optimize_context and read
+    # compressionStats.tokens_saved, but this endpoint never set the field,
+    # so CompressionStatsCard just never rendered — no error, no feedback,
+    # just nothing. Found during a full integration audit, not a live bug
+    # report.
+    compression_stats: Dict[str, Any] = {}
 
 
 class DetectResponse(BaseModel):
@@ -178,3 +189,4 @@ class HealthResponse(BaseModel):
     detector: str
     supabase: str
     nlp_active: bool = True
+    kompress_ready: bool = False

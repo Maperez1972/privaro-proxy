@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.models.schemas import HealthResponse
 from app.config import settings
 from app.services.nlp_engine import is_available as nlp_is_available
+from app.services.context_optimizer import kompress_ready
 
 router = APIRouter()
 
@@ -28,13 +29,27 @@ def _build_health_response() -> HealthResponse:
     # boolean for anything that wants to check it directly instead of
     # string-matching `detector`.
     active = nlp_is_available()
+
+    # Added 2026-08-07 — real production incident: requirements.txt was
+    # missing the [proxy] extra Kompress needs (onnxruntime/transformers).
+    # The app started fine, /health said status=ok the whole time, and the
+    # only way to see Kompress had failed to load was grepping container
+    # logs for "background model download failed". If warmup was
+    # requested (CONTEXT_OPTIMIZATION_WARMUP=true) but the model still
+    # isn't ready, that's a real degradation — surfaced the same way the
+    # NLP one is, instead of requiring log access to notice.
+    kompress_ok = kompress_ready()
+    warmup_expected = settings.CONTEXT_OPTIMIZATION_WARMUP
+    degraded = (not active) or (warmup_expected and not kompress_ok)
+
     return HealthResponse(
-        status="ok" if active else "degraded",
+        status="ok" if not degraded else "degraded",
         version="0.1.0",
         environment=settings.ENVIRONMENT,
         detector=_detector_label(),
         supabase="connected" if settings.SUPABASE_URL else "not configured",
         nlp_active=active,
+        kompress_ready=kompress_ok,
     )
 
 

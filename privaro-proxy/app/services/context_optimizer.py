@@ -107,6 +107,24 @@ def _unshield(text: str, mapping: Dict[str, str]) -> str:
     return text
 
 
+def kompress_ready() -> bool:
+    """
+    Non-blocking check: is the Kompress prose-compression model actually
+    loaded right now? Added 2026-08-07 after a production incident where
+    requirements.txt was missing the [proxy] extra (onnxruntime/
+    transformers) — the app started fine and /health reported nlp_active
+    correctly, but there was no way to see from the outside that Kompress
+    itself had failed to load, only by grepping container logs for
+    'background model download failed'. Exposed on /health as
+    kompress_ready so this class of failure is visible without log access.
+    """
+    try:
+        from headroom.transforms.kompress_compressor import KompressCompressor
+        return KompressCompressor().is_ready()
+    except Exception:
+        return False
+
+
 def compress_protected_messages(
     messages: List[Dict[str, Any]],
     model: str,
