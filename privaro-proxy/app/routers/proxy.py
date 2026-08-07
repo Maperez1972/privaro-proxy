@@ -28,7 +28,7 @@ from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
 from app.services.key_manager import resolve_encryption_key, get_org_default_key_id, _decrypt_aes_gcm
-from app.services.context_optimizer import compress_protected_messages
+from app.services.context_optimizer import compress_with_timeout
 from app.config import settings
 from app.services import quota as quota_svc
 
@@ -421,9 +421,18 @@ async def protect_prompt(
     # fail-open contract as relay.py: any integrity mismatch or internal
     # error discards the compression result and returns protected_prompt
     # unmodified.
+    #
+    # Fixed 2026-08-07 — CRITICAL: this used to call
+    # compress_protected_messages() directly (sync, no await, no
+    # executor) inside this async endpoint. Kompress is a real CPU
+    # transformer model; on a ~14K char document it took 30+ seconds,
+    # during which it blocked the entire asyncio event loop for this
+    # worker — freezing every OTHER concurrent request, not just this
+    # one. Now uses compress_with_timeout(), which offloads to a thread
+    # pool and bounds worst-case latency (fails open past the timeout).
     compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
     if getattr(body.options, "optimize_context", False):
-        compressed_messages, compression_stats = compress_protected_messages(
+        compressed_messages, compression_stats = await compress_with_timeout(
             [{"role": "user", "content": protected_prompt}],
             model=pipeline.get("llm_model", "claude-sonnet-4-6"),
         )

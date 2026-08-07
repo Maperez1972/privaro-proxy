@@ -26,7 +26,7 @@ from app.config import settings
 
 from fastapi import BackgroundTasks
 from app.routers.webhooks import maybe_dispatch_agent_step, dispatch_run_completed
-from app.services.context_optimizer import compress_protected_messages
+from app.services.context_optimizer import compress_with_timeout
 
 router = APIRouter(prefix="/v1/agent", tags=["agent"])
 
@@ -224,10 +224,18 @@ async def agent_protect(
     # separate from /v1/proxy/protect and /v1/relay/complete, and had no
     # Context Optimization wiring at all until now. Same fail-open
     # contract as the other two endpoints.
+    #
+    # Fixed 2026-08-07 — CRITICAL, same finding as proxy.py/relay.py: this
+    # called compress_protected_messages() directly (sync, no await, no
+    # executor), blocking the entire asyncio event loop for the whole
+    # duration of a real transformer model's CPU inference (30+ seconds
+    # observed on a ~14K char document) — freezing every other
+    # concurrent request on this worker. Now uses compress_with_timeout(),
+    # offloaded to a thread pool with a bounded worst-case latency.
     compression_stats: Dict[str, Any] = {"tokens_saved": 0, "compression_ratio": 0.0, "skipped_reason": "disabled"}
     if body.optimize_context and protected_messages:
         compressible = [{"role": m.role, "content": m.content} for m in protected_messages]
-        compressed, compression_stats = compress_protected_messages(
+        compressed, compression_stats = await compress_with_timeout(
             compressible, model=pipeline.get("llm_model", "claude-sonnet-4-6"),
         )
         for m, c in zip(protected_messages, compressed):

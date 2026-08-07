@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # context_optimizer.py). Enable this in production once
     # optimize_context is actually exposed to customers.
     CONTEXT_OPTIMIZATION_WARMUP: bool = False
+    # Added 2026-08-07 — real production finding: compress_protected_messages()
+    # runs a real transformer model (Kompress) on CPU, and on a large
+    # document (~14K chars) took 30s+ end to end. Bounds worst-case latency
+    # so one oversized request can't hang a request indefinitely; see
+    # compress_with_timeout() in context_optimizer.py, which fails open
+    # (skips compression, keeps the already-tokenised text) on timeout.
+    CONTEXT_OPTIMIZATION_TIMEOUT_SECONDS: float = 20.0
 
     # ── Development only ───────────────────────────────────────────
     PRIVARO_DEV_KEY: Optional[str] = None
