@@ -17,6 +17,7 @@ Flow:
 from __future__ import annotations
 import json
 import os
+import re
 import base64
 from typing import Any, Dict, List, Optional
 import httpx
@@ -184,12 +185,29 @@ async def _call_openai(
     model: str, messages: List[Dict], api_key: str,
     max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
 ) -> Dict:
+    resolved_model = model or PROVIDERS["openai"]["default_model"]
+    # Fixed 2026-08-08 — real failure hit in production: newer OpenAI
+    # models (the o1/o3 reasoning family, and gpt-5.x) reject the
+    # `max_tokens` parameter entirely ("Unsupported parameter: max_tokens
+    # is not supported with this model. Use max_completion_tokens
+    # instead."). Every call through this function to one of those models
+    # failed outright until this was fixed — found while verifying the
+    # chat-completion security fix against a real pipeline (gpt-5.5).
+    uses_completion_tokens_param = bool(
+        re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE)
+    )
+    token_param = "max_completion_tokens" if uses_completion_tokens_param else "max_tokens"
+    body: Dict[str, Any] = {
+        "model": resolved_model,
+        "messages": messages,
+        token_param: max_tokens,
+        "temperature": temperature,
+    }
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model or PROVIDERS["openai"]["default_model"],
-                  "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+            json=body,
         )
         if resp.status_code != 200:
             raise LLMRouterError(f"OpenAI error {resp.status_code}: {resp.text[:300]}",
@@ -362,13 +380,26 @@ async def _stream_openai(
 ):
     """Yields raw text deltas as they arrive from OpenAI's SSE stream.
     Also used for Azure OpenAI — same wire format."""
+    resolved_model = model or PROVIDERS["openai"]["default_model"]
+    # Same fix as _call_openai (2026-08-08) — o1/o3/gpt-5 models reject
+    # max_tokens entirely, and streaming through this path failed
+    # identically to the non-streaming one until fixed here too.
+    uses_completion_tokens_param = bool(
+        re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE)
+    )
+    token_param = "max_completion_tokens" if uses_completion_tokens_param else "max_tokens"
+    body: Dict[str, Any] = {
+        "model": resolved_model,
+        "messages": messages,
+        token_param: max_tokens,
+        "temperature": temperature,
+        "stream": True,
+    }
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
             "POST", "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model or PROVIDERS["openai"]["default_model"],
-                  "messages": messages, "max_tokens": max_tokens,
-                  "temperature": temperature, "stream": True},
+            json=body,
         ) as resp:
             if resp.status_code != 200:
                 error_body = await resp.aread()
