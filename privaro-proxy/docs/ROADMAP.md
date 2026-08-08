@@ -239,3 +239,40 @@ A raíz de que Octupus pidiera activar `partner:write_children` (para crear sub-
   **Actualización 2026-07-28 — no bloquea a Octupus específicamente.** Confirmaron que no van a usar el relay en absoluto: su arquitectura permite que el cliente final elija cualquier LLM (no solo los que Privaro sabe llamar de forma nativa), así que montan su propio flujo `protect` → su propia llamada al LLM que sea → `detokenize`. Verificado en código: `/v1/proxy/protect` nunca necesita un proveedor configurado (`get_provider_trust` devuelve `None` sin romper nada, con valores por defecto sensatos vía `if provider_trust else "EU"`), y `llm_provider`/`llm_model` en el body de creación no tienen ninguna restricción de valores en la base de datos — les vale pasar cualquier texto arbitrario (ej. `"generic"`/`"n/a"`), ya que esos campos nunca se leen para resolver una clave real en su flujo. El hueco sigue siendo real para un futuro partner que sí quiera usar el relay — no se ha construido nada para cerrarlo de raíz, solo se confirmó que no afecta a este caso concreto.
 
 Pendiente de la respuesta de Michel a una pregunta clave antes de construir nada: ¿cada cliente final de Octupus tiene su propia clave de proveedor LLM (facturación independiente), o Octupus gestiona una única clave compartida para todos? La respuesta determina si la solución es "heredar automáticamente la configuración del padre" o "añadir un campo al propio POST de creación para pasarla directamente".
+
+---
+
+## Auditoría funcional completa de la app — 2026-08-08
+
+Motivada por: primer cliente real (Octupus) en producción + un cambio de Lovable (`chat-completion`) que resultó ser una vulnerabilidad crítica. Plan de 5 fases ejecutado en su totalidad.
+
+### Fase 1 — Edge Functions (8 problemas reales, 3 críticos)
+
+| Función | Hallazgo | Severidad |
+|---|---|---|
+| `chat-completion` | Enviaba mensajes reales sin proteger directamente a OpenAI/Anthropic; system prompt afirmaba falsamente que la PII ya estaba tokenizada | 🔴 Crítico |
+| `revoke-token` | Cualquier admin/dpo de cualquier organización podía revocar el token de cualquier otra organización (mismo bug que `reveal-token` tenía antes del 24/07, pero nunca se replicó el arreglo aquí) | 🔴 Crítico |
+| `proxy-bridge` | Modo `protect` siempre fallaba con 422 (`reversible: true` sin `conversation_id`) | 🟡 Funcional |
+| `recertify-pending` | Usaba fragmento del `SERVICE_ROLE_KEY` real como contraseña propia, comparado con `.includes()` | 🟡 Mala práctica |
+| `ibs-sync-cron` | Cero autenticación — cualquiera con la URL podía disparar llamadas de pago a la API de iBS repetidamente | 🟡 Denial of wallet |
+| `encrypt-provider-key` | Resolvía la organización desde una fila `user_roles` arbitraria en vez de `profiles.org_id` — endurecido preventivamente | 🟢 Robustez |
+
+Arreglo en `privaro-proxy`: `relay.py` ahora acepta el patrón `X-Internal-Secret`+`X-Internal-Org-Id` (antes solo `verify_api_key_or_dev`), necesario para que `chat-completion` pudiera enrutar por el proxy real en vez de llamar a los proveedores directamente. Además, `llm_router.py` tenía 2 bugs reales bloqueando cualquier llamada a modelos `o1/o3/gpt-5`: rechazaban `max_tokens` (necesitan `max_completion_tokens`) y cualquier `temperature` no-default.
+
+### Fase 2 — RLS a nivel de base de datos (2 problemas reales, 1 crítico)
+
+- **`profiles`** (el hallazgo más grave de toda la auditoría): la política de `UPDATE` solo comprobaba `id = auth.uid()`, sin ningún `with_check`. Combinado con permisos de columna reales para `authenticated` sobre `is_platform_admin` y `org_id`, **cualquier usuario autenticado podía auto-otorgarse acceso "platform admin" (ver todas las organizaciones) o cambiar su propio `org_id` para suplantar cualquier otra organización** en prácticamente todas las Edge Functions auditadas en la Fase 1. Arreglado con un trigger que fija ambas columnas a su valor anterior cuando la actualización viene de una sesión de usuario normal (no de `service_role`). Verificado con un ataque simulado real: bloqueado correctamente; las actualizaciones legítimas desde el backend siguen funcionando.
+- **`conversations`**: mismo patrón — `UPDATE` solo comprobaba `user_id = auth.uid()`, permitiendo a un usuario cambiar el `org_id` de su propia conversación a cualquier valor. Arreglado con `WITH CHECK` explícito.
+- **`retention_runs`**: la política de `SELECT` no filtraba por `org_id` en absoluto (aunque la columna existe) — cualquier admin/dpo podía ver el historial de limpieza de retención de todas las organizaciones. Scopeado correctamente.
+
+### Fase 3 — Endpoints del proxy probados directamente
+
+`/v1/proxy/detect`, `/protect`, `/protect-structured`, `/detokenize`, `/v1/relay/complete` y `GET /v1/partner/sub-accounts` probados con llamadas HTTP reales (no solo revisión de código) contra pipelines reales. Todos funcionan correctamente.
+
+### Fase 4 — Consistencia de facturación (1 problema real)
+
+`increment_billing_requests()` escribía `org_usage_monthly.cycle_start` truncado al primer día del **mes calendario**, mientras que todo el código que lee esa tabla (`partner-sub-accounts`, `usage-alerts`, ambos tocados hoy mismo) compara contra la fecha real de inicio del **ciclo de facturación** (`billing_accounts.billing_cycle_start`), que casi nunca cae el día 1. Las dos convenciones nunca coincidían, así que cualquier lectura de esa tabla devolvía siempre 0 — exactamente el síntoma original que se intentaba arreglar hoy ("la tabla del dashboard ya lo pintaba pero llegaba a 0"). Arreglada la función para escribir con la fecha real del ciclo; migradas las 2 filas del ciclo activo; verificado con una llamada real en producción (30 → 31).
+
+### Fase 5 — Pendiente
+
+Verificación cruzada frontend↔backend para el resto de pantallas de la app (más allá de Chat.tsx, ya cubierto en la Fase 1) — no ejecutada todavía en esta sesión.
