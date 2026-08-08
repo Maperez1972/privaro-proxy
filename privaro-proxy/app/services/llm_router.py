@@ -186,23 +186,22 @@ async def _call_openai(
     max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
 ) -> Dict:
     resolved_model = model or PROVIDERS["openai"]["default_model"]
-    # Fixed 2026-08-08 — real failure hit in production: newer OpenAI
-    # models (the o1/o3 reasoning family, and gpt-5.x) reject the
-    # `max_tokens` parameter entirely ("Unsupported parameter: max_tokens
-    # is not supported with this model. Use max_completion_tokens
-    # instead."). Every call through this function to one of those models
-    # failed outright until this was fixed — found while verifying the
-    # chat-completion security fix against a real pipeline (gpt-5.5).
-    uses_completion_tokens_param = bool(
-        re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE)
-    )
-    token_param = "max_completion_tokens" if uses_completion_tokens_param else "max_tokens"
+    # Fixed 2026-08-08 — real failures hit in production against gpt-5.5:
+    # (1) these models reject `max_tokens` ("use max_completion_tokens
+    # instead"), (2) they also reject any non-default `temperature`
+    # ("Only the default (1) value is supported") — found in that order,
+    # one fix exposing the next real error underneath. Omit temperature
+    # entirely for this family rather than sending 1.0 explicitly, since
+    # a future default change on OpenAI's side should still work either way.
+    is_newer_model = bool(re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE))
+    token_param = "max_completion_tokens" if is_newer_model else "max_tokens"
     body: Dict[str, Any] = {
         "model": resolved_model,
         "messages": messages,
         token_param: max_tokens,
-        "temperature": temperature,
     }
+    if not is_newer_model:
+        body["temperature"] = temperature
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
@@ -381,20 +380,18 @@ async def _stream_openai(
     """Yields raw text deltas as they arrive from OpenAI's SSE stream.
     Also used for Azure OpenAI — same wire format."""
     resolved_model = model or PROVIDERS["openai"]["default_model"]
-    # Same fix as _call_openai (2026-08-08) — o1/o3/gpt-5 models reject
-    # max_tokens entirely, and streaming through this path failed
-    # identically to the non-streaming one until fixed here too.
-    uses_completion_tokens_param = bool(
-        re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE)
-    )
-    token_param = "max_completion_tokens" if uses_completion_tokens_param else "max_tokens"
+    # Same fixes as _call_openai (2026-08-08): o1/o3/gpt-5 models reject
+    # both max_tokens and any non-default temperature.
+    is_newer_model = bool(re.match(r"^(o1|o3|o4|gpt-5)", resolved_model, re.IGNORECASE))
+    token_param = "max_completion_tokens" if is_newer_model else "max_tokens"
     body: Dict[str, Any] = {
         "model": resolved_model,
         "messages": messages,
         token_param: max_tokens,
-        "temperature": temperature,
         "stream": True,
     }
+    if not is_newer_model:
+        body["temperature"] = temperature
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
             "POST", "https://api.openai.com/v1/chat/completions",
