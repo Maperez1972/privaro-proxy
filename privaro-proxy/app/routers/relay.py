@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.models.schemas import _validate_conversation_id
 from typing import Dict, Any, List, Optional
 
-from app.services.auth import verify_api_key_or_dev
+from app.services.auth import verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
 from app.services import detector
@@ -219,7 +219,7 @@ class RelayResponse(BaseModel):
 async def relay_complete(
     body: RelayRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
@@ -391,7 +391,7 @@ async def relay_complete(
 
 @router.get("/providers")
 async def get_providers(
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """List supported LLM providers and their available models."""
     return {"providers": list_providers()}
@@ -433,7 +433,7 @@ def _detokenise(text: str, token_map: Dict[str, str]) -> str:
 async def relay_stream(
     body: RelayRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     t0 = time.monotonic()
     request_id = f"relaystream_{uuid.uuid4().hex[:12]}"
