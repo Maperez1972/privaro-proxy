@@ -298,3 +298,26 @@ Motivado por: revisión estratégica de posicionamiento frente al estándar AIUC
 - `agent_steps` con `role='assistant'`/`step_type='response'` — hoy solo existen filas `user`/`prompt`; extender el router de agentes para registrar (y escanear) los pasos de respuesta y resultados de tool-calls es la vía real para cerrar la fuga vía RAG/tool-calling en flujos agénticos multi-paso.
 - SDKs (`privaro-sdk-python`, `privaro-sdk-js`): añadir un método `protect_output()`/`protectOutput()` equivalente, hoy solo cubren el flujo de input.
 - UI de dashboard (repo `privaro-7938a3bd`): toggle de `output_scanning_enabled`/`mode` por pipeline, selector de `direction` en el editor de policy rules, vista de "Output Incidents", y actualización de `generate-dpo-report` para reflejar cobertura de output.
+
+---
+
+## Escaneo de output en streaming — 2026-08-10 (misma tarde)
+
+Motivado por: prueba real de iCommunity Labs activando `output_scanning_enabled` en el pipeline "Medical Document Reviewer" — el toggle se guardó correctamente, pero al revisar `audit_logs` no apareció ningún evento `direction='output'`. Causa encontrada: el chat real de la app llama a `chat-completion` → **`/v1/relay/stream`**, no a `/v1/relay/complete` — y el escaneo de output de esta misma tarde solo estaba conectado a `/complete`. El toggle era un no-op silencioso en la única ruta que importaba de verdad.
+
+### Por qué streaming es fundamentalmente distinto
+
+En `/complete` se puede escanear la respuesta ANTES de devolverla — hay margen para enmascarar. En streaming, cada chunk ya se ha entregado al cliente en tiempo real; para cuando se puede analizar la respuesta completa, el usuario ya la ha visto. No existe un modo "enforce" real en streaming sin retener toda la respuesta hasta escanearla (lo cual anula el propósito de usar streaming).
+
+### Diseño
+
+- `_audit_streamed_output()` en `relay.py`, invocada tras `data: [DONE]`, sobre el texto RAW (antes de detokenizar) acumulado durante el stream.
+- Es **solo auditoría**, nunca modifica lo ya enviado.
+- El `output_scanning_mode` del pipeline determina cómo se ETIQUETA la detección, no si se enmascara:
+  - `shadow`: se guarda la acción que resolvería la policy (informativo — el cliente ya sabía que esto es solo observación).
+  - `enforce`: cualquier detección cuya acción resuelta no sea un no-op se reetiqueta como **`leaked`** — la política pedía bloquear/enmascarar y el canal no pudo cumplirlo. Esto alimenta correctamente `pipelines.total_leaked` y `stats.leaked`, dando al DPO una señal honesta de que este canal concreto no puede hacer cumplir sus políticas de output.
+- Verificado con `test_output_direction.py` (2 casos nuevos: shadow mantiene la acción resuelta, enforce reetiqueta a `leaked`).
+
+### Pendiente
+
+- Si un cliente necesita **enforcement real** en streaming, la única solución honesta es desactivar streaming en ese pipeline (`organizations.streaming_enabled`, ya existe) y usar `/complete`, o aceptar latencia añadida con un buffer de N segundos antes de empezar a emitir — no construido, requiere decisión de producto.

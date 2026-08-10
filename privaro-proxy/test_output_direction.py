@@ -103,4 +103,53 @@ assert r[0].action == "tokenised", f"expected fallback, got {r[0].action!r}"
 print("  -> rule with no 'direction' key treated as 'input', ignored for "
       f"output context (action={r[0].action!r}). OK\n")
 
+print("=" * 70)
+print("5. Streaming 'enforce' relabeling (relay.py's _audit_streamed_output):")
+print("   /v1/relay/stream cannot mask anything — every chunk is already")
+print("   flushed to the client before this ever runs. If the pipeline is")
+print("   configured 'enforce', any non-passed detection must be relabeled")
+print("   'leaked' (the policy's promise wasn't kept on this channel); if")
+print("   'shadow', the resolved action is kept as-is (informational only).")
+print("=" * 70)
+
+
+def _simulate_enforce_relabel(detections, scan_mode):
+    """Mirrors the relabeling loop inside relay.py's _audit_streamed_output,
+    without needing the Supabase-backed audit/db calls around it."""
+    if scan_mode == "enforce":
+        for d in detections:
+            if d.action != "passed":
+                d.action = "leaked"
+    return detections
+
+
+output_rule_block = {
+    "entity_type": "dni", "category": "personal", "action": "block",
+    "is_enabled": True, "direction": "output", "priority": 10,
+}
+
+d_shadow = detector.detect(SAMPLE_OUTPUT)
+d_shadow = [x for x in d_shadow if x.type == "dni"]
+d_shadow = pe.apply_policies(d_shadow, [output_rule_block], {
+    "provider": "openai", "user_role": "developer", "data_region": "EU",
+    "agent_mode": False, "pipeline_sector": "general", "default_action": "tokenise",
+    "direction": "output",
+})
+d_shadow = _simulate_enforce_relabel(d_shadow, "shadow")
+assert d_shadow[0].action == "blocked", f"shadow mode must keep the resolved action, got {d_shadow[0].action!r}"
+print(f"  -> shadow mode keeps resolved action (action={d_shadow[0].action!r}). OK")
+
+d_enforce = detector.detect(SAMPLE_OUTPUT)
+d_enforce = [x for x in d_enforce if x.type == "dni"]
+d_enforce = pe.apply_policies(d_enforce, [output_rule_block], {
+    "provider": "openai", "user_role": "developer", "data_region": "EU",
+    "agent_mode": False, "pipeline_sector": "general", "default_action": "tokenise",
+    "direction": "output",
+})
+d_enforce = _simulate_enforce_relabel(d_enforce, "enforce")
+assert d_enforce[0].action == "leaked", f"enforce mode on a stream must relabel to 'leaked', got {d_enforce[0].action!r}"
+print(f"  -> enforce mode on a stream correctly relabels to 'leaked' "
+      f"(action={d_enforce[0].action!r}), since streaming already delivered "
+      f"the chunk before any scan could run. OK\n")
+
 print("ALL CHECKS PASSED")

@@ -310,6 +310,131 @@ async def _scan_output_for_pii(
     return OutputScanResult(scanned, detections, True, vault_rows)
 
 
+async def _audit_streamed_output(
+    raw_response: str,
+    org_id: str,
+    pipeline_id: str,
+    provider: str,
+    model: str,
+    sector: str,
+    user_role: str,
+    mode: str,
+    scan_mode: str,
+    request_id: str,
+    conversation_id: Optional[str],
+) -> None:
+    """
+    Added 2026-08 — output-direction PII detection for /v1/relay/stream.
+
+    Confirmed necessary by a real customer test (iCommunity Labs, Medical
+    Document Reviewer pipeline, 2026-08-10): output_scanning_enabled was
+    turned on in the dashboard, but the chat UI calls chat-completion ->
+    /v1/relay/stream, not /v1/relay/complete — and _scan_output_for_pii
+    was only ever wired into /complete. The toggle was silently a no-op
+    for the one path that actually mattered.
+
+    Streaming makes this fundamentally different from /complete: by the
+    time the full response is assembled here, every chunk has ALREADY
+    been flushed to the client (see event_generator — this only runs
+    after "data: [DONE]" has been yielded). There is no way to mask
+    something the client already received. So this function only ever
+    AUDITS; it never returns modified text, and there is no
+    "enforce"-mode masking here — that would require holding back the
+    entire response until scanned, defeating the point of streaming.
+
+    What DOES depend on the pipeline's output_scanning_mode is how a
+    detection is LABELED:
+      - scan_mode == 'shadow': the org explicitly asked for observe-only
+        behavior, so a detection is recorded with the action the policy
+        engine resolved (e.g. 'tokenised') — nothing "leaked" that wasn't
+        already understood to be unenforced on this path.
+      - scan_mode == 'enforce': the org's policy demanded masking/blocking,
+        and streaming could not honor that — so any detection whose
+        resolved action was NOT a no-op is recorded as 'leaked', which is
+        the honest, correct signal (and is what feeds
+        pipelines.total_leaked and stats.leaked elsewhere in this
+        codebase). A DPO reading the audit log for an 'enforce' pipeline
+        should see the truth: this channel could not enforce the policy.
+    """
+    policies = await db.get_policy_rules(org_id, pipeline_id=pipeline_id) or []
+    provider_trust = await db.get_provider_trust(provider, org_id)
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+    policy_context = {
+        "provider": provider,
+        "user_role": user_role,
+        "data_region": (provider_trust or {}).get("data_region", "EU"),
+        "agent_mode": False,
+        "pipeline_sector": sector,
+        "default_action": mode,
+        "direction": "output",
+    }
+
+    detections = detector.detect(raw_response)
+    if not detections:
+        return
+
+    if policies:
+        detections = pe.apply_policies(detections, policies, policy_context)
+    else:
+        for d in detections:
+            d.action = mode if mode in ("tokenise", "anonymise", "block") else "tokenised"
+
+    if scan_mode == "enforce":
+        for d in detections:
+            if d.action not in ("passed",):
+                # See docstring: streaming already delivered this to the
+                # client before this function could ever run, so an
+                # 'enforce' policy's promise was not kept for this
+                # detection — 'leaked' is the accurate label, not
+                # whatever the policy engine resolved.
+                d.action = "leaked"
+
+    stats = detector.build_stats(detections, 0)
+    risk_score = pe.compute_risk_score(detections, provider_risk_level, False, stats["leaked"])
+    event_type = "output_pii_leaked" if stats["leaked"] > 0 else "output_pii_detected"
+
+    audit_log_id = await db.insert_audit_log({
+        "org_id": org_id, "pipeline_id": pipeline_id,
+        "event_type": event_type,
+        "entity_type": detections[0].type,
+        "entity_category": pe._get_category(detections[0].type),
+        "action_taken": detections[0].action,
+        "severity": "critical" if stats["leaked"] > 0 else (
+            "high" if risk_score > 0.7 else "medium" if risk_score > 0.4 else "low"
+        ),
+        "prompt_hash": hashlib.sha256(raw_response.encode()).hexdigest(),
+        "pipeline_stage": "relay_stream_output",
+        "processing_ms": 0,
+        "ibs_status": "pending", "source": "relay_stream", "direction": "output",
+        "risk_score": risk_score, "agent_mode": False,
+        "conversation_id": conversation_id,
+        "metadata": {
+            "request_id": request_id, "provider": provider, "model": model,
+            "total_detected": stats["total_detected"], "total_masked": stats["total_masked"],
+            "leaked": stats["leaked"], "by_type": stats["by_type"], "scan_mode": scan_mode,
+            "streaming_caveat": scan_mode == "enforce",
+        },
+    })
+    if audit_log_id:
+        await db.insert_pii_detections([
+            {
+                "audit_log_id": audit_log_id, "org_id": org_id, "entity_type": d.type,
+                "original_length": (d.end - d.start) if d.start is not None else None,
+                "token_ref": d.token, "start_offset": d.start, "end_offset": d.end,
+                "confidence_score": d.confidence, "detector_used": d.detector,
+                "detector_version": "regex-v1", "direction": "output",
+                "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
+                "conversation_id": conversation_id,
+                "decision_reason": f"Streamed output scan (post-hoc, audit-only): {d.action} for {d.type} (scan_mode={scan_mode})",
+            }
+            for d in detections
+        ])
+        await ibs.certify_audit_log(audit_log_id, org_id, {"request_id": request_id, "provider": provider})
+    await db.increment_pipeline_counters(
+        pipeline_id, stats["total_detected"], stats["total_masked"], stats["leaked"], 0,
+    )
+
+
 class OutputScanResult:
     """Small typed tuple substitute — keeps the 4 return values self-documenting
     at every call site instead of an anonymous tuple."""
@@ -742,6 +867,12 @@ async def relay_stream(
     async def event_generator():
         buf = ""
         full_response_parts = []
+        # Added 2026-08 — collects the RAW (still-tokenised) chunks, before
+        # _detokenise() runs, so the post-stream output scan below sees the
+        # same "only genuinely new PII" view that /complete's
+        # _scan_output_for_pii gets — the caller's own [XX-0001]
+        # placeholders never match a PII pattern either way.
+        raw_response_parts = []
         try:
             async for chunk in route_stream(
                 provider=provider, messages=protected_messages, org_id=org_id,
@@ -753,6 +884,7 @@ async def relay_stream(
                 if safe_point > 0:
                     to_emit = buf[:safe_point]
                     buf = buf[safe_point:]
+                    raw_response_parts.append(to_emit)
                     if body.options.detokenise_response:
                         to_emit = _detokenise(to_emit, token_map)
                     full_response_parts.append(to_emit)
@@ -763,6 +895,7 @@ async def relay_stream(
             return
 
         if buf:
+            raw_response_parts.append(buf)
             if body.options.detokenise_response:
                 buf = _detokenise(buf, token_map)
             full_response_parts.append(buf)
@@ -792,5 +925,24 @@ async def relay_stream(
                          "total_detected": pii_detected, "total_masked": pii_masked},
         })
         await ibs.certify_audit_log(audit_log_id, org_id, {"request_id": request_id, "provider": provider})
+
+        # ── Output-direction PII scan (added 2026-08, post-hoc/audit-only) ──
+        # Gated by the same pipeline.output_scanning_enabled flag as
+        # /v1/relay/complete and /v1/proxy/protect-output, so this is a
+        # no-op for every pipeline that hasn't explicitly opted in.
+        if pipeline.get("output_scanning_enabled"):
+            raw_response = "".join(raw_response_parts)
+            try:
+                await _audit_streamed_output(
+                    raw_response, org_id, body.pipeline_id, provider, model,
+                    pipeline.get("sector", "general"), key_record.get("role", "developer"),
+                    body.options.mode, pipeline.get("output_scanning_mode", "shadow"),
+                    request_id, body.conversation_id,
+                )
+            except Exception as e:
+                # Best-effort, same philosophy as the audit log above this
+                # block — a failure here must never affect a response the
+                # client has already fully received.
+                print(f"[OutputScan] streamed audit failed (non-fatal): {e}")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
