@@ -189,9 +189,34 @@ async def agent_protect(
         protected_content = msg.content
         tokens_created_msg = 0
 
+        # Added 2026-08 — output-direction PII detection for agent runs.
+        # This endpoint already scans every message role uniformly
+        # (assistant/tool_output content has always been sent through
+        # detector.detect() here — unlike /v1/relay/complete and
+        # /v1/proxy/protect, where output scanning was entirely new and
+        # gated behind pipeline.output_scanning_enabled). What was missing
+        # was direction-awareness in policy resolution: every message,
+        # regardless of role, was evaluated as if direction='input'
+        # (the default when the key is absent), meaning an org's
+        # direction='output'-scoped rules (e.g. "block health_record from
+        # ever appearing in an assistant/tool response") could never fire
+        # here even after being created — the exact multi-step
+        # RAG/tool-call leakage vector discussed for AIUC-1 alignment.
+        # 'user'/'system' messages keep direction='input' (their existing,
+        # unchanged behavior); 'assistant'/'tool' messages (and any
+        # step_type of 'tool_output'/'observation') are now evaluated as
+        # direction='output'. An org with no output-scoped rules yet sees
+        # zero behavior change (falls back to the same default_action as
+        # before).
+        message_direction = "output" if (
+            msg.role in ("assistant", "tool")
+            or msg.step_type in ("tool_output", "observation")
+        ) else "input"
+        message_policy_context = {**policy_context, "direction": message_direction}
+
         if detections:
             if policies:
-                detections = pe.apply_policies(detections, policies, policy_context)
+                detections = pe.apply_policies(detections, policies, message_policy_context)
             protected_content, tokens_created_msg = await _apply_agent_tokenisation(
                 text=msg.content,
                 detections=detections,
