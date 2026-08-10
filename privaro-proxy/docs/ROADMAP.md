@@ -276,3 +276,25 @@ Arreglo en `privaro-proxy`: `relay.py` ahora acepta el patrón `X-Internal-Secre
 ### Fase 5 — Pendiente
 
 Verificación cruzada frontend↔backend para el resto de pantallas de la app (más allá de Chat.tsx, ya cubierto en la Fase 1) — no ejecutada todavía en esta sesión.
+
+---
+
+## Output-direction PII detection — 2026-08-10
+
+Motivado por: revisión estratégica de posicionamiento frente al estándar AIUC-1 (certificación de agentes de IA). Al mapear los 51 controles de AIUC-1 contra Privaro, quedó claro que el motor de detección solo se invocaba sobre el INPUT (prompt → LLM), nunca sobre el OUTPUT (respuesta del LLM → usuario/agente). Confirmado con datos reales de producción antes de tocar código: `conversation_messages` tenía 1.175 detecciones de PII en 76 mensajes `role=user` y **0 en 78 mensajes `role=assistant`**; `pipelines.total_leaked` estaba en 0 en absolutamente todos los pipelines, incluidos los de cientos de requests.
+
+### Cambios
+
+- **Migración `output_direction_policies`**: añade `direction` (`input`/`output`/`both`) a `policy_rules`, `audit_logs` y `pii_detections`. Todas las filas existentes se retro-rellenan explícitamente a `'input'` — cero cambio de comportamiento para clientes existentes.
+- **Migración `output_scanning_rollout_flag`**: añade `pipelines.output_scanning_enabled` (default `false`) y `pipelines.output_scanning_mode` (`shadow`/`enforce`, default `shadow`). El escaneo de output es estrictamente opt-in por pipeline — desplegar este código no cambia nada hasta que un cliente lo activa explícitamente. `shadow` detecta y audita sin modificar la respuesta (periodo de validación seguro antes de pasar a `enforce`).
+- **`policy_engine.py`**: `_matches_context` ahora filtra por `direction` — una regla `input` (o sin `direction`, tratada como `input`) nunca se aplica a un contexto `output`, y viceversa; `direction='both'` aplica a ambos. Verificado con `test_output_direction.py` (sin dependencias externas — no requiere Supabase ni presidio).
+- **`relay.py`**: nueva `_scan_output_for_pii()`, invocada en `/v1/relay/complete` sobre la respuesta CRUDA del LLM, ANTES de la de-tokenización de los placeholders `[XX-0001]` del propio caller (esos nunca matchean un patrón de PII, así que esto solo detecta fugas NUEVAS — RAG, resultados de tool-calls, contaminación cross-tenant, memorización del modelo — nunca los datos que el propio caller ya había autorizado en turnos anteriores de la misma conversación). Genera un `audit_log` separado (`direction='output'`, `pipeline_stage='relay_output'`) para no tocar la forma del audit_log principal que ya leen dashboards/informes DPO existentes.
+- **`proxy.py`**: nuevo endpoint `POST /v1/proxy/protect-output`, para clientes que usan `/protect` de forma standalone (llaman a su propio LLM fuera de Privaro) y quieren escanear la respuesta antes de devolverla a su usuario final. Falla con 403 explícito si el pipeline no tiene `output_scanning_enabled` — mejor eso que dar una falsa sensación de protección.
+- **Fix de raíz, encontrado durante esta revisión**: `_apply_tokenization` (proxy.py) y `_protect_messages` (relay.py) descartaban en silencio cualquier detección sin `start`/`end` fiable (`continue` sin cambiar el estado) — la detección quedaba SIN enmascarar en el texto real, y nada lo registraba. Es la razón exacta por la que `pipelines.total_leaked` llevaba en 0 en toda la producción: ningún código asignaba nunca `action = "leaked"`. Corregido en ambos sitios.
+
+### Pendiente (no construido en esta sesión — backlog explícito)
+
+- Escaneo de output en `/v1/relay/stream` (SSE) — requiere lógica de buffering adicional (un chunk puede cortar una entidad detectada a la mitad); el escaneo no-streaming (`/complete`, `/protect-output`) ya cubre el caso más común.
+- `agent_steps` con `role='assistant'`/`step_type='response'` — hoy solo existen filas `user`/`prompt`; extender el router de agentes para registrar (y escanear) los pasos de respuesta y resultados de tool-calls es la vía real para cerrar la fuga vía RAG/tool-calling en flujos agénticos multi-paso.
+- SDKs (`privaro-sdk-python`, `privaro-sdk-js`): añadir un método `protect_output()`/`protectOutput()` equivalente, hoy solo cubren el flujo de input.
+- UI de dashboard (repo `privaro-7938a3bd`): toggle de `output_scanning_enabled`/`mode` por pipeline, selector de `direction` en el editor de policy rules, vista de "Output Incidents", y actualización de `generate-dpo-report` para reflejar cobertura de output.

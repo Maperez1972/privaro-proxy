@@ -20,6 +20,7 @@ from app.models.schemas import (
     DetectRequest, DetectResponse,
     DetokenizeRequest, DetokenizeResponse,
     ProtectStructuredRequest, ProtectStructuredResponse,
+    ProtectOutputRequest, ProtectOutputResponse,
     Detection,
 )
 from app.services import detector
@@ -143,6 +144,14 @@ def _apply_tokenization(text: str, detections: list, counters: Dict[str, int]) -
     """
     for detection in reversed(detections):
         if detection.start is None or detection.end is None:
+            # Real bug fix, found while adding output-direction scanning
+            # (2026-08): a detection with no reliable span was silently
+            # skipped here with no state change — meaning it was reported
+            # as "detected" but never actually masked in the text that
+            # went out, and nothing ever recorded that. This is exactly
+            # why pipelines.total_leaked has read 0 in every single
+            # pipeline in production: no code path ever set this action.
+            detection.action = "leaked"
             continue
         entity_type = detection.type
 
@@ -621,6 +630,214 @@ async def protect_prompt(
     if idempotency_key:
         background_tasks.add_task(
             db.save_idempotent_response, org_id, idempotency_key, "protect",
+            200, final_response.model_dump(),
+        )
+
+    return final_response
+
+
+# ── /proxy/protect-output ────────────────────────────────────────────────────
+# Added 2026-08 — output-direction PII detection for standalone /protect
+# customers (as opposed to /v1/relay/complete, which scans the response
+# inline because Privaro itself makes the LLM call there). A customer who
+# calls /protect, sends the protected prompt to their OWN LLM, and gets a
+# response back has, until now, had zero Privaro visibility into that
+# response — the exact gap confirmed in production data before this was
+# built: conversation_messages had 1,175 PII detections across 76 input
+# messages and 0 across 78 output messages; pipelines.total_leaked was 0
+# everywhere. This endpoint mirrors /protect's contract (same policy
+# engine, same tokenisation/vault mechanics) but scoped to direction='output'
+# rules, and gated by the same pipeline.output_scanning_enabled flag used by
+# /v1/relay/complete so a single dashboard toggle governs both paths.
+
+@router.post("/protect-output", response_model=ProtectOutputResponse)
+async def protect_output(
+    body: ProtectOutputRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    t0 = time.monotonic()
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+
+    if not pipeline.get("output_scanning_enabled"):
+        # Fail loudly rather than silently pass the text through unscanned —
+        # this endpoint is an explicit, dedicated call, so a customer
+        # relying on it deserves a clear signal that the pipeline isn't
+        # opted in yet, not a false sense of protection.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "output_scanning_disabled",
+                "message": "This pipeline has not enabled output-direction PII "
+                           "scanning. Enable output_scanning_enabled for this "
+                           "pipeline in the dashboard (Pipelines → Settings) "
+                           "before calling /protect-output.",
+            },
+        )
+
+    org_id = pipeline["org_id"]
+    shadow = pipeline.get("output_scanning_mode", "shadow") != "enforce"
+
+    if idempotency_key:
+        cached = await db.get_idempotent_response(org_id, idempotency_key, "protect-output")
+        if cached:
+            return ProtectOutputResponse(**cached["response_body"])
+
+    await quota_svc.check_and_increment(org_id)
+
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+
+    try:
+        detections = await _detect_with_timeout(body.response_text, custom_pattern_rules)
+    except DegradedModeError as e:
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[Resilience] /protect-output degraded ({e.reason}) org={org_id} pipeline={body.pipeline_id}")
+        audit_log_id = str(uuid.uuid4())
+        background_tasks.add_task(db.insert_audit_log, {
+            "id": audit_log_id,
+            "org_id": org_id, "pipeline_id": body.pipeline_id,
+            "event_type": "degraded_bypass", "entity_type": "unknown",
+            "entity_category": "system", "action_taken": "passthrough_unprotected",
+            "severity": "critical",
+            "prompt_hash": hashlib.sha256(body.response_text.encode()).hexdigest(),
+            "pipeline_stage": "proxy_output", "processing_ms": processing_ms,
+            "ibs_status": "pending", "source": "proxy", "direction": "output",
+            "risk_score": None, "agent_mode": False,
+            "conversation_id": body.conversation_id,
+            "metadata": {"request_id": request_id, "degraded_reason": e.reason},
+        })
+        return ProtectOutputResponse(
+            request_id=request_id,
+            protected_response=body.response_text,  # fail open, unmodified
+            detections=[],
+            stats={"total_detected": 0, "total_masked": 0, "leaked": 0,
+                   "coverage_pct": 0.0, "processing_ms": processing_ms, "by_type": {}, "risk_score": None},
+            audit_log_id=audit_log_id,
+            gdpr_compliant=False,
+            scan_mode="shadow" if shadow else "enforce",
+            response_modified=False,
+        )
+
+    provider_trust = await db.get_provider_trust(pipeline.get("llm_provider", ""), org_id)
+    policy_context = {
+        "provider": pipeline.get("llm_provider", ""),
+        "user_role": key_record.get("role", "developer"),
+        "data_region": (provider_trust or {}).get("data_region", "EU"),
+        "agent_mode": body.options.agent_mode,
+        "pipeline_sector": pipeline.get("sector", "general"),
+        "default_action": body.options.mode.value,
+        "direction": "output",
+    }
+    provider_risk_level = (provider_trust or {}).get("provider_risk_level", "medium")
+
+    if policies and detections:
+        detections = pe.apply_policies(detections, policies, policy_context)
+    else:
+        for d in detections:
+            d.action = "tokenised" if body.options.mode.value == "tokenise" else body.options.mode.value
+
+    processing_ms = int((time.monotonic() - t0) * 1000)
+    audit_log_id = str(uuid.uuid4())
+
+    protected_response = body.response_text
+    response_modified = False
+    counters: Dict[str, int] = {}
+
+    if detections and not shadow:
+        protected_response = _apply_tokenization(protected_response, detections, counters)
+        response_modified = True
+    # shadow mode: detections are still classified above (so stats/audit
+    # reflect what WOULD happen), but the text returned is unmodified.
+
+    stats = detector.build_stats(detections, processing_ms)
+    risk_score = pe.compute_risk_score(detections, provider_risk_level, body.options.agent_mode, stats["leaked"])
+    stats["risk_score"] = risk_score
+
+    event_type = "request_clean" if not detections else (
+        "output_pii_leaked" if stats["leaked"] > 0 else "output_pii_detected"
+    )
+    background_tasks.add_task(db.insert_audit_log, {
+        "id": audit_log_id,
+        "org_id": org_id, "pipeline_id": body.pipeline_id,
+        "event_type": event_type,
+        "entity_type": detections[0].type if detections else "none",
+        "entity_category": pe._get_category(detections[0].type) if detections else "none",
+        "action_taken": detections[0].action if detections else "passed",
+        "severity": "high" if risk_score > 0.7 else "medium" if risk_score > 0.4 else "low",
+        "prompt_hash": hashlib.sha256(body.response_text.encode()).hexdigest(),
+        "pipeline_stage": "proxy_output", "processing_ms": processing_ms,
+        "ibs_status": "pending", "source": "proxy", "direction": "output",
+        "risk_score": risk_score, "agent_mode": body.options.agent_mode,
+        "conversation_id": body.conversation_id,
+        "metadata": {
+            "request_id": request_id, "total_detected": stats["total_detected"],
+            "total_masked": stats["total_masked"], "leaked": stats["leaked"],
+            "by_type": stats["by_type"], "scan_mode": "shadow" if shadow else "enforce",
+            "response_modified": response_modified,
+        },
+    })
+
+    if detections:
+        background_tasks.add_task(db.insert_pii_detections, [
+            {
+                "audit_log_id": audit_log_id, "org_id": org_id, "entity_type": d.type,
+                "original_length": (d.end - d.start) if d.start is not None else None,
+                "token_ref": d.token, "start_offset": d.start, "end_offset": d.end,
+                "confidence_score": d.confidence, "detector_used": d.detector,
+                "detector_version": "regex-v1", "direction": "output",
+                "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
+                "conversation_id": body.conversation_id,
+                "decision_reason": f"Output scan: {d.action} for {d.type} (mode={'shadow' if shadow else 'enforce'})",
+            }
+            for d in detections
+        ])
+
+    if detections and body.options.reversible and not shadow:
+        enc_key_id = await get_org_default_key_id(org_id)
+        try:
+            enc_key = await resolve_encryption_key(enc_key_id, org_id)
+        except Exception as e:
+            print(f"[Vault] Key resolution failed (protect-output), falling back to managed: {e}")
+            from app.services.key_manager import _get_managed_key
+            enc_key = _get_managed_key()
+            enc_key_id = "key-v1"
+
+        token_rows = await _build_vault_rows(
+            body.response_text, detections, org_id, body.pipeline_id,
+            body.conversation_id, enc_key, enc_key_id,
+        )
+        if token_rows:
+            background_tasks.add_task(db.insert_tokens_batch, token_rows)
+            background_tasks.add_task(db.increment_encryption_key_usage, enc_key_id, len(token_rows))
+
+    background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id, {"request_id": request_id})
+    background_tasks.add_task(
+        db.increment_pipeline_counters,
+        body.pipeline_id, stats["total_detected"], stats["total_masked"], stats["leaked"], processing_ms,
+    )
+
+    final_response = ProtectOutputResponse(
+        request_id=request_id,
+        protected_response=protected_response,
+        detections=detections if body.options.include_detections else [],
+        stats=stats,
+        audit_log_id=audit_log_id,
+        gdpr_compliant=stats["leaked"] == 0,
+        scan_mode="shadow" if shadow else "enforce",
+        response_modified=response_modified,
+    )
+
+    if idempotency_key:
+        background_tasks.add_task(
+            db.save_idempotent_response, org_id, idempotency_key, "protect-output",
             200, final_response.model_dump(),
         )
 

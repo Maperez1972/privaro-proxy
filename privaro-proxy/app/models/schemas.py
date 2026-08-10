@@ -77,6 +77,36 @@ class DetectRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=50000)
 
 
+class ProtectOutputRequest(BaseModel):
+    """
+    Added 2026-08 — output-direction PII detection for customers who call
+    POST /v1/proxy/protect themselves and then make their OWN LLM call
+    elsewhere (as opposed to /v1/relay/complete, where Privaro makes the
+    LLM call and can scan the response inline). Those customers get their
+    LLM's raw response back with no Privaro involvement at all today —
+    this endpoint lets them hand that response back to Privaro for the
+    same PII scan, before they return it to their own end user.
+    """
+    pipeline_id: str
+    response_text: str = Field(..., min_length=1, max_length=50000)
+    options: ProxyOptions = ProxyOptions()
+    conversation_id: Optional[str] = None
+
+    _validate_conv_id = field_validator("conversation_id")(_validate_conversation_id)
+
+    @model_validator(mode="after")
+    def _require_conversation_id_if_reversible(self):
+        if self.options.reversible and not self.conversation_id:
+            raise ValueError(
+                "conversation_id is required when options.reversible is true "
+                "(the default) — same reasoning as ProtectRequest: a token "
+                "like [NM-0001] is not unique across unrelated requests over "
+                "time. Pass the same conversation_id used for this "
+                "conversation's /protect call, or set options.reversible=false."
+            )
+        return self
+
+
 class Detection(BaseModel):
     type: str
     severity: str
@@ -87,6 +117,17 @@ class Detection(BaseModel):
     confidence: float = 1.0
     detector: str = "regex"
     regulation_ref: Optional[str] = None   # set by policy engine when a rule matches
+
+
+class ProtectOutputResponse(BaseModel):
+    request_id: str
+    protected_response: str
+    detections: List[Detection]
+    stats: Dict[str, Any]
+    audit_log_id: Optional[str] = None
+    gdpr_compliant: bool = True
+    scan_mode: str = "shadow"
+    response_modified: bool = False
 
 
 class ProtectResponse(BaseModel):

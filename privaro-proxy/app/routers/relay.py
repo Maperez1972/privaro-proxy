@@ -105,6 +105,12 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
 
         for d in reversed(detections):
             if d.start is None or d.end is None:
+                # Same root-cause fix as proxy.py's _apply_tokenization and
+                # this file's own _scan_output_for_pii (2026-08): silently
+                # skipping here left the detection unmasked in the text
+                # that actually went to the LLM, with nothing ever
+                # recording it — why total_leaked read 0 everywhere.
+                d.action = "leaked"
                 continue
             original_value = msg.content[d.start:d.end]
 
@@ -166,6 +172,156 @@ async def _protect_messages(messages, org_id, pipeline_id, provider, sector, use
     return protected_messages, all_detections, token_map, provider_risk_level, token_rows
 
 
+async def _scan_output_for_pii(
+    raw_response: str,
+    org_id: str,
+    pipeline_id: str,
+    provider: str,
+    sector: str,
+    user_role: str,
+    mode: str,
+    shadow: bool,
+    conversation_id: Optional[str] = None,
+) -> "OutputScanResult":
+    """
+    Added 2026-08 — output-direction PII detection.
+
+    Confirmed via a direct audit of production data before writing this:
+    conversation_messages had 1,175 PII detections across 76 user-role
+    (input) messages and ZERO across 78 assistant-role (output) messages;
+    pipelines.total_leaked was 0 across every single pipeline. The
+    detector was never invoked on what the LLM sends back — only on what
+    goes in. This closes that gap for the /v1/relay/* path, which is the
+    one place Privaro already has the raw LLM response in hand (customers
+    using /v1/proxy/protect standalone get the equivalent via the new
+    POST /v1/proxy/protect-output endpoint, since Privaro never sees
+    their LLM's response on that path).
+
+    Runs the SAME regex/NLP detector used on input against the model's
+    RAW response — i.e. BEFORE de-tokenising the caller's own [XX-0001]
+    placeholders back to real values. Those placeholders never match a
+    PII pattern, so this only ever flags genuinely NEW sensitive data
+    that surfaced in the response itself: RAG/tool-call context leakage,
+    cross-tenant contamination, or model memorisation — never data the
+    caller already authorised earlier in the same conversation.
+
+    Gated by pipeline.output_scanning_enabled (default false in the DB) —
+    deploying this code changes nothing for any existing pipeline until a
+    customer is explicitly opted in. output_scanning_mode='shadow'
+    (the default once enabled) detects and audit-logs without altering
+    the response, for safe validation before flipping to 'enforce'.
+    """
+    policies = await db.get_policy_rules(org_id, pipeline_id=pipeline_id) or []
+    provider_trust = await db.get_provider_trust(provider, org_id)
+    policy_context = {
+        "provider": provider,
+        "user_role": user_role,
+        "data_region": (provider_trust or {}).get("data_region", "EU"),
+        "agent_mode": False,
+        "pipeline_sector": sector,
+        "default_action": mode,
+        "direction": "output",
+    }
+
+    detections = detector.detect(raw_response)
+    if detections and policies:
+        detections = pe.apply_policies(detections, policies, policy_context)
+    elif detections:
+        for d in detections:
+            d.action = mode if mode in ("tokenise", "anonymise", "block") else "tokenised"
+
+    if not detections:
+        return OutputScanResult(raw_response, [], False, [])
+
+    if shadow:
+        # Detect + classify for audit purposes only. Response text returned
+        # unmodified — this is the safe default for a pipeline's first
+        # output-scanning period.
+        return OutputScanResult(raw_response, detections, False, [])
+
+    scanned = raw_response
+    counters: Dict[str, int] = {}
+    vault_rows: List[Dict[str, Any]] = []
+    enc_key = None
+    enc_key_id = None
+    if conversation_id and any(d.action in ("tokenised", "pseudonymised", "tokenise") for d in detections):
+        enc_key_id = await get_org_default_key_id(org_id)
+        try:
+            enc_key = await resolve_encryption_key(enc_key_id, org_id)
+        except Exception as e:
+            print(f"[Vault] Key resolution failed (output scan), falling back to managed: {e}")
+            from app.services.key_manager import _get_managed_key
+            enc_key = _get_managed_key()
+            enc_key_id = "key-v1"
+
+    for d in reversed(detections):
+        if d.start is None or d.end is None:
+            # Detected but couldn't be masked (no reliable span) — this IS
+            # a real leak, not a silent no-op. Root-cause fix alongside
+            # this feature: previously such detections were just skipped
+            # with no state change at all, which is exactly why
+            # pipelines.total_leaked has read 0 everywhere in production —
+            # nothing ever set this action, on input OR output.
+            d.action = "leaked"
+            continue
+
+        original_value = raw_response[d.start:d.end]
+
+        if d.action in ("tokenised", "pseudonymised", "tokenise"):
+            entity_type = d.type
+            counters[entity_type] = counters.get(entity_type, 0) + 1
+            prefix = PREFIX_MAP.get(entity_type, entity_type[:2].upper())
+            token = f"[{prefix}-{counters[entity_type]:04d}]"
+            d.token = token
+            d.action = "tokenised"
+            scanned = scanned[:d.start] + token + scanned[d.end:]
+
+            if enc_key:
+                try:
+                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                    aesgcm = AESGCM(enc_key)
+                    nonce = os.urandom(12)
+                    ciphertext = aesgcm.encrypt(nonce, original_value.encode("utf-8"), None)
+                    encrypted = base64.b64encode(nonce + ciphertext).decode("utf-8")
+                    vault_rows.append({
+                        "org_id": org_id, "pipeline_id": pipeline_id,
+                        "entity_type": entity_type, "token_value": token,
+                        "encrypted_original": encrypted,
+                        "original_value_hash": hashlib.sha256(original_value.encode("utf-8")).hexdigest(),
+                        "encryption_key_id": enc_key_id, "is_reversible": True,
+                        "access_roles": ["admin", "dpo"], "conversation_id": conversation_id,
+                    })
+                except Exception as e:
+                    print(f"[Vault] Encryption error (output scan): {e}")
+        elif d.action in ("anonymised", "anonymise"):
+            d.action = "anonymised"
+            label = PREFIX_MAP.get(d.type, d.type[:2].upper())
+            scanned = scanned[:d.start] + f"[{label}-REDACTED]" + scanned[d.end:]
+        elif d.action == "blocked":
+            # Span-level redaction, not whole-response blocking: unlike
+            # /protect (a prompt with a hole is useless — you can't send a
+            # half-prompt to an LLM), a response is already generated, so
+            # masking just the offending span keeps the rest of an
+            # otherwise-fine answer usable rather than discarding it
+            # entirely.
+            scanned = scanned[:d.start] + f"[BLOCKED:{d.type.upper()}]" + scanned[d.end:]
+        # else: passed / no-op — leave text as-is
+
+    return OutputScanResult(scanned, detections, True, vault_rows)
+
+
+class OutputScanResult:
+    """Small typed tuple substitute — keeps the 4 return values self-documenting
+    at every call site instead of an anonymous tuple."""
+    __slots__ = ("text", "detections", "modified", "vault_rows")
+
+    def __init__(self, text, detections, modified, vault_rows):
+        self.text = text
+        self.detections = detections
+        self.modified = modified
+        self.vault_rows = vault_rows
+
+
 class RelayMessage(BaseModel):
     role: str = Field(..., description="user | assistant | system")
     content: str = Field(..., min_length=1, max_length=50000)
@@ -213,6 +369,15 @@ class RelayResponse(BaseModel):
     usage: Dict[str, Any] = {}
     processing_ms: int = 0
     compression_stats: Dict[str, Any] = {}
+    # Added 2026-08 — output-direction PII scan. All zero/None/false when
+    # the pipeline hasn't opted into output_scanning_enabled (the default),
+    # so existing integrations parsing this response see no shape change.
+    output_pii_detected: int = 0
+    output_pii_masked: int = 0
+    output_pii_leaked: int = 0
+    output_scan_mode: Optional[str] = None
+    output_response_modified: bool = False
+    output_audit_log_id: Optional[str] = None
 
 
 @router.post("/complete", response_model=RelayResponse)
@@ -315,9 +480,36 @@ async def relay_complete(
             }
         )
 
-    # ── 4. De-tokenise response ───────────────────────────────────────────────
+    # ── 3b. Output-direction PII scan (added 2026-08) ─────────────────────────
+    # Runs on the RAW response, BEFORE de-tokenising — see _scan_output_for_pii
+    # docstring. Strictly opt-in per pipeline (output_scanning_enabled), so
+    # this is a no-op for every pipeline that hasn't been explicitly migrated.
     raw_response = llm_result["content"]
-    final_response = raw_response
+    output_detections: List = []
+    output_scan_modified = False
+    output_vault_rows: List[Dict[str, Any]] = []
+    scanned_response = raw_response
+
+    if pipeline.get("output_scanning_enabled"):
+        shadow = pipeline.get("output_scanning_mode", "shadow") != "enforce"
+        scan_result = await _scan_output_for_pii(
+            raw_response, org_id, body.pipeline_id, provider,
+            pipeline.get("sector", "general"), key_record.get("role", "developer"),
+            body.options.mode, shadow=shadow, conversation_id=body.conversation_id,
+        )
+        scanned_response = scan_result.text
+        output_detections = scan_result.detections
+        output_scan_modified = scan_result.modified
+        output_vault_rows = scan_result.vault_rows
+        if output_vault_rows:
+            background_tasks.add_task(db.insert_tokens_batch, output_vault_rows)
+
+    # ── 4. De-tokenise response ───────────────────────────────────────────────
+    # Runs on scanned_response (post output-scan) rather than the raw LLM
+    # text, so a caller's own [XX-0001] placeholders are restored to real
+    # values as before, while anything the output scan just masked stays
+    # masked.
+    final_response = scanned_response
     tokens_replaced = 0
 
     if body.options.detokenise_response and token_map:
@@ -327,6 +519,74 @@ async def relay_complete(
                 tokens_replaced += 1
 
     processing_ms = int((time.monotonic() - t0) * 1000)
+
+    # ── 4b. Output-scan audit log (separate row, direction='output') ─────────
+    # Kept distinct from the primary relay_complete audit_log below (which
+    # stays exactly as it was, direction='input') so existing dashboards/
+    # DPO reports that already read that row's shape are unaffected.
+    output_audit_log_id: Optional[str] = None
+    if output_detections:
+        output_stats = detector.build_stats(output_detections, 0)
+        output_risk_score = pe.compute_risk_score(output_detections, provider_risk_level, False, output_stats["leaked"])
+        output_event_type = "output_pii_leaked" if output_stats["leaked"] > 0 else "output_pii_detected"
+        output_audit_log_id = await db.insert_audit_log({
+            "org_id": org_id,
+            "pipeline_id": body.pipeline_id,
+            "event_type": output_event_type,
+            "entity_type": output_detections[0].type,
+            "entity_category": pe._get_category(output_detections[0].type),
+            "action_taken": output_detections[0].action,
+            "severity": "high" if output_risk_score > 0.7 else "medium" if output_risk_score > 0.4 else "low",
+            "prompt_hash": hashlib.sha256(raw_response.encode()).hexdigest(),
+            "pipeline_stage": "relay_output",
+            "processing_ms": processing_ms,
+            "ibs_status": "pending",
+            "source": "relay",
+            "direction": "output",
+            "risk_score": output_risk_score,
+            "agent_mode": False,
+            "conversation_id": body.conversation_id,
+            "metadata": {
+                "request_id": request_id,
+                "provider": provider,
+                "model": llm_result["model"],
+                "total_detected": output_stats["total_detected"],
+                "total_masked": output_stats["total_masked"],
+                "leaked": output_stats["leaked"],
+                "by_type": output_stats["by_type"],
+                "scan_mode": pipeline.get("output_scanning_mode", "shadow"),
+                "response_modified": output_scan_modified,
+            },
+        })
+        if output_audit_log_id:
+            background_tasks.add_task(
+                db.insert_pii_detections,
+                [{
+                    "audit_log_id": output_audit_log_id,
+                    "org_id": org_id,
+                    "entity_type": d.type,
+                    "original_length": (d.end - d.start) if d.start is not None else None,
+                    "token_ref": d.token,
+                    "start_offset": d.start,
+                    "end_offset": d.end,
+                    "confidence_score": d.confidence,
+                    "detector_used": d.detector,
+                    "detector_version": "regex-v1",
+                    "direction": "output",
+                    "risk_score": pe.ENTITY_RISK_WEIGHTS.get(d.type, 0.3),
+                    "conversation_id": body.conversation_id,
+                    "decision_reason": f"Output scan: {d.action} for {d.type} (mode={pipeline.get('output_scanning_mode', 'shadow')})",
+                } for d in output_detections],
+            )
+            background_tasks.add_task(ibs.certify_audit_log, output_audit_log_id, org_id, {"request_id": request_id})
+        background_tasks.add_task(
+            db.increment_pipeline_counters,
+            body.pipeline_id,
+            output_stats["total_detected"],
+            output_stats["total_masked"],
+            output_stats["leaked"],
+            0,
+        )
 
     # ── 5. Audit log ──────────────────────────────────────────────────────────
     primary_msg = body.messages[0].content if body.messages else ""
@@ -378,6 +638,12 @@ async def relay_complete(
         usage=llm_result.get("usage", {}),
         processing_ms=processing_ms,
         compression_stats=compression_stats,
+        output_pii_detected=len(output_detections),
+        output_pii_masked=sum(1 for d in output_detections if d.action in ("tokenised", "anonymised", "blocked")),
+        output_pii_leaked=sum(1 for d in output_detections if d.action == "leaked"),
+        output_scan_mode=pipeline.get("output_scanning_mode") if pipeline.get("output_scanning_enabled") else None,
+        output_response_modified=output_scan_modified,
+        output_audit_log_id=output_audit_log_id,
     )
 
     if idempotency_key:

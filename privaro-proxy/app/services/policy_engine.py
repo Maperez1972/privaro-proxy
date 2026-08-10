@@ -73,6 +73,18 @@ def _matches_context(rule: Dict, context: Dict) -> bool:
     if rule.get("agent_mode_only") and not context.get("agent_mode", False):
         return False
 
+    # Direction filtering (added 2026-08 — output PII detection).
+    # A rule scoped to 'input' or 'output' only fires for a matching
+    # context direction; 'both' (or an unset/legacy value, which the
+    # migration backfilled to 'input') always applies to input contexts,
+    # preserving pre-existing behavior for every rule that existed before
+    # this feature. Rules must be explicitly authored/edited with
+    # direction='output' or 'both' to ever fire against LLM responses.
+    rule_direction = rule.get("direction") or "input"
+    context_direction = context.get("direction", "input")
+    if rule_direction != "both" and rule_direction != context_direction:
+        return False
+
     rule_category = rule.get("category")
     entity_category = context.get("entity_category", "personal")
     if rule_category and rule_category != "all" and rule_category != entity_category:
