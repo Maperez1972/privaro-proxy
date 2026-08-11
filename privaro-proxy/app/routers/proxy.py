@@ -878,6 +878,7 @@ TOKEN_PREFIX = {
     "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT", "ssn": "SS",
     "passport": "PP",
     "money": "MN",
+    "license_plate": "LP",
 }
 
 def _make_token(entity_type: str, counter: int) -> str:

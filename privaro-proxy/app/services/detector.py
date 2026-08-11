@@ -299,6 +299,20 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
          re.IGNORECASE
      ),
      0.85),
+
+    # Spanish vehicle license plate — current national format since Sep 2000
+    # (confirmed against DGT/press sources 2026-08-11): 4 digits + 3
+    # consonants, no vowels, no Ñ/Q (avoids visual/reading confusion). Added
+    # 2026-08-11 — real gap found: a plate uniquely identifies a specific
+    # vehicle and, via DGT lookup, its owner/driver — exactly why plates are
+    # always pixelated in photos, dashcam footage, journalism, etc. It's a
+    # direct identifier (like DNI/IBAN), not a mere quasi-identifier like a
+    # name or birth date alone. Optional space/hyphen between the digit and
+    # letter blocks (both appear on real plates/photos depending on spacing
+    # and OCR read).
+    ("license_plate", "high",
+     re.compile(r'\b\d{4}[\s-]?[BCDFGHJKLMNPRSTVWXYZ]{3}\b'),
+     0.9),
 ]
 
 # ── Severity → category mapping ─────────────────────────────────────────────
@@ -312,6 +326,7 @@ ENTITY_CATEGORY = {
     "full_name": "personal",
     "ip_address": "personal",
     "date_of_birth": "personal",
+    "license_plate": "personal",
     "ssn": "personal",
     "passport": "personal",
 }
@@ -331,6 +346,7 @@ TOKEN_PREFIX = {
     "ssn": "SS",
     "passport": "PP",
     "money": "MN",
+    "license_plate": "LP",
 }
 
 
