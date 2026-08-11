@@ -2,13 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for spaCy
+# System deps for spaCy + Tesseract OCR (image-document protection, Tier 1 —
+# 2026-08-11). tesseract-ocr-spa is the Spanish language pack; without it
+# Tesseract defaults to English-only recognition, which would badly hurt
+# accuracy on Spanish documents (DNI, direcciones, etc.) — exactly the
+# real-world case this feature targets.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ && \
+    gcc g++ tesseract-ocr tesseract-ocr-spa && \
     rm -rf /var/lib/apt/lists/*
 
 # Cache bust — increment to force full rebuild including pip + spacy model
-ARG CACHE_BUST=23
+ARG CACHE_BUST=24
 RUN echo "Cache bust: $CACHE_BUST"
 
 # Install Python deps (including Presidio + spaCy)

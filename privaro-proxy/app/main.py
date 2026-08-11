@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import proxy, health, webhooks, agent, document, relay
+from app.routers import proxy, health, webhooks, agent, document, relay, image_document
 from app.config import settings
 from app.services import ibs
 
@@ -75,6 +75,7 @@ app.include_router(webhooks.router, prefix="/v1/webhooks", tags=["Webhooks"])
 app.include_router(agent.router, tags=["Agent API"])
 app.include_router(relay.router, tags=["relay"])
 app.include_router(document.router, prefix="/v1/proxy", tags=["Document"])
+app.include_router(image_document.router, prefix="/v1/proxy", tags=["ImageDocument"])
 
 # Phase 13 — BYOK / Key Management
 from app.routers import byok
