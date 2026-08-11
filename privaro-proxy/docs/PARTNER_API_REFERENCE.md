@@ -292,6 +292,62 @@ Para forzar el tipo de un campo por su nombre (en vez de depender solo del conte
 
 ---
 
+## 10.5. POST /v1/proxy/protect-document — documentos de texto (PDF, Excel, CSV, Word, email)
+
+Multipart/form-data en vez de JSON — subís el archivo directamente, extraemos el texto y lo protegemos con el mismo motor que `/protect`.
+
+```
+POST /v1/proxy/protect-document
+Headers: X-Privaro-Key: prvr_xxxxx
+Body (multipart/form-data):
+  file: <archivo> (PDF, xlsx, csv, docx, eml — máx. 20MB)
+  pipeline_id: string
+  conversation_id: UUID (opcional, obligatorio si reversible=true)
+  mode: tokenise | anonymise | block (default: tokenise)
+  reversible: bool (default: true)
+```
+
+**Respuesta (200):** igual forma que `/protect`, más `document_format` y `extracted_chars`.
+
+---
+
+## 10.6. POST /v1/proxy/protect-image-document — documentos fotografiados o escaneados (DNI, contratos, capturas)
+
+Igual que `/protect-document`, pero para imágenes (jpeg, png, webp, tiff — máx. 15MB). OCR con Tesseract (español + inglés), mismo motor de detección/políticas, y además devuelve la imagen con las regiones sensibles tapadas.
+
+```
+POST /v1/proxy/protect-image-document
+Headers: X-Privaro-Key: prvr_xxxxx
+Body (multipart/form-data):
+  file: <imagen>
+  pipeline_id: string
+  conversation_id: UUID (opcional, obligatorio si reversible=true)
+  mode: tokenise | anonymise | block (default: tokenise)
+  reversible: bool (default: true)
+  return_redacted_image: bool (default: true) — false si solo necesitáis el texto
+```
+
+**Respuesta (200):**
+```json
+{
+  "request_id": "req_xxxxxxxx",
+  "protected_text": "...",
+  "redacted_image_base64": "...",
+  "detections": [...],
+  "stats": {...},
+  "ocr_quality": {
+    "avg_confidence": 94.7,
+    "min_confidence": 60,
+    "low_confidence_word_pct": 5.0
+  },
+  "audit_log_id": "uuid"
+}
+```
+
+`ocr_quality` os indica cuánto confiar en el resultado — con fotos borrosas o mal iluminadas, la confianza baja y conviene pedir una foto mejor en vez de asumir cobertura completa. **De momento solo Tesseract (sin OCR en la nube de refuerzo)** — si vuestro caso de uso son fotos de móvil con mala iluminación en volumen alto, avisadnos para evaluar si hace falta reforzar esto antes de que lo deis por definitivo en producción.
+
+---
+
 ## 11. Errores comunes
 
 | Código | Significado |
