@@ -321,3 +321,19 @@ En `/complete` se puede escanear la respuesta ANTES de devolverla — hay margen
 ### Pendiente
 
 - Si un cliente necesita **enforcement real** en streaming, la única solución honesta es desactivar streaming en ese pipeline (`organizations.streaming_enabled`, ya existe) y usar `/complete`, o aceptar latencia añadida con un buffer de N segundos antes de empezar a emitir — no construido, requiere decisión de producto.
+
+---
+
+## Protección de imagen-documento — Tier 1 OCR con Tesseract (2026-08-11)
+
+Nuevo endpoint `POST /v1/proxy/protect-image-document` para documentos fotografiados/escaneados (DNI, contratos, capturas de pantalla): OCR con Tesseract (spa+eng, cajas de palabra + confianza), reconstrucción de texto completo, el mismo motor de detección/políticas que `/protect` y `/protect-document` sin ningún cambio, mapeo de cada detección a las cajas de píxeles que cubre, y redacción de esas regiones con rectángulos negros sobre la imagen.
+
+Decisión de negocio deliberada: **solo Tier 1 (Tesseract), sin fallback a OCR en la nube todavía** — con un solo cliente en producción y sin datos reales sobre cómo se comporta Tesseract con fotos reales (vs. documentos escaneados limpios), construir una escalada de pago a un OCR en la nube ahora sería adivinar el balance de coste sin datos. La respuesta del endpoint incluye un bloque `ocr_quality` explícito (confianza media/mínima, % de palabras de baja confianza) precisamente para que el uso real informe si Tier 2 merece la pena construirse, y en su caso, a partir de qué umbral de confianza activarlo.
+
+**2 bugs reales encontrados durante la verificación end-to-end** (no solo revisión de código — desplegado, probado con una petición real, y depurado con logs reales de Railway ante un 500):
+- `find_existing_token()` se llamaba con el parámetro `encrypted_value` (que nunca existió con ese nombre real, y que además nunca podría haber funcionado — AES-256-GCM usa un nonce aleatorio, así que el mismo texto nunca produce el mismo cifrado dos veces). Copiado literalmente del patrón ya existente en `document.py`, que tenía el mismo bug latente sin detonar en producción hasta ahora. `proxy.py` y `relay.py` ya se habían arreglado correctamente el 23/07; `document.py` nunca recibió ese mismo arreglo.
+- Consecuencia del mismo bug: `original_value_hash` tampoco se guardaba nunca al insertar el token, así que aunque se hubiera corregido solo el nombre del parámetro, la reutilización de tokens dentro de una misma conversación en `/protect-document` nunca habría funcionado en silencio — arreglado en ambos archivos.
+
+Dockerfile: añadidos `tesseract-ocr` + `tesseract-ocr-spa` (el paquete de español es imprescindible — sin él, la precisión en documentos españoles, el caso de uso completo de esta función, se vería muy afectada). `requirements.txt`: `pytesseract` + `Pillow`.
+
+Verificado con una imagen sintética de prueba (nombre, DNI, teléfono, email, dirección) tanto en lógica aislada como en producción real tras el despliegue: reconstrucción de texto con offsets correctos, mapeo de detección→píxeles correcto (un nombre de 3 palabras mapeó a exactamente 3 cajas), y la imagen redactada resultante confirmada visualmente — los 4 campos sensibles correctamente tapados, sin desplazamiento ni solapamiento con las etiquetas.
