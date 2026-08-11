@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 import app.services.supabase as db
 import app.services.policy_engine as pe
 import app.services.detector as detector
-from app.services.auth import verify_api_key_or_dev
+from app.services.auth import verify_api_key_or_internal
 from app.config import settings
 
 from fastapi import BackgroundTasks
@@ -115,7 +115,7 @@ class AgentRunEndResponse(BaseModel):
 @router.post("/run/start", response_model=AgentRunStartResponse)
 async def agent_run_start(
     body: AgentRunStartRequest,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """Create an agent run. Returns agent_run_id for subsequent /agent/protect calls."""
     pipeline = await db.get_pipeline(body.pipeline_id)
@@ -143,7 +143,7 @@ async def agent_run_start(
 async def agent_protect(
     body: AgentProtectRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """
     Protect a step in an agent run.
@@ -311,7 +311,7 @@ async def agent_protect(
 @router.post("/reveal", response_model=AgentRevealResponse)
 async def agent_reveal(
     body: AgentRevealRequest,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """
     Detokenise text using the token map of an agent run.
@@ -371,7 +371,7 @@ async def agent_reveal(
 async def agent_run_end(
     body: AgentRunEndRequest,
     background_tasks: BackgroundTasks,
-    key_record: Dict[str, Any] = Depends(verify_api_key_or_dev),
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
 ):
     """Close an agent run. Updates status and finalises aggregated counters."""
     run = await db.get_agent_run(body.agent_run_id, key_record["org_id"])
