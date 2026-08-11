@@ -35,6 +35,23 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
     # NIE has a leading X/Y/Z and exactly 7 digits. The standalone branch
     # now requires the correct digit count for each shape instead of always
     # demanding 8.
+    #
+    # Checksum validation added 2026-08-11 (real request, not speculative):
+    # verified during a real test that a genuine DNI's control letter can
+    # go completely unread by Tesseract on a real phone photo — that's an
+    # OCR-quality limitation this regex can't fix (the character simply
+    # isn't in the extracted text), but it exposed that the bare-number
+    # branches had no way to tell a real DNI/NIE from a random 8-digit
+    # number that happens to be followed by any letter — a plain shape
+    # match alone risks both false positives (random digits + letter) and
+    # gives no extra confidence signal. Spain's real check-letter algorithm
+    # (mod 23 over the digits, RD 1553/2005) is cheap to verify and, when
+    # it matches, all but rules out coincidence (~1/23 odds for a random
+    # combination) — so detections are now split into "verified" (checksum
+    # matches, confidence 0.99) and "unverified shape match" (looks right
+    # but checksum doesn't match — still flagged, since a mistyped/OCR'd
+    # digit is far more likely than this shape occurring on an unrelated
+    # random string, just at slightly lower confidence).
     ("dni", "critical",
      re.compile(
          r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b'
@@ -322,6 +339,32 @@ def _make_token(entity_type: str, counter: int) -> str:
     return f"[{prefix}-{counter:04d}]"
 
 
+def _verify_spanish_id_checksum(value: str) -> bool:
+    """
+    Verifies a Spanish DNI/NIE control letter via the real mod-23 algorithm
+    (RD 1553/2005): letter = "TRWAGMYFPDXBNJZSQVHLCKE"[digits % 23]. For NIE,
+    the leading X/Y/Z is substituted with 0/1/2 before the modulo. Verified
+    2026-08-11 against the official table (cross-checked across multiple
+    independent sources) before relying on it to raise confidence.
+    Returns False (not raises) on any malformed input — this only ever
+    upgrades/downgrades confidence, never blocks a detection outright.
+    """
+    LETTERS = "TRWAGMYFPDXBNJZSQVHLCKE"
+    value = value.strip().upper()
+    if len(value) < 8:
+        return False
+    leading = value[0]
+    nie_substitution = {"X": "0", "Y": "1", "Z": "2"}
+    if leading in nie_substitution:
+        digits_str = nie_substitution[leading] + value[1:-1]
+    else:
+        digits_str = value[:-1]
+    letter = value[-1]
+    if not digits_str.isdigit() or not letter.isalpha():
+        return False
+    return LETTERS[int(digits_str) % 23] == letter
+
+
 def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] = None) -> List[Detection]:
     """
     Hybrid detection: Tier 1 (regex) + Tier 1.5 (custom org/pipeline patterns)
@@ -385,6 +428,18 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
             if entity_type == "full_name" and _TITLE_ONLY_RE.match(text[start:end]):
                 continue
 
+            detection_confidence = confidence
+            if entity_type == "dni":
+                # Checksum-verified DNI/NIE gets top confidence (0.99 — a
+                # random string matching this shape AND passing mod-23 is
+                # ~1/23 odds); one that matches the shape but fails checksum
+                # keeps the base 0.95 rather than being discarded outright,
+                # since a single OCR-misread digit is far likelier than an
+                # unrelated random match, and this is exactly the pattern
+                # that gets tokenised on production DNI photos today.
+                raw_value = text[start:end]
+                detection_confidence = 0.99 if _verify_spanish_id_checksum(raw_value) else confidence
+
             seen_spans.append((start, end))
             detections.append(Detection(
                 type=entity_type,
@@ -393,7 +448,7 @@ def detect(text: str, use_nlp: bool = True, custom_rules: Optional[List[Dict]] =
                 token=None,
                 start=start,
                 end=end,
-                confidence=confidence,
+                confidence=detection_confidence,
                 detector="regex",
             ))
 
