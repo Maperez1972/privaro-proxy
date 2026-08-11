@@ -348,6 +348,66 @@ Body (multipart/form-data):
 
 ---
 
+## 10.7. POST /v1/proxy/protect-output — escaneo de la respuesta del LLM
+
+Pensado específicamente para quienes **no usáis `/v1/relay/complete`** — es decir, protegéis el prompt con `/protect` y luego hacéis vuestra propia llamada al LLM que sea (como hacéis vosotros). En ese caso, la respuesta del modelo nunca pasa por ningún escaneo de Privaro hoy — este endpoint cierra ese hueco: le entregáis la respuesta cruda de vuestro LLM, y os decimos si contiene PII antes de que la devolváis a vuestro propio usuario final.
+
+```
+POST /v1/proxy/protect-output
+Headers: X-Privaro-Key: prvr_xxxxx
+Body:
+{
+  "pipeline_id": "string",
+  "response_text": "string (respuesta cruda del LLM)",
+  "conversation_id": "UUID (opcional)"
+}
+```
+
+**⚠️ Importante — hay que activarlo por pipeline antes de poder usarlo.** Si `output_scanning_enabled` no está activado en el pipeline, el endpoint devuelve `403 output_scanning_disabled`. Pedidnos que os lo activemos.
+
+**⚠️ Más importante todavía — el modo por defecto es `shadow`, no `enforce`.** En modo `shadow` (el que tenéis salvo que pidáis lo contrario), el endpoint **detecta y audita, pero nunca modifica el texto que os devuelve** (`response_modified: false` siempre) — es puramente observacional, pensado para que midáis cuánto PII sale realmente de vuestro LLM antes de decidir bloquear nada. Solo con `output_scanning_mode: "enforce"` configurado en el pipeline, la respuesta que os devolvemos sí sale con la PII detectada tokenizada de verdad. Si asumís que llamar a este endpoint ya os protege activamente sin haber pedido el modo `enforce`, no es así.
+
+**Respuesta (200):**
+```json
+{
+  "request_id": "req_xxxxxxxx",
+  "protected_response": "...",
+  "detections": [...],
+  "stats": {...},
+  "audit_log_id": "uuid",
+  "gdpr_compliant": true,
+  "scan_mode": "shadow",
+  "response_modified": false
+}
+```
+
+Ya soportado en ambos SDKs oficiales: `client.protectOutput(...)` (JS), `client.protect_output(...)` (Python).
+
+---
+
+## 10.8. GET /v1/relay/providers
+
+Lista los proveedores de LLM y modelos soportados por el relay. Sin body, misma autenticación `X-Privaro-Key`.
+
+---
+
+## 10.9. API de agente — sesiones multi-paso con tokens consistentes
+
+Para agentes que ejecutan varios pasos (llamadas a herramientas, sub-tareas) dentro de la misma tarea, y necesitan que el mismo dato real reciba siempre el mismo token a lo largo de todo el run — no solo dentro de una conversación de chat.
+
+- `POST /v1/agent/run/start` — abre un run, devuelve `agent_run_id`.
+- `POST /v1/agent/protect` — protege un paso (prompt + salidas de herramientas opcionales), scopeado al run.
+- `POST /v1/agent/reveal` — destokeniza el resultado final de un run completo.
+- `POST /v1/agent/run/end` — cierra el run y finaliza los contadores.
+
+Soporte en los SDKs oficiales, vía una clase de sesión dedicada:
+- JS: `new AgentRun({ apiKey, pipelineId })` → `.protect(...)`, `.reveal(...)`
+- Python: `with AgentRun(...) as run:` → `.reveal(...)`, `.end(...)`
+
+**Nota de estado (2026-08-11):** ninguno de los dos SDKs llama todavía a `/v1/agent/run/start` ni `/v1/agent/run/end` explícitamente — si necesitáis gestionar el ciclo de vida completo del run (no solo protect/reveal), llamad a esos dos directamente por HTTP hasta que el SDK los incorpore.
+
+---
+
 ## 11. Errores comunes
 
 | Código | Significado |
@@ -355,6 +415,7 @@ Body (multipart/form-data):
 | 401 `missing_api_key` / `invalid_api_key` | Falta la cabecera `X-Privaro-Key` o la clave no es válida/está revocada |
 | 403 `pipeline_org_mismatch` | El `pipeline_id` no pertenece a la organización de esa clave |
 | 403 `partner_permission_required` / `partner_write_permission_required` | Vuestra clave no tiene el permiso necesario para ese endpoint |
+| 403 `output_scanning_disabled` | Llamasteis a `/protect-output` sin tener `output_scanning_enabled` activado en el pipeline — pedidnos que lo activemos |
 | 404 `pipeline_not_found` | El `pipeline_id` no existe |
 | 404 `sub_account_not_found` | El `org_id` no existe o no es hijo de vuestra organización |
 | 502 `llm_provider_error` | El proveedor del LLM devolvió un error (clave inválida, cuota agotada, etc. — el campo `message` trae el detalle) |
