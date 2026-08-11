@@ -337,3 +337,33 @@ Decisión de negocio deliberada: **solo Tier 1 (Tesseract), sin fallback a OCR e
 Dockerfile: añadidos `tesseract-ocr` + `tesseract-ocr-spa` (el paquete de español es imprescindible — sin él, la precisión en documentos españoles, el caso de uso completo de esta función, se vería muy afectada). `requirements.txt`: `pytesseract` + `Pillow`.
 
 Verificado con una imagen sintética de prueba (nombre, DNI, teléfono, email, dirección) tanto en lógica aislada como en producción real tras el despliegue: reconstrucción de texto con offsets correctos, mapeo de detección→píxeles correcto (un nombre de 3 palabras mapeó a exactamente 3 cajas), y la imagen redactada resultante confirmada visualmente — los 4 campos sensibles correctamente tapados, sin desplazamiento ni solapamiento con las etiquetas.
+
+---
+
+## Tier 2 (OCR en la nube) — exploración para decidir más adelante, 2026-08-11
+
+Motivado por una prueba real con un DNI fotografiado desde el móvil (no una imagen sintética): Tesseract confundió el carácter final del número de DNI, leyendo "4" donde había una "A" — un error de sustitución de caracteres visualmente similares, no un carácter ausente. El propio texto extraído (`542676064` en vez de `54267606A`) confirma que Tesseract puede estar **"confiadamente equivocado"**: no es que fallara en leer nada, es que leyó mal un carácter concreto con aparente normalidad.
+
+### Dos arreglos ya hechos hoy mismo, independientes de la decisión de Tier 2
+
+1. **Checksum del DNI/NIE** (algoritmo módulo 23 real, RD 1553/2005): eleva la confianza a 0.99 cuando la letra cuadra, mantiene la detección a 0.95 cuando no cuadra (más probable un error de OCR/tecleo que una coincidencia aleatoria). Verificado con el ejemplo oficial (12345678 → Z) y recalculado a mano para un NIE. **No habría resuelto el caso concreto de la prueba** — cuando falta o se sustituye el carácter en el texto extraído, ningún regex puede recuperarlo. Confirmado explícitamente para no generar falsas expectativas.
+2. **Nuevo tipo de entidad `license_plate`**: formato español actual (4 dígitos + 3 consonantes, sin vocales/Ñ/Q, vigente desde 2000). Identificador directo (como DNI/IBAN) — permite localizar al propietario/conductor vía DGT, por eso se pixela siempre en fotos/dashcams/prensa. De paso, sincronizado `TOKEN_PREFIX` en los 4 archivos donde estaba duplicado sin importación compartida (`detector.py`, `proxy.py`, `document.py`, `image_document.py`) — `document.py`/`image_document.py` ya estaban desincronizados antes de hoy (les faltaba `money`/`passport`, no solo `license_plate`).
+
+### La decisión pendiente — Tier 2
+
+**Opciones de proveedor evaluadas:**
+
+| | Google Cloud Vision / AWS Textract | BlinkID (Microblink), self-hosted |
+|---|---|---|
+| Coste | ~$1,50/1.000 imágenes, 1.000 gratis/mes — prácticamente gratis al volumen actual | Sin precio público, venta enterprise/contrato |
+| Integración | API REST self-service, sin contrato | Proceso de venta más lento |
+| Especialización en documentos de identidad | OCR genérico, mejor que Tesseract en fotos reales, sin corrección específica de campos | Corrección inteligente de caracteres específica para IDs — exactamente la clase de error (A↔4) encontrado hoy. 2.500+ tipos de documento, 140+ países, ISO 27001/27701 |
+| **Dónde viven los datos** | La imagen completa sale hacia Google/AWS **sin proteger**, antes de que Privaro pueda tokenizar nada | Se auto-hospeda — los datos nunca salen de la infraestructura de Privaro |
+
+**Tensión conceptual identificada, no solo de coste**: usar un OCR en la nube genérico (Google/AWS) significa mandar el documento de identidad completo, sin ninguna protección, a un tercero antes de poder tokenizar nada — exactamente el tipo de salto de confianza que Privaro existe para evitar con los LLMs. Para clientes de banca/seguros/legal, esto podría ser una objeción real de venta ("¿mandáis mi DNI a Google?"). BlinkID (self-hosted) resuelve esto de raíz, a cambio de mayor coste y un proceso de integración/venta más lento.
+
+**Recomendación cuando se decida construir**: empezar con Google Cloud Vision (barato, rápido, ya mejora la extracción con fotos reales) para validar con volumen bajo; evaluar migrar a algo self-hosted como BlinkID si el volumen de documentos de identidad crece y la privacidad del propio proceso de OCR se convierte en argumento de venta (probable, dados los sectores objetivo).
+
+**Estrategia de activación — más precisa que "confianza baja genérica"**: dado que Tesseract puede estar confiadamente equivocado (el caso de hoy no habría bajado ninguna métrica de confianza agregada), NO basar la escalada solo en `ocr_quality.avg_confidence`. Mejor: escalar específicamente cuando se detecta un patrón "casi-DNI" (8-9 dígitos consecutivos en contexto de documento de identidad) pero el checksum no valida, o cuando no se detecta ningún DNI en absoluto en una imagen que aparenta serlo — esto ataca directamente el campo de mayor valor en vez de disparar por una métrica que puede no reflejar el error real.
+
+**Estado**: sin construir, documentado para decidir cuándo abordarlo.
