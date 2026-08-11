@@ -223,6 +223,7 @@ async def protect_document(
         for d in detections:
             if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
                 original_value = extracted_text[d.start:d.end]
+                original_value_hash = hashlib.sha256(original_value.encode("utf-8")).hexdigest()
                 try:
                     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
                     aesgcm = AESGCM(enc_key)
@@ -233,13 +234,23 @@ async def protect_document(
                     print(f"[Vault] Encryption error: {e}")
                     continue
 
-                # Reuse existing token if conversation-scoped
+                # Fixed 2026-08-11 — found while debugging a sibling endpoint's
+                # 500 error copied from this exact call: find_existing_token()
+                # takes original_value_hash, not encrypted_value (which never
+                # even existed as a real parameter name — this call would have
+                # raised a TypeError the moment it actually ran with a
+                # conversation_id present and a tokenisable detection, a path
+                # apparently never exercised in production testing until now).
+                # Also: original_value_hash was never persisted on insert
+                # below either, so even with the right lookup, nothing would
+                # ever have matched — reuse-within-a-conversation silently
+                # never worked at all.
                 if conversation_id:
                     existing = await db.find_existing_token(
                         org_id=org_id,
                         conversation_id=conversation_id,
                         entity_type=d.type,
-                        encrypted_value=encrypted,
+                        original_value_hash=original_value_hash,
                     )
                     if existing:
                         d.token = existing["token_value"]
@@ -252,6 +263,7 @@ async def protect_document(
                     "token_value": d.token,
                     "encrypted_original": encrypted,
                     "encryption_key_id": "key-v1",
+                    "original_value_hash": original_value_hash,
                     "is_reversible": True,
                     "access_roles": ["admin", "dpo"],
                     "conversation_id": conversation_id,

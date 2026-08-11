@@ -382,6 +382,7 @@ async def protect_image_document(
         for d in detections:
             if d.action == "tokenised" and d.token and d.start is not None and d.end is not None:
                 original_value = extracted_text[d.start:d.end]
+                original_value_hash = hashlib.sha256(original_value.encode("utf-8")).hexdigest()
                 try:
                     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
                     aesgcm = AESGCM(enc_key)
@@ -395,7 +396,7 @@ async def protect_image_document(
                 if conversation_id:
                     existing = await db.find_existing_token(
                         org_id=org_id, conversation_id=conversation_id,
-                        entity_type=d.type, encrypted_value=encrypted,
+                        entity_type=d.type, original_value_hash=original_value_hash,
                     )
                     if existing:
                         d.token = existing["token_value"]
@@ -405,6 +406,7 @@ async def protect_image_document(
                     "org_id": org_id, "pipeline_id": pipeline_id,
                     "entity_type": d.type, "token_value": d.token,
                     "encrypted_original": encrypted, "encryption_key_id": "key-v1",
+                    "original_value_hash": original_value_hash,
                     "is_reversible": True, "access_roles": ["admin", "dpo"],
                     "conversation_id": conversation_id,
                 })
