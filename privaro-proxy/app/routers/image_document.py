@@ -192,6 +192,7 @@ async def protect_image_document(
     include_detections: bool = Form(True),
     reversible: bool = Form(True),
     return_redacted_image: bool = Form(True),
+    extract_only: bool = Form(False),
 ):
     """
     Protect a photographed/scanned document — OCR, detect PII, tokenize
@@ -207,6 +208,15 @@ async def protect_image_document(
       - return_redacted_image: bool (default: true) — set false to skip
         image redaction entirely if only the protected text is needed
         (saves the redaction step, not the OCR step)
+      - extract_only: bool (default: false) — OCR only, no detection, no
+        tokenisation, no audit log, no vault write. Added 2026-08-11 for
+        the chat attachment flow: extracting a preview of an attached
+        image happens BEFORE the user hits send, same as the existing
+        PDF/DOCX text-extraction step — real protection happens once,
+        later, when the full message (text + extracted file content) is
+        sent through protect-chat-message. Calling this endpoint in full
+        mode at attach-time would write an audit log / vault tokens for
+        every attach, even if the user never sends the message.
     """
     t0 = time.monotonic()
     request_id = f"req_{uuid.uuid4().hex[:12]}"
@@ -237,6 +247,19 @@ async def protect_image_document(
         extracted_text, word_spans, ocr_quality = _ocr_with_boxes(file_bytes)
     except Exception as e:
         raise HTTPException(status_code=422, detail={"error": "ocr_failed", "detail": str(e)})
+
+    if extract_only:
+        # No pipeline-scoped side effects at all here — no audit log, no
+        # vault write, no quota increment. Real protection happens later
+        # when the caller sends the extracted text through the normal
+        # text-protection path (e.g. protect-chat-message -> /v1/proxy/protect).
+        return {
+            "request_id": request_id,
+            "filename": file.filename or "image",
+            "extracted_text": extracted_text,
+            "extracted_chars": len(extracted_text),
+            "ocr_quality": ocr_quality,
+        }
 
     if not extracted_text.strip():
         raise HTTPException(
