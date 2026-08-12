@@ -52,11 +52,24 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
     # but checksum doesn't match — still flagged, since a mistyped/OCR'd
     # digit is far more likely than this shape occurring on an unrelated
     # random string, just at slightly lower confidence).
+    # Fixed 2026-08-12 — real gap found testing against an actual
+    # photographed DNI: Google Vision correctly read the digits+letter
+    # (checksum-verified), but OCR segmentation on a document with a
+    # complex layout (hologram overlay, nearby support number) glued it
+    # directly to adjacent letters with no word boundary in between (e.g.
+    # "...CCT" immediately followed by the 8 digits + letter, no space).
+    # \b requires a transition between a word char and a non-word char --
+    # letter-to-digit is word-to-word, so \b never matched there, and the
+    # correctly-read, checksum-valid number was never even tested. Dropped
+    # the leading \b on the bare-DNI branch; checksum remains the real
+    # precision filter (~1/23 odds of a coincidental match), so this
+    # doesn't meaningfully increase false positives despite being a wider
+    # net syntactically.
     ("dni", "critical",
      re.compile(
          r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b'
          r'|\b([XYZxyz]\d{7}[A-Za-z])\b'   # bare NIE: letter + 7 digits + letter
-         r'|\b(\d{8}[A-Za-z])\b'           # bare DNI: 8 digits + letter, no leading letter
+         r'|(\d{8}[A-Za-z])\b'             # bare DNI: 8 digits + letter — no leading \b, see above
      ),
      0.95),
 
