@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # Used to decrypt customer LLM API keys stored in llm_providers table
     # and to encrypt/decrypt PII tokens in the vault.
     ENCRYPTION_KEY: str = "0" * 64
+    GOOGLE_VISION_API_KEY: str = ""  # Tier 2 OCR fallback, added 2026-08-11
 
     # ── iBS (Blockchain Evidence) ──────────────────────────────────
     IBS_API_KEY: str = ""

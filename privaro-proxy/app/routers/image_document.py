@@ -39,7 +39,9 @@ import hashlib
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
 from typing import Dict, Any, List, Optional, Tuple
 
+import re
 from app.services import detector
+from app.services.detector import _verify_spanish_id_checksum
 from app.services.auth import verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
@@ -153,6 +155,163 @@ def _ocr_with_boxes(image_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], Dict
     return full_text, word_spans, quality
 
 
+def _ocr_with_google_vision(image_bytes: bytes) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Tier 2 OCR (2026-08-11) — Google Cloud Vision's DOCUMENT_TEXT_DETECTION.
+    Same output contract as _ocr_with_boxes (Tesseract, Tier 1): full_text,
+    word_spans (character offsets into full_text + pixel box), quality dict.
+    This makes it a drop-in alternative, not a parallel code path.
+
+    Verified against a real API call before writing this (not assumed from
+    docs alone): confidence is available per-word AND per-symbol via
+    fullTextAnnotation.pages[].blocks[].paragraphs[].words[].symbols[] —
+    finer-grained than Tesseract's word-only confidence. boundingBox comes
+    as 4 vertices (not left/top/width/height like Tesseract), converted
+    here via min/max of the vertices.
+
+    Real API key required via GOOGLE_VISION_API_KEY env var. Auth is a
+    simple `?key=` query param (confirmed working directly against
+    the real endpoint) — not OAuth2/service-account, so no extra
+    google-cloud-vision SDK dependency needed, just httpx.
+    """
+    import httpx as _httpx
+
+    api_key = settings.GOOGLE_VISION_API_KEY
+    if not api_key:
+        raise RuntimeError("GOOGLE_VISION_API_KEY not configured")
+
+    payload = {
+        "requests": [{
+            "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+            "imageContext": {"languageHints": ["es"]},
+        }]
+    }
+
+    with _httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+            json=payload,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    result = data.get("responses", [{}])[0]
+
+    if "error" in result:
+        raise RuntimeError(f"Google Vision error: {result['error'].get('message', 'unknown')}")
+
+    full_annotation = result.get("fullTextAnnotation")
+    if not full_annotation:
+        return "", [], {"engine": "google_vision", "words_detected": 0, "avg_confidence": None,
+                         "min_confidence": None, "low_confidence_word_pct": None,
+                         "low_confidence_threshold": LOW_CONFIDENCE_THRESHOLD}
+
+    full_text_parts: List[str] = []
+    word_spans: List[Dict[str, Any]] = []
+    confidences: List[float] = []
+    offset = 0
+
+    # Fixed 2026-08-11 during verification: assuming "new paragraph = new
+    # line" produced wrong reconstructions (e.g. two visually separate
+    # lines merged into one, because Google Vision groups multiple visual
+    # lines into the same "paragraph" when they're related). The real,
+    # precise signal is symbol.property.detectedBreak.type on each word's
+    # LAST symbol — verified directly against a real API response before
+    # relying on it: SPACE/SURE_SPACE -> a space; EOL_SURE_SPACE/LINE_BREAK
+    # -> an actual newline. This mirrors how the text visually breaks,
+    # rather than inferring it from paragraph structure.
+    for page in full_annotation.get("pages", []):
+        for block in page.get("blocks", []):
+            for paragraph in block.get("paragraphs", []):
+                for word in paragraph.get("words", []):
+                    symbols = word.get("symbols", [])
+                    word_text = "".join(s.get("text", "") for s in symbols)
+                    if not word_text:
+                        continue
+                    conf_pct = round(word.get("confidence", 0.0) * 100, 1)
+                    confidences.append(conf_pct)
+
+                    start = offset
+                    full_text_parts.append(word_text)
+                    offset += len(word_text)
+                    end = offset
+
+                    vertices = word.get("boundingBox", {}).get("vertices", [])
+                    xs = [v.get("x", 0) for v in vertices] or [0]
+                    ys = [v.get("y", 0) for v in vertices] or [0]
+                    left, top = min(xs), min(ys)
+
+                    word_spans.append({
+                        "start": start, "end": end,
+                        "left": left, "top": top,
+                        "width": max(xs) - left, "height": max(ys) - top,
+                        "conf": conf_pct,
+                    })
+
+                    break_type = (symbols[-1].get("property", {}).get("detectedBreak", {}) or {}).get("type")
+                    if break_type in ("LINE_BREAK", "EOL_SURE_SPACE"):
+                        full_text_parts.append("\n")
+                        offset += 1
+                    elif break_type in ("SPACE", "SURE_SPACE"):
+                        full_text_parts.append(" ")
+                        offset += 1
+                    # HYPHEN or no break: no separator inserted (word continues)
+
+    full_text = "".join(full_text_parts).rstrip("\n").rstrip(" ")
+    total = len(confidences)
+    low_conf_count = sum(1 for c in confidences if c < LOW_CONFIDENCE_THRESHOLD)
+    quality = {
+        "engine": "google_vision",
+        "words_detected": total,
+        "avg_confidence": round(sum(confidences) / total, 1) if total else None,
+        "min_confidence": min(confidences) if total else None,
+        "low_confidence_word_pct": round(100 * low_conf_count / total, 1) if total else None,
+        "low_confidence_threshold": LOW_CONFIDENCE_THRESHOLD,
+    }
+    return full_text, word_spans, quality
+
+
+def _should_escalate_to_tier2(full_text: str) -> bool:
+    """
+    Decides whether Tier 1 (Tesseract) output is trustworthy enough, or
+    whether to re-run with Tier 2 (Google Vision). Added 2026-08-11 —
+    deliberately NOT based on generic OCR confidence alone: a real test
+    showed Tesseract can be confidently wrong on character-substitution
+    errors (misread 'A' as '4' in a DNI control letter, with no drop in
+    aggregate confidence). Instead this targets the highest-value field
+    directly: if the text looks like it contains a Spanish ID document
+    (keywords) but no dni/nie pattern is found at all, OR a near-DNI shape
+    is found but the checksum fails to validate, escalate — this catches
+    exactly the class of error found in production, rather than relying on
+    a confidence score that may not reflect it.
+    """
+    id_document_keywords = ("DNI", "NIE", "IDENTIDAD", "IDENTITAT", "NACIONAL", "PASSPORT", "PASAPORTE")
+    looks_like_id_document = any(kw in full_text.upper() for kw in id_document_keywords)
+    if not looks_like_id_document:
+        return False
+
+    dni_pattern = re.compile(
+        r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b'
+        r'|\b([XYZxyz]\d{7}[A-Za-z])\b'
+        r'|\b(\d{8}[A-Za-z])\b'
+    )
+    match = dni_pattern.search(full_text)
+    if not match:
+        # Looks like an ID document, but not even the shape of a DNI/NIE
+        # was found — could well be Tesseract dropping/misreading the
+        # control letter entirely, as happened in production.
+        return True
+
+    matched_value = next(g for g in match.groups() if g)
+    if not _verify_spanish_id_checksum(matched_value):
+        # Shape matched, but the checksum doesn't -- likely a
+        # character-substitution misread, escalate to get a second,
+        # more accurate read.
+        return True
+
+    return False
+
+
 def _redact_image(image_bytes: bytes, boxes: List[Dict[str, int]]) -> bytes:
     """Draws solid black rectangles over the given pixel boxes and returns
     the result as PNG bytes."""
@@ -243,11 +402,27 @@ async def protect_image_document(
 
     org_id = pipeline["org_id"]
 
-    # ── Step 3-4: OCR ──────────────────────────────────────────────────────────
+    # ── Step 3-4: OCR (Tier 1: Tesseract, escalate to Tier 2: Google Vision) ──
     try:
         extracted_text, word_spans, ocr_quality = _ocr_with_boxes(file_bytes)
     except Exception as e:
         raise HTTPException(status_code=422, detail={"error": "ocr_failed", "detail": str(e)})
+
+    # Added 2026-08-11 — real production case: a genuine DNI's control
+    # letter got misread as a digit by Tesseract, with no drop in aggregate
+    # confidence. Escalating only on generic low confidence would have
+    # missed exactly this case, so the trigger targets the highest-value
+    # field directly (see _should_escalate_to_tier2's docstring). Fails
+    # open to the Tier 1 result if Tier 2 itself errors (e.g. API key not
+    # configured, quota, network) — never blocks the request over this.
+    if settings.GOOGLE_VISION_API_KEY and _should_escalate_to_tier2(extracted_text):
+        try:
+            tier2_text, tier2_spans, tier2_quality = _ocr_with_google_vision(file_bytes)
+            if tier2_text.strip():
+                extracted_text, word_spans, ocr_quality = tier2_text, tier2_spans, tier2_quality
+                ocr_quality["escalated_from_tier1"] = True
+        except Exception as e:
+            print(f"[ImageDocument] Tier 2 escalation failed, using Tier 1 result: {e}")
 
     if extract_only:
         # No pipeline-scoped side effects at all here — no audit log, no
