@@ -274,22 +274,25 @@ def _ocr_with_google_vision(image_bytes: bytes) -> Tuple[str, List[Dict[str, Any
 def _should_escalate_to_tier2(full_text: str) -> bool:
     """
     Decides whether Tier 1 (Tesseract) output is trustworthy enough, or
-    whether to re-run with Tier 2 (Google Vision). Added 2026-08-11 —
-    deliberately NOT based on generic OCR confidence alone: a real test
-    showed Tesseract can be confidently wrong on character-substitution
-    errors (misread 'A' as '4' in a DNI control letter, with no drop in
-    aggregate confidence). Instead this targets the highest-value field
-    directly: if the text looks like it contains a Spanish ID document
-    (keywords) but no dni/nie pattern is found at all, OR a near-DNI shape
-    is found but the checksum fails to validate, escalate — this catches
-    exactly the class of error found in production, rather than relying on
-    a confidence score that may not reflect it.
-    """
-    id_document_keywords = ("DNI", "NIE", "IDENTIDAD", "IDENTITAT", "NACIONAL", "PASSPORT", "PASAPORTE")
-    looks_like_id_document = any(kw in full_text.upper() for kw in id_document_keywords)
-    if not looks_like_id_document:
-        return False
+    whether to re-run with Tier 2 (Google Vision).
 
+    v1 (earlier today) required first matching ID-document keywords
+    ("DNI", "IDENTIDAD", etc.) before checking the DNI shape/checksum.
+    Fixed after testing against a real photographed DNI: OCR quality was
+    so poor (hologram, glare, photo overlaid on text) that NONE of those
+    keywords were read either — not just the DNI number. The trigger
+    designed to catch bad OCR never fired precisely because the OCR was
+    bad, the opposite of what it needed to do.
+
+    v2 (this fix): escalate directly whenever no checksum-valid DNI/NIE
+    shape is found in the text — full stop, no keyword precondition. This
+    endpoint's real-world use case is already "photographed identity
+    documents", so a slightly higher false-escalation rate (paying for a
+    Tier 2 call on an image that turns out not to be an ID) is an
+    acceptable and cheap tradeoff (Google Vision: ~$1.50/1000 images)
+    against the alternative of silently failing to protect the one field
+    that matters most.
+    """
     dni_pattern = re.compile(
         r'\b(?:DNI|NIF|NIE)[\s:]+([XYZxyz]?\d{7,8}[A-Za-z])\b'
         r'|\b([XYZxyz]\d{7}[A-Za-z])\b'
@@ -297,19 +300,10 @@ def _should_escalate_to_tier2(full_text: str) -> bool:
     )
     match = dni_pattern.search(full_text)
     if not match:
-        # Looks like an ID document, but not even the shape of a DNI/NIE
-        # was found — could well be Tesseract dropping/misreading the
-        # control letter entirely, as happened in production.
         return True
 
     matched_value = next(g for g in match.groups() if g)
-    if not _verify_spanish_id_checksum(matched_value):
-        # Shape matched, but the checksum doesn't -- likely a
-        # character-substitution misread, escalate to get a second,
-        # more accurate read.
-        return True
-
-    return False
+    return not _verify_spanish_id_checksum(matched_value)
 
 
 def _redact_image(image_bytes: bytes, boxes: List[Dict[str, int]]) -> bytes:
