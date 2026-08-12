@@ -326,6 +326,23 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
     ("license_plate", "high",
      re.compile(r'\b\d{4}[\s-]?[BCDFGHJKLMNPRSTVWXYZ]{3}\b'),
      0.9),
+
+    # Spanish street address (street-type keyword + name + number). Added
+    # 2026-08-12 — a full home address is a direct identifier on its own
+    # (a specific street+number almost always narrows to one household),
+    # not a mere quasi-identifier like a birth date alone — same tier as
+    # DNI/IBAN/plate under the identifiability principle used throughout
+    # this detector. Deliberately requires a recognized street-type prefix
+    # rather than matching any "word(s) + number" pattern, to avoid
+    # flagging unrelated text (e.g. "Artículo 15" or "Página 76").
+    ("address", "high",
+     re.compile(
+         r'\b(?:C\.|Calle|Avda\.?|Avenida|Pza\.?|Plaza|Po\.?|Paseo|'
+         r'Ctra\.?|Carretera|Camino|Urb\.?|Urbanizaci[oó]n)\s+'
+         r'[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]{1,40}?\s+\d{1,4}\b',
+         re.IGNORECASE
+     ),
+     0.8),
 ]
 
 # ── Severity → category mapping ─────────────────────────────────────────────
@@ -340,6 +357,7 @@ ENTITY_CATEGORY = {
     "ip_address": "personal",
     "date_of_birth": "personal",
     "license_plate": "personal",
+    "address": "personal",
     "ssn": "personal",
     "passport": "personal",
 }
@@ -359,7 +377,7 @@ TOKEN_PREFIX = {
     "ssn": "SS",
     "passport": "PP",
     "money": "MN",
-    "license_plate": "LP",
+    "license_plate": "LP", "address": "AD",
 }
 
 

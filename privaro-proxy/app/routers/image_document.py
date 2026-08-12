@@ -63,7 +63,7 @@ TOKEN_PREFIX = {
     "full_name": "NM", "dni": "ID", "nie": "ID", "iban": "BK",
     "credit_card": "CC", "email": "EM", "phone": "PH",
     "health_record": "HC", "ip_address": "IP", "date_of_birth": "DT", "ssn": "SS",
-    "passport": "PP", "money": "MN", "license_plate": "LP",
+    "passport": "PP", "money": "MN", "license_plate": "LP", "address": "AD",
 }
 
 
@@ -396,27 +396,40 @@ async def protect_image_document(
 
     org_id = pipeline["org_id"]
 
-    # ── Step 3-4: OCR (Tier 1: Tesseract, escalate to Tier 2: Google Vision) ──
-    try:
-        extracted_text, word_spans, ocr_quality = _ocr_with_boxes(file_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail={"error": "ocr_failed", "detail": str(e)})
-
-    # Added 2026-08-11 — real production case: a genuine DNI's control
-    # letter got misread as a digit by Tesseract, with no drop in aggregate
-    # confidence. Escalating only on generic low confidence would have
-    # missed exactly this case, so the trigger targets the highest-value
-    # field directly (see _should_escalate_to_tier2's docstring). Fails
-    # open to the Tier 1 result if Tier 2 itself errors (e.g. API key not
-    # configured, quota, network) — never blocks the request over this.
-    if settings.GOOGLE_VISION_API_KEY and _should_escalate_to_tier2(extracted_text):
+    # ── Step 3-4: OCR ──────────────────────────────────────────────────────────
+    # Changed 2026-08-12 (explicit decision, not a default): Google Vision is
+    # now the PRIMARY engine, not a conditional escalation from Tesseract.
+    # Reasoning: repeated real-world Tesseract failures today (control-letter
+    # misread as a digit with no confidence drop, OCR segmentation gluing
+    # unrelated text together) made confidence in Tesseract-first low enough
+    # that the marginal cost of Google Vision (~$1.50/1000 images, trivial at
+    # current volume) is worth paying on every call rather than only when a
+    # (fallible) trigger decides it's needed. Real tradeoff worth restating
+    # here even though the decision is made: every image now leaves to a
+    # third party (Google) unprotected before Privaro can tokenize anything,
+    # not just the ones that would have failed Tier 1 — previously this only
+    # happened on escalation. Revisit if this endpoint's use case broadens
+    # beyond ID documents, where that tradeoff may weigh differently.
+    #
+    # Tesseract is kept as a resilience fallback ONLY — if Google Vision
+    # itself errors (key not configured, quota, network), not as a quality
+    # comparison. _should_escalate_to_tier2 is no longer used for this reason
+    # but left in the module in case a future cost-sensitive mode wants it back.
+    if settings.GOOGLE_VISION_API_KEY:
         try:
-            tier2_text, tier2_spans, tier2_quality = _ocr_with_google_vision(file_bytes)
-            if tier2_text.strip():
-                extracted_text, word_spans, ocr_quality = tier2_text, tier2_spans, tier2_quality
-                ocr_quality["escalated_from_tier1"] = True
+            extracted_text, word_spans, ocr_quality = _ocr_with_google_vision(file_bytes)
         except Exception as e:
-            print(f"[ImageDocument] Tier 2 escalation failed, using Tier 1 result: {e}")
+            print(f"[ImageDocument] Google Vision failed, falling back to Tesseract: {e}")
+            try:
+                extracted_text, word_spans, ocr_quality = _ocr_with_boxes(file_bytes)
+                ocr_quality["fell_back_to_tier1"] = True
+            except Exception as e2:
+                raise HTTPException(status_code=422, detail={"error": "ocr_failed", "detail": str(e2)})
+    else:
+        try:
+            extracted_text, word_spans, ocr_quality = _ocr_with_boxes(file_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail={"error": "ocr_failed", "detail": str(e)})
 
     if extract_only:
         # No pipeline-scoped side effects at all here — no audit log, no
