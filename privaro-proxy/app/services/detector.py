@@ -207,6 +207,33 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
     #      ("Cliente: Madonna") never matched. Now 1 word is enough
     #      (still capped at 4 total to limit over-capture).
     #
+    # Spanish street address (street-type keyword + name + number). Added
+    # 2026-08-12 — a full home address is a direct identifier on its own
+    # (a specific street+number almost always narrows to one household),
+    # not a mere quasi-identifier like a birth date alone — same tier as
+    # DNI/IBAN/plate under the identifiability principle used throughout
+    # this detector. Deliberately requires a recognized street-type prefix
+    # rather than matching any "word(s) + number" pattern, to avoid
+    # flagging unrelated text (e.g. "Artículo 15" or "Página 76").
+    #
+    # Moved BEFORE full_name (2026-08-12, real bug found): overlap
+    # resolution in this detector is first-match-wins (see seen_spans
+    # below) — with address defined after full_name, a street named after
+    # a person (extremely common in Spain, e.g. "C. Doctor Fleming 36")
+    # had its person-name component claimed by full_name first, so the
+    # address pattern never got a chance to match the full span at all.
+    # Person names inside a matched address are a small, deliberately
+    # accepted loss elsewhere in the document (full_name still fires
+    # normally everywhere the address pattern doesn't match).
+    ("address", "high",
+     re.compile(
+         r'\b(?:C\.|Calle|Avda\.?|Avenida|Pza\.?|Plaza|Po\.?|Paseo|'
+         r'Ctra\.?|Carretera|Camino|Urb\.?|Urbanizaci[oó]n)\s+'
+         r'[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]{1,40}?\s+\d{1,4}\b',
+         re.IGNORECASE
+     ),
+     0.8),
+
     # Known remaining limitation (documented, not fixed here — needs NLP):
     # if the word immediately after a real name is ALSO capitalised and
     # looks name-shaped (a company name, "Empresa", "SL", another proper
@@ -327,22 +354,6 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
      re.compile(r'\b\d{4}[\s-]?[BCDFGHJKLMNPRSTVWXYZ]{3}\b'),
      0.9),
 
-    # Spanish street address (street-type keyword + name + number). Added
-    # 2026-08-12 — a full home address is a direct identifier on its own
-    # (a specific street+number almost always narrows to one household),
-    # not a mere quasi-identifier like a birth date alone — same tier as
-    # DNI/IBAN/plate under the identifiability principle used throughout
-    # this detector. Deliberately requires a recognized street-type prefix
-    # rather than matching any "word(s) + number" pattern, to avoid
-    # flagging unrelated text (e.g. "Artículo 15" or "Página 76").
-    ("address", "high",
-     re.compile(
-         r'\b(?:C\.|Calle|Avda\.?|Avenida|Pza\.?|Plaza|Po\.?|Paseo|'
-         r'Ctra\.?|Carretera|Camino|Urb\.?|Urbanizaci[oó]n)\s+'
-         r'[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]{1,40}?\s+\d{1,4}\b',
-         re.IGNORECASE
-     ),
-     0.8),
 ]
 
 # ── Severity → category mapping ─────────────────────────────────────────────
