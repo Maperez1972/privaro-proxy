@@ -37,6 +37,65 @@ _TOKEN_RE = re.compile(r"\[[A-Z]{2,4}-\d{4}\]")
 _PLACEHOLDER_TMPL = "\u2060PVR{idx}\u2060"  # word-joiner-wrapped, invisible-ish
 
 
+def _get_real_kompress_compressor():
+    """
+    Reach into the ACTUAL singleton compression pipeline that
+    compress()/compress_protected_messages() uses internally, and return
+    its real Kompress compressor instance — NOT a standalone throwaway
+    one.
+
+    CRITICAL finding, 2026-08-13 (Fase 0 of the RAG expansion audit,
+    Presidio/Kompress scale validation): warmup_kompress() and
+    kompress_ready() both used to call `KompressCompressor()` directly —
+    a brand new, throwaway instance completely disconnected from the one
+    `compress()` actually uses at runtime. `headroom.compress._get_pipeline()`
+    IS a real module-level singleton (confirmed by reading the library
+    source directly), but its `ContentRouter` transform lazy-loads its
+    OWN Kompress instance on first use (`self._kompress: Any = None` in
+    `ContentRouter.__init__`, populated by the private `_get_kompress()`
+    method) — a completely separate object from anything created by
+    calling `KompressCompressor()` ourselves.
+
+    Consequence, confirmed empirically, not assumed: `warmup_kompress()`
+    would report `ready: True` after successfully warming its own
+    throwaway instance, while the pipeline's REAL instance had never
+    been touched — its first real use (inside an actual `compress()`
+    call) would find itself not ready, and appears to hit an internal
+    failure latch (`_degraded_reason` / `_inference_failures`, visible
+    in KompressCompressor's own source) that PERMANENTLY disables
+    compression for the rest of that process's lifetime after a single
+    bad attempt — every subsequent call returns instantly (~13ms) with
+    `tokens_saved: 0`, no error, no retry, ever again. The exact same
+    problem existed independently in `kompress_ready()`, which means the
+    `/health` endpoint's `kompress_ready: true` reported during the
+    Context Optimization latency investigation reflected the health of
+    an unrelated, never-used object — NOT whether the pipeline customers
+    actually hit could compress anything.
+
+    Net effect: Context Optimization's prose compression (Kompress) has
+    very likely never worked in production since it was first deployed,
+    silently, with both health signals we built to catch exactly this
+    kind of failure (warmup + health check) checking the wrong object
+    the entire time.
+
+    Verified directly against the real object before writing this fix:
+    warming the correct instance (obtained exactly as below) took ~2s
+    (weights already cached to disk from an earlier throwaway-instance
+    load), versus 11s for a fresh throwaway instance — and a subsequent
+    real `compress_protected_messages()` call returned
+    `tokens_saved: 749, compression_ratio: 0.226` on a synthetic prose
+    document, versus `tokens_saved: 0` every time before this fix.
+    """
+    from headroom.compress import _get_pipeline
+    from headroom.transforms.content_router import ContentRouter
+
+    pipeline = _get_pipeline()
+    for transform in pipeline.transforms:
+        if isinstance(transform, ContentRouter):
+            return transform._get_kompress()
+    return None
+
+
 def warmup_kompress(timeout_seconds: float = 30.0, retries: int = 2) -> bool:
     """
     Force-load the Kompress prose-compression model synchronously and BLOCK
@@ -60,6 +119,13 @@ def warmup_kompress(timeout_seconds: float = 30.0, retries: int = 2) -> bool:
     restart, this retries `retries` additional times (each with a fresh
     `timeout_seconds` window and a short backoff) before giving up.
 
+    CRITICAL fix, 2026-08-13: this used to warm a throwaway
+    `KompressCompressor()` instance with zero connection to the real
+    pipeline `compress()` uses — see `_get_real_kompress_compressor()`'s
+    docstring for the full incident. Now warms the actual singleton
+    instance, so this function's return value genuinely reflects whether
+    real traffic will get compressed.
+
     Call this once from the app's startup/lifespan handler, BEFORE serving
     traffic, so every instance starts warm. Returns True if the model
     became ready within any attempt, False otherwise (the service should
@@ -67,9 +133,9 @@ def warmup_kompress(timeout_seconds: float = 30.0, retries: int = 2) -> bool:
     until the model finishes loading, same as any cold instance would
     today).
     """
-    from headroom.transforms.kompress_compressor import KompressCompressor
-
-    compressor = KompressCompressor()
+    compressor = _get_real_kompress_compressor()
+    if compressor is None:
+        return False
     if compressor.is_ready():
         return True
 
@@ -117,10 +183,16 @@ def kompress_ready() -> bool:
     itself had failed to load, only by grepping container logs for
     'background model download failed'. Exposed on /health as
     kompress_ready so this class of failure is visible without log access.
+
+    CRITICAL fix, 2026-08-13: same wrong-instance bug as
+    warmup_kompress() — this used to construct its own throwaway
+    KompressCompressor() and check IT, meaning `kompress_ready: true` on
+    /health never actually reflected whether real traffic could compress
+    anything. See _get_real_kompress_compressor()'s docstring.
     """
     try:
-        from headroom.transforms.kompress_compressor import KompressCompressor
-        return KompressCompressor().is_ready()
+        compressor = _get_real_kompress_compressor()
+        return compressor.is_ready() if compressor is not None else False
     except Exception:
         return False
 

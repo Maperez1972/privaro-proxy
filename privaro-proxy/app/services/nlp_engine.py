@@ -77,7 +77,7 @@ NLP_CONFIDENCE_THRESHOLD = 0.75
 
 def detect_nlp(
     text: str,
-    existing_spans,  # detector.OverlapTracker — see detector.py for why
+    existing_spans: List[tuple],
     language: str = "es",
 ) -> List[Detection]:
     """
@@ -104,15 +104,29 @@ def detect_nlp(
     for result in results:
         start, end = result.start, result.end
 
-        # Fixed 2026-08-07 — this used to be a linear scan (`any(start <
-        # e2 and s < end for s, e2 in existing_spans)`) against a plain
-        # list that grows with every detection. Profiled on a 300K
-        # character document: 47.5M comparisons, 95% of total detection
-        # time, real O(n^2) scaling (verified: 10x document size ->
-        # 75x slower, not 10x). existing_spans is now a
-        # detector.OverlapTracker, giving O(log n) here too — see its
-        # docstring for the full correctness argument and benchmarks.
-        if existing_spans.overlaps(start, end):
+        # Skip if overlaps with already-detected regex span.
+        #
+        # Fixed 2026-08-07 — CRITICAL, this was the actual root cause of a
+        # real production bug (garbled tokenisation in a document
+        # signature block, e.g. "[NM-0007]l." instead of a clean token).
+        # The old check (s <= start < e2 or s < end <= e2) only catches
+        # PARTIAL overlaps where one span's boundary falls inside the
+        # other — it misses full containment, where a Presidio span
+        # starts before AND ends after an existing Tier-1 regex span.
+        # Real numbers from the incident: existing regex span
+        # (13720,13734), Presidio candidate (13716,13738) — fully
+        # containing it. Old check: false on both clauses, so BOTH
+        # detections were kept and both got tokenised.
+        # _apply_tokenization applies replacements back-to-front by start
+        # position; once the inner (regex) span was replaced first, the
+        # outer (Presidio) span's stored [start:end] offsets no longer
+        # matched the now-shifted string, so its replacement sliced into
+        # the wrong characters — corrupting everything after the overlap
+        # point. The correct general interval-overlap test is
+        # start1 < end2 AND start2 < end1, which catches every overlap
+        # case (partial in either direction, and full containment in
+        # either direction).
+        if any(start < e2 and s < end for s, e2 in existing_spans):
             continue
 
         mapping = PRESIDIO_TO_PRIVARO.get(result.entity_type)

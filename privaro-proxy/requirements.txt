@@ -16,7 +16,6 @@ openpyxl==3.1.5
 python-docx==1.1.2
 python-multipart==0.0.20
 headroom-ai[proxy]>=0.32.1
-sortedcontainers>=2.4.0
 
 # Image-document protection (Tier 1 OCR — 2026-08-11)
 pytesseract==0.3.13
