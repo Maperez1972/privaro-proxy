@@ -32,4 +32,25 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2"]
+# Fixed 2026-08-26 — real deploy issue, confirmed across multiple
+# attempts: Railway would not apply this service's "Custom Start
+# Command" (python -m app.worker.ingestion_worker) for the ingestion
+# worker service, running the default uvicorn CMD instead regardless
+# (confirmed by the "🚀 Privaro Proxy API starting" log line, which
+# only exists in app/main.py — proof the worker service was still
+# running the API). Tried and ruled out: a separate railway.worker.toml
+# config file (Railway kept applying railway.toml's config per its own
+# deployment detail page, despite the Config File path being correctly
+# set), and an embedded /health server (fixed the healthcheck symptom,
+# but the underlying process was still uvicorn, not the worker).
+#
+# Rather than depend on Railway correctly overriding CMD at the
+# platform level (whatever the underlying cause — same account, same
+# project, unclear why it wasn't working), this bakes the choice into
+# the image itself via an environment variable, which IS unambiguously
+# per-service in Railway (Settings -> Variables, no path resolution, no
+# config-as-code involved at all). Default (WORKER_MODE unset or not
+# "true") preserves the exact original behaviour -- zero risk to the
+# API service, which needs no changes at all to keep working exactly
+# as before.
+CMD ["sh", "-c", "if [ \"$WORKER_MODE\" = \"true\" ]; then python -m app.worker.ingestion_worker; else uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2; fi"]
