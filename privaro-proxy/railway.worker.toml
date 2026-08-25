@@ -1,0 +1,25 @@
+# Railway config específico para el servicio "ingestion-worker" (Privaro
+# Ingest, Fase 1 del plan de RAG). NO usar railway.toml (el de la API) para
+# este servicio — el worker no escucha ningún puerto HTTP, así que
+# healthcheckPath="/health" haría que Railway lo matara siempre tras 4
+# intentos fallidos de conectarse a un puerto que nunca se abre.
+#
+# Cómo usar: en el servicio del worker, en Settings → Config-as-code →
+# "Railway Config File", apunta a esta ruta exacta:
+#   privaro-proxy/railway.worker.toml
+#
+# Sin esto, Railway auto-detecta railway.toml (el de la API) porque ambos
+# servicios comparten el mismo repo + Root Directory, y aplica su
+# healthcheckPath también aquí — es justo lo que causó el fallo de deploy
+# real (build OK, "1/1 replicas never became healthy!" tras 4 intentos
+# contra /health).
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m app.worker.ingestion_worker"
+# Deliberadamente SIN healthcheckPath -- ver comentario arriba.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
