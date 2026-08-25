@@ -1258,3 +1258,111 @@ async def send_usage_notification(
         await mark_notification_triggered(config["id"])
     except Exception as e:
         print(f"[Notify] Failed to send {notif_type} for org {org_id}: {e}")
+
+
+# ── Privaro Ingest — async job queue (Fase 1 del plan de RAG) ─────────────
+#
+# Added 2026-08-25. A large document (Fase 0 measured Presidio needing
+# >30s past the hundreds-of-KB range) can't process synchronously inside
+# a single HTTP request without risking timeouts in production —
+# see /v1/proxy/protect-document's own inline timeout, which is bounded
+# but real. This table + these functions back the async path: a job row
+# is created here, a SEPARATE worker process (see
+# app/worker/ingestion_worker.py) picks it up, processes it, and writes
+# the result back — deliberately isolated from the API process serving
+# live chat traffic, since Fase 0 also found Kompress can crash the
+# whole process on large documents (unresolved as of this PR, which is
+# exactly why /protect-document never calls Context Optimization at all
+# yet — but the worker/API separation is worth having regardless, for
+# the day that gets re-enabled here too).
+
+async def create_ingestion_job(payload: Dict[str, Any]) -> Optional[str]:
+    """Insert a new ingestion_jobs row (status='pending' by default) and
+    return its UUID."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/ingestion_jobs",
+            headers=SUPABASE_HEADERS,
+            json=payload,
+        )
+        if response.status_code in (200, 201):
+            data = response.json()
+            return data[0]["id"] if data else None
+        print(f"[Supabase] ingestion_jobs INSERT failed: {response.status_code} {response.text}")
+        return None
+
+
+async def get_ingestion_job(job_id: str, org_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a single ingestion job by id, scoped to org_id so a caller can
+    never poll another organization's job by guessing/enumerating ids.
+    """
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/ingestion_jobs",
+            headers=SUPABASE_HEADERS,
+            params={
+                "id": f"eq.{job_id}",
+                "org_id": f"eq.{org_id}",
+                "select": "id,status,result,error,char_count,created_at,started_at,completed_at",
+                "limit": "1",
+            },
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data[0] if data else None
+        return None
+
+
+async def claim_next_pending_ingestion_job() -> Optional[Dict[str, Any]]:
+    """
+    Atomically claim the oldest pending job for processing, via a single
+    UPDATE ... WHERE status='pending' ORDER BY created_at LIMIT 1
+    RETURNING *-style call. PostgREST doesn't support ORDER BY + LIMIT
+    directly inside an UPDATE the way raw SQL would, so this uses an RPC
+    instead (see supabase_ingestion_jobs.sql's companion function) —
+    same pattern already used elsewhere in this codebase for anything
+    that needs atomicity across concurrent workers (e.g.
+    increment_pipeline_stats). Returns None if no pending job exists.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/rpc/claim_next_ingestion_job",
+            headers=SUPABASE_HEADERS,
+            json={},
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data[0] if data else None
+        print(f"[Supabase] claim_next_ingestion_job RPC failed: {response.status_code} {response.text}")
+        return None
+
+
+async def complete_ingestion_job(job_id: str, result: Dict[str, Any]) -> bool:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/ingestion_jobs",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{job_id}"},
+            json={
+                "status": "completed",
+                "result": result,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return response.status_code in (200, 204)
+
+
+async def fail_ingestion_job(job_id: str, error: str) -> bool:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_REST}/ingestion_jobs",
+            headers=SUPABASE_HEADERS,
+            params={"id": f"eq.{job_id}"},
+            json={
+                "status": "failed",
+                "error": error,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return response.status_code in (200, 204)

@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     # (skips compression, keeps the already-tokenised text) on timeout.
     CONTEXT_OPTIMIZATION_TIMEOUT_SECONDS: float = 20.0
 
+    # Added 2026-08-25 — Fase 1 of the RAG expansion (Privaro Ingest).
+    # Documents at or below this size get processed synchronously in
+    # /v1/proxy/protect-document; above it, the request returns
+    # immediately with a job_id and a separate worker process
+    # (app/worker/ingestion_worker.py) handles it. 20,000 chosen from
+    # Fase 0's real measurements: Tier1+Tier2 combined stayed under ~1s
+    # at 100K chars in the sandbox test, but Presidio's own scaling
+    # degrades non-linearly past 300K and this needs to hold up on
+    # Railway's actual (weaker, shared) CPU too — kept deliberately
+    # conservative until real production timing data exists.
+    INGEST_SYNC_THRESHOLD_CHARS: int = 20_000
+
     # ── Development only ───────────────────────────────────────────
     PRIVARO_DEV_KEY: Optional[str] = None
     DEV_ORG_ID: Optional[str] = None

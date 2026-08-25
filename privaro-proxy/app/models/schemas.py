@@ -119,6 +119,57 @@ class Detection(BaseModel):
     regulation_ref: Optional[str] = None   # set by policy engine when a rule matches
 
 
+# ── /proxy/protect-document (RAG Ingest, Fase 1) ──────────────────────────
+#
+# Added 2026-08-25 — Fase 1 of the RAG expansion (Privaro Ingest). Deliberately
+# a SEPARATE request model from ProtectRequest, not a reuse with a bumped
+# max_length: ProtectRequest.prompt's 50,000-char cap was sized for chat
+# prompts, and Fase 0's real audit found this endpoint needs to handle
+# documents two orders of magnitude larger (a 100-page PDF easily exceeds
+# 500K characters) while explicitly NOT supporting Context Optimization
+# (see Fase 0 finding: Kompress can crash the whole process past ~30K
+# characters, unresolved as of this PR) — keeping the two request shapes
+# separate means that constraint is enforced by the type itself, not by
+# convention.
+class DocumentIngestOptions(BaseModel):
+    mode: DetectionMode = DetectionMode.tokenise
+    reversible: bool = True
+    use_nlp: bool = True
+    chunk_size: int = Field(512, ge=64, le=8192)
+    # No optimize_context field here on purpose — see module docstring
+    # above. Add it back only once the Kompress crash (Fase 0, Hallazgo 4)
+    # is resolved, and even then gate it separately from chat's flag so
+    # ingestion traffic can't be turned on for it by accident via a shared
+    # default.
+
+
+class ProtectDocumentRequest(BaseModel):
+    pipeline_id: str
+    document: str = Field(..., min_length=1, max_length=2_000_000)
+    document_id: Optional[str] = None  # caller's own external reference
+    options: DocumentIngestOptions = DocumentIngestOptions()
+
+
+class DocumentChunk(BaseModel):
+    index: int
+    text: str
+    char_start: int
+    char_end: int
+
+
+class ProtectDocumentResponse(BaseModel):
+    request_id: str
+    status: str  # "completed" | "processing" | "failed"
+    job_id: Optional[str] = None          # set when status == "processing"
+    estimated_seconds: Optional[int] = None
+    protected_document: Optional[str] = None
+    chunks: Optional[List[DocumentChunk]] = None
+    detections: Optional[List[Detection]] = None
+    stats: Optional[Dict[str, Any]] = None
+    degraded_mode: bool = False
+    degraded_reason: Optional[str] = None
+
+
 class ProtectOutputResponse(BaseModel):
     request_id: str
     protected_response: str
