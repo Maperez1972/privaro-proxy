@@ -21,9 +21,11 @@ from app.models.schemas import (
     DetokenizeRequest, DetokenizeResponse,
     ProtectStructuredRequest, ProtectStructuredResponse,
     ProtectOutputRequest, ProtectOutputResponse,
+    ProtectDocumentRequest, ProtectDocumentResponse, DocumentChunk,
     Detection,
 )
 from app.services import detector
+from app.services.chunker import chunk_protected_document
 from app.services.auth import verify_api_key_or_dev, verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
@@ -1147,4 +1149,181 @@ async def protect_structured(
         detections_by_field=detections_by_field,
         stats=stats,
         audit_log_id=audit_log_id,
+    )
+
+
+# ── /proxy/protect-document (RAG Ingest, Fase 1) ────────────────────────────
+#
+# Added 2026-08-25 — Fase 1 of the RAG expansion plan ("Privaro Ingest").
+# Protects a WHOLE document before it gets chunked and embedded into a
+# vector store, so PII never sits in a customer's vector DB in plain
+# text and never enters an embedding as raw content.
+#
+# Deliberately synchronous-only in this first pass, for documents up to
+# a size the real Fase 0 audit already measured as fast (Tier 1 regex:
+# ~1.3ms/1000 chars after the O(n^2) fix; Presidio Tier 2: ~55-60ms/1000
+# chars below 300K chars, worse above that — see the RAG plan doc for
+# the full numbers). The async job-queue + webhook path for very large
+# documents described in the plan is NOT implemented here — this
+# endpoint will simply take longer (bounded by DETECT_TIMEOUT_SECONDS,
+# same resilience pattern as /protect) rather than silently truncating
+# or hanging past that. Building the job queue is real infrastructure
+# work (a new table, a worker process, retry/failure handling) that
+# deserves its own PR rather than being folded into this one.
+#
+# Explicitly does NOT call compress_with_timeout()/Kompress — see the
+# RAG plan's Fase 0 Hallazgo 4: Kompress can crash the whole process on
+# documents above ~30K characters, unresolved as of this endpoint.
+# Ingestion traffic must not be able to trigger that until it's fixed.
+@router.post("/protect-document", response_model=ProtectDocumentResponse)
+async def protect_document(
+    body: ProtectDocumentRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+):
+    """
+    Protect a full document before ingestion into a vector store / RAG
+    pipeline. Chunking happens AFTER tokenisation, never before — see
+    chunker.py's module docstring for why that order is non-negotiable
+    (a chunk boundary landing inside a name mid-detection is exactly the
+    class of bug this session spent hours finding and fixing in the
+    detector itself; this endpoint exists specifically so RAG customers
+    don't reintroduce it themselves by chunking their own raw document
+    first).
+
+    Flow (mirrors /protect's structure, minus Context Optimization —
+    see module docstring above):
+    1. Validate pipeline + org
+    2. Detect PII over the WHOLE document (resilient — fails open)
+    3. Tokenise
+    4. Chunk the ALREADY-TOKENISED text
+    5. Persist audit log + reversible token vault (background, same
+       pattern as /protect and /protect-structured)
+    6. Return the full protected document + its chunks
+    """
+    t0 = time.monotonic()
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    # ── Step 1: Validate pipeline ────────────────────────────────────────────
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+
+    org_id = pipeline["org_id"]
+
+    await quota_svc.check_and_increment(org_id)
+
+    audit_log_id = str(uuid.uuid4())
+
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+
+    # ── Step 2: Detect PII over the whole document (fails open) ─────────────
+    try:
+        loop = asyncio.get_event_loop()
+        detections = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, detector.detect, body.document, body.options.use_nlp, custom_pattern_rules,
+            ),
+            timeout=settings.PROTECT_TIMEOUT_SECONDS * 20,
+            # 20x /protect's timeout, not an arbitrary number: Fase 0's
+            # real measurement showed Presidio alone can need >30s on
+            # documents in the hundreds-of-KB range, which /protect's
+            # base timeout (sized for short chat prompts) was never
+            # meant to accommodate. Still bounded, not unlimited — a
+            # document large enough to exceed even this should go
+            # through the (not yet built) async job path instead.
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        reason = "detector_timeout" if isinstance(e, asyncio.TimeoutError) else "detector_error"
+        print(f"[Resilience] /protect-document degraded ({reason}) org={org_id} pipeline={body.pipeline_id}: {e}")
+        background_tasks.add_task(db.insert_audit_log, {
+            "id": audit_log_id,
+            "org_id": org_id, "pipeline_id": body.pipeline_id,
+            "event_type": "degraded_bypass",
+            "entity_type": "unknown", "entity_category": "system",
+            "action_taken": "passthrough_unprotected", "severity": "critical",
+            "prompt_hash": hashlib.sha256(body.document.encode()).hexdigest(),
+            "metadata": {"request_id": request_id, "reason": reason, "endpoint": "protect-document"},
+        })
+        return ProtectDocumentResponse(
+            request_id=request_id,
+            status="failed",
+            protected_document=body.document,  # unmodified — fail open
+            degraded_mode=True,
+            degraded_reason=reason,
+        )
+
+    # ── Step 3: Apply contextual policy + tokenise ───────────────────────────
+    # No LLM provider in the loop for ingestion (unlike /protect), so
+    # provider-related context fields use sensible ingestion-only
+    # defaults rather than a real provider lookup.
+    policy_context = {
+        "provider": "",
+        "user_role": key_record.get("role", "developer"),
+        "data_region": "EU",
+        "agent_mode": False,
+        "pipeline_sector": pipeline.get("sector", "general"),
+        "default_action": body.options.mode.value,
+    }
+    if policies and detections:
+        detections = pe.apply_policies(detections, policies, policy_context)
+    else:
+        for d in detections:
+            d.action = "tokenised" if body.options.mode.value == "tokenise" else body.options.mode.value
+
+    counters: Dict[str, int] = {}
+    protected_document = _apply_tokenization(body.document, detections, counters)
+
+    # ── Step 4: Chunk the ALREADY-TOKENISED document ─────────────────────────
+    raw_chunks = chunk_protected_document(protected_document, chunk_size=body.options.chunk_size)
+    chunks = [
+        DocumentChunk(index=c.index, text=c.text, char_start=c.char_start, char_end=c.char_end)
+        for c in raw_chunks
+    ]
+
+    # ── Step 5: Persist (background — never blocks the response) ────────────
+    if body.options.reversible:
+        enc_key, enc_key_id = await resolve_encryption_key(org_id)
+        vault_rows = await _build_vault_rows(
+            body.document, detections, org_id, body.pipeline_id, None, enc_key, enc_key_id,
+        )
+        if vault_rows:
+            background_tasks.add_task(db.insert_tokens_batch, vault_rows)
+            background_tasks.add_task(db.increment_encryption_key_usage, enc_key_id, len(vault_rows))
+
+    processing_ms = int((time.monotonic() - t0) * 1000)
+    stats = {
+        "total_detected": len(detections),
+        "total_masked": sum(1 for d in detections if d.action in ("tokenised", "anonymised")),
+        "char_count": len(body.document),
+        "chunk_count": len(chunks),
+        "processing_ms": processing_ms,
+    }
+
+    background_tasks.add_task(db.insert_audit_log, {
+        "id": audit_log_id,
+        "org_id": org_id, "pipeline_id": body.pipeline_id,
+        "event_type": "protect_document",
+        "entity_type": "document", "entity_category": "ingestion",
+        "action_taken": "tokenised", "severity": "info",
+        "prompt_hash": hashlib.sha256(body.document.encode()).hexdigest(),
+        "metadata": {
+            "request_id": request_id, "document_id": body.document_id,
+            "char_count": len(body.document), "chunk_count": len(chunks),
+            "total_detected": len(detections),
+        },
+    })
+    background_tasks.add_task(ibs.certify_audit_log, audit_log_id, org_id, {"request_id": request_id})
+
+    return ProtectDocumentResponse(
+        request_id=request_id,
+        status="completed",
+        protected_document=protected_document,
+        chunks=chunks,
+        detections=detections,
+        stats=stats,
     )
