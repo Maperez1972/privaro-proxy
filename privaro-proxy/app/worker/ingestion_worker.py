@@ -37,6 +37,10 @@ paralelo al bucle de polling — así el healthcheck de Railway pasa
 siempre, sin depender de qué fichero de configuración esté leyendo
 realmente.
 """
+import sys
+
+print("[IngestionWorker] python process started, importing modules...", flush=True)
+
 import asyncio
 import os
 import threading
@@ -82,7 +86,7 @@ def _start_health_server() -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"[IngestionWorker] health server listening on :{port}/health "
-          f"(solo para satisfacer el healthcheck de Railway — el trabajo real es el polling de abajo)")
+          f"(solo para satisfacer el healthcheck de Railway — el trabajo real es el polling de abajo)", flush=True)
 
 
 async def _process_job(job: dict) -> None:
@@ -169,7 +173,7 @@ async def _process_job(job: dict) -> None:
 
 async def run_forever() -> None:
     print("[IngestionWorker] starting — polling ingestion_jobs every "
-          f"{POLL_INTERVAL_SECONDS}s")
+          f"{POLL_INTERVAL_SECONDS}s", flush=True)
     idle_polls = 0
     while True:
         job = await db.claim_next_pending_ingestion_job()

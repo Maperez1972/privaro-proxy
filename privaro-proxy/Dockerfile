@@ -1,5 +1,20 @@
 FROM python:3.11-slim
 
+# Fixed 2026-08-26 — real deploy issue: the worker deployment showed
+# "Starting Container" and then nothing at all, no error, no
+# [IngestionWorker] print output, for well over the time it should
+# take to import everything and print its first line. Python buffers
+# stdout by default when it's not connected to a TTY (true inside any
+# Docker container) -- print() calls can sit in a buffer indefinitely
+# instead of reaching `docker logs`/Railway's log stream, especially
+# with the worker's mix of a background thread (health server) and the
+# main asyncio loop. Baked into the image directly via ENV rather than
+# relying on a Railway environment variable — given how unreliable
+# getting Railway to apply per-service settings for this worker service
+# turned out to be across several earlier attempts this session, this
+# needs to hold regardless of any platform-side configuration.
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # System deps for spaCy + Tesseract OCR (image-document protection, Tier 1 —
