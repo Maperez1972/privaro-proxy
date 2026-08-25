@@ -1215,6 +1215,38 @@ async def protect_document(
 
     await quota_svc.check_and_increment(org_id)
 
+    # ── Routing: sync vs. async job ──────────────────────────────────────────
+    # Threshold based on Fase 0's real measurements, not a guess: Tier1+Tier2
+    # combined stays under ~1s below this size even in the worst case
+    # measured (see the RAG plan doc's scaling tables). Above it, Presidio
+    # alone can legitimately take longer than any reasonable HTTP timeout,
+    # so the request returns immediately with a job_id instead of holding
+    # the connection open.
+    if len(body.document) > settings.INGEST_SYNC_THRESHOLD_CHARS:
+        job_id = await db.create_ingestion_job({
+            "org_id": org_id,
+            "pipeline_id": body.pipeline_id,
+            "document_id_external": body.document_id,
+            "document": body.document,
+            "char_count": len(body.document),
+            "options": body.options.model_dump(),
+        })
+        if not job_id:
+            raise HTTPException(status_code=500, detail={"error": "job_creation_failed"})
+
+        # Rough estimate only, shown to the caller for UX (e.g. a progress
+        # spinner) — not a guarantee. Based on the Fase 0 measurements: Tier
+        # 1 (~1.3ms/1000 chars) + Tier 2 worst case observed (~117ms/1000
+        # chars above 300K chars), rounded up generously.
+        estimated_seconds = max(5, int(len(body.document) / 1000 * 0.15))
+
+        return ProtectDocumentResponse(
+            request_id=f"req_{uuid.uuid4().hex[:12]}",
+            status="processing",
+            job_id=job_id,
+            estimated_seconds=estimated_seconds,
+        )
+
     audit_log_id = str(uuid.uuid4())
 
     policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
@@ -1326,4 +1358,45 @@ async def protect_document(
         chunks=chunks,
         detections=detections,
         stats=stats,
+    )
+
+
+@router.get("/protect-document/{job_id}", response_model=ProtectDocumentResponse)
+async def get_protect_document_job(
+    job_id: str,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+):
+    """
+    Poll the status of an async document ingestion job (see
+    app/worker/ingestion_worker.py — the actual processing happens
+    there, in a separate process, not here).
+
+    Scoped to the caller's own org_id (via get_ingestion_job's own
+    filter) — a caller can never poll another organization's job by
+    guessing/enumerating job ids.
+    """
+    job = await db.get_ingestion_job(job_id, key_record["org_id"])
+    if not job:
+        raise HTTPException(status_code=404, detail={"error": "job_not_found"})
+
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    if job["status"] in ("pending", "processing"):
+        return ProtectDocumentResponse(request_id=request_id, status="processing", job_id=job_id)
+
+    if job["status"] == "failed":
+        return ProtectDocumentResponse(
+            request_id=request_id, status="failed", job_id=job_id,
+            degraded_mode=True, degraded_reason=job.get("error"),
+        )
+
+    result = job.get("result") or {}
+    return ProtectDocumentResponse(
+        request_id=request_id,
+        status="completed",
+        job_id=job_id,
+        protected_document=result.get("protected_document"),
+        chunks=[DocumentChunk(**c) for c in result.get("chunks", [])],
+        detections=[Detection(**d) for d in result.get("detections", [])],
+        stats=result.get("stats"),
     )
