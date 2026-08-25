@@ -1318,8 +1318,20 @@ async def protect_document(
     ]
 
     # ── Step 5: Persist (background — never blocks the response) ────────────
+    #
+    # Fixed 2026-08-25 — real production bug: resolve_encryption_key()
+    # takes (key_id, org_id) and returns a single bytes value, not
+    # (org_id) returning a (key, key_id) tuple. Every other call site in
+    # this file resolves the org's default key_id first via
+    # get_org_default_key_id(), then passes THAT into
+    # resolve_encryption_key() — this endpoint had never actually been
+    # exercised against a real pipeline before (Fase 0/1 testing all
+    # used synthetic function calls or a Supabase branch without a real
+    # provider/key setup), so this was caught by a live 500 on the
+    # first real request, not before.
     if body.options.reversible:
-        enc_key, enc_key_id = await resolve_encryption_key(org_id)
+        enc_key_id = await get_org_default_key_id(org_id)
+        enc_key = await resolve_encryption_key(enc_key_id, org_id)
         vault_rows = await _build_vault_rows(
             body.document, detections, org_id, body.pipeline_id, None, enc_key, enc_key_id,
         )
