@@ -330,6 +330,35 @@ PATTERNS: List[Tuple[str, str, re.Pattern, float]] = [
          r'|fdo\.?(?!\s+(?:dr\.?|dra\.?|d\.?/d\.?a\.?|sr\.?|sra\.?|don\b|doña\b|dña\.?)\s)'
          r'|fda\.?(?!\s+(?:dr\.?|dra\.?|d\.?/d\.?a\.?|sr\.?|sra\.?|don\b|doña\b|dña\.?)\s)'
          r')[\s:]+'
+         # General secondary-title consumption — added 2026-08-25, found
+         # via a live production smoke test (not a synthetic test case):
+         # "Médico: Dr. Carlos Ruiz Mena" left the name completely
+         # undetected, while the exact same name later in the same
+         # document ("Fdo. Dr. Carlos Ruiz Mena") WAS caught correctly.
+         # Root cause: identical mechanism to the Fdo./Fda. fix above,
+         # but that fix only guarded "fdo\.?"/"fda\.?" specifically —
+         # "médico" (and every other keyword in the list above) has the
+         # exact same problem whenever a title abbreviation sits between
+         # it and the real name. "médico:" matches, then tries to
+         # capture starting at "Dr" (2-letter word shape matches),
+         # captures just "Dr" (stops before the period — punctuation
+         # isn't in the continuation charset), which the title-only
+         # filter below correctly discards — but the regex engine's scan
+         # position has already advanced past "Dr" by then, so "dr\.?"
+         # can never fire separately at its own position afterward. Net
+         # effect: total miss, not partial.
+         #
+         # Rather than adding a negative lookahead to all ~30 keywords
+         # individually (fragile, easy to miss one), this consumes an
+         # OPTIONAL secondary title right here, for every keyword at
+         # once: "médico: Dr. " -> "Dr. " is absorbed here, real name
+         # capture starts cleanly at "Carlos". Deliberately excludes a
+         # bare "d\.?" option — a single letter "D" optionally followed
+         # by a period would incorrectly swallow the first letter of any
+         # real name starting with D (David, Diego, Daniela...), which
+         # are common Spanish first names; only multi-letter,
+         # unambiguous abbreviations are included.
+         r'(?:(?i:dr\.?|dra\.?|dña\.?|sr\.?|sra\.?|don\b|doña\b)[\s:]+)?'
          r'('
          r'(?:[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+|[A-ZÁÉÍÓÚÑ]{2,})'
          # Continuation words stay on the SAME line ([ \t-]+, never \n) —
