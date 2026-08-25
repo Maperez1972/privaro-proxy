@@ -23,10 +23,26 @@ Despliegue: pensado para correr como un SERVICIO SEPARADO en Railway
     python -m app.worker.ingestion_worker
 
 No comparte proceso con `uvicorn app.main:app`.
+
+Servidor de salud embebido — añadido 2026-08-26, hallazgo real de
+despliegue: Railway insistió en aplicar el healthcheckPath="/health"
+del railway.toml de la API a este servicio, incluso con
+railway.worker.toml correctamente referenciado en "Railway Config
+File" (comportamiento confirmado en los logs de deploy reales —
+"Configuration merged from ... /privaro-proxy/railway.toml", no el
+fichero worker-específico, pese a la configuración correcta). En vez
+de seguir peleando con la resolución de config de la plataforma, este
+worker ahora sirve su propio /health mínimo en un hilo de fondo, en
+paralelo al bucle de polling — así el healthcheck de Railway pasa
+siempre, sin depender de qué fichero de configuración esté leyendo
+realmente.
 """
 import asyncio
+import os
+import threading
 import time
 import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from app.services import detector, supabase as db
 from app.services.chunker import chunk_protected_document
@@ -39,10 +55,34 @@ from app.services import policy_engine as pe
 # relay.py/agent.py; esto habría sido una cuarta copia si no se
 # reutilizara así.
 from app.routers.proxy import _apply_tokenization, _build_vault_rows
-from app.services.key_manager import resolve_encryption_key
+from app.services.key_manager import resolve_encryption_key, get_org_default_key_id
 
 POLL_INTERVAL_SECONDS = 3.0
 IDLE_LOG_EVERY_N_POLLS = 20  # evita llenar los logs cuando no hay trabajo
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/health", "/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","service":"ingestion-worker"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # silenciar el log de acceso por defecto — no aporta nada útil aquí
+
+
+def _start_health_server() -> None:
+    port = int(os.environ.get("PORT", 8080))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[IngestionWorker] health server listening on :{port}/health "
+          f"(solo para satisfacer el healthcheck de Railway — el trabajo real es el polling de abajo)")
 
 
 async def _process_job(job: dict) -> None:
@@ -91,7 +131,14 @@ async def _process_job(job: dict) -> None:
         ]
 
         if reversible:
-            enc_key, enc_key_id = await resolve_encryption_key(org_id)
+            # Fixed 2026-08-26 — same bug found and fixed in proxy.py's
+            # protect_document(): resolve_encryption_key() takes
+            # (key_id, org_id) and returns a single bytes value, not
+            # (org_id) returning a (key, key_id) tuple. Never caught
+            # here specifically because the earlier manual validation
+            # of the async path used reversible=False on purpose.
+            enc_key_id = await get_org_default_key_id(org_id)
+            enc_key = await resolve_encryption_key(enc_key_id, org_id)
             vault_rows = await _build_vault_rows(
                 document, detections, org_id, pipeline_id, None, enc_key, enc_key_id,
             )
@@ -138,4 +185,5 @@ async def run_forever() -> None:
 
 
 if __name__ == "__main__":
+    _start_health_server()
     asyncio.run(run_forever())
