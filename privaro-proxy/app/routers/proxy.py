@@ -13,7 +13,7 @@ import base64
 import hashlib
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Header
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from app.models.schemas import (
     ProtectRequest, ProtectResponse,
@@ -22,6 +22,7 @@ from app.models.schemas import (
     ProtectStructuredRequest, ProtectStructuredResponse,
     ProtectOutputRequest, ProtectOutputResponse,
     ProtectDocumentRequest, ProtectDocumentResponse, DocumentChunk,
+    ProtectRetrievalRequest, ProtectRetrievalResponse, AllowedChunk, BlockedChunk,
     Detection,
 )
 from app.services import detector
@@ -1411,4 +1412,162 @@ async def get_protect_document_job(
         chunks=[DocumentChunk(**c) for c in result.get("chunks", [])],
         detections=[Detection(**d) for d in result.get("detections", [])],
         stats=result.get("stats"),
+    )
+
+
+# ── /proxy/protect-retrieval (RAG Retrieval Guard, Fase 2) ──────────────────
+#
+# Added 2026-08-26 — Fase 2 of the RAG expansion plan ("Privaro Retrieval
+# Guard"). Defense in depth for retrieved chunks right before they enter
+# the LLM's context: catches PII that slipped past ingestion (unprotected
+# upload paths, migrated vector stores never run through Privaro Ingest),
+# and enforces per-chunk access control based on the caller's own
+# metadata — something Ingest alone can't do, since it has no concept of
+# "who is asking" at index time.
+#
+# Cached by content hash (not caller-provided chunk id) — see
+# get_cached_chunk_protection()/upsert_chunk_protection_cache() in
+# supabase.py — since this endpoint sits in the critical path of every
+# single RAG query, unlike ingestion's one-time-per-document cost.
+#
+# Deliberately does NOT support Context Optimization — same reasoning as
+# ProtectDocumentRequest (Fase 1): Fase 0 found Kompress can crash the
+# whole process on large content, unresolved. This endpoint is on the
+# hot path of every RAG query, so the blast radius here is larger, not
+# smaller.
+@router.post("/protect-retrieval", response_model=ProtectRetrievalResponse)
+async def protect_retrieval(
+    body: ProtectRetrievalRequest,
+    background_tasks: BackgroundTasks,
+    key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
+):
+    """
+    Protect a batch of retrieved chunks before they're stuffed into an
+    LLM's context, and filter out any the requester isn't allowed to see.
+
+    Per-chunk flow:
+    1. Access control — if chunk.allowed_roles is set and the requester's
+       role isn't in it, block outright (no detection work wasted on it).
+    2. Cache lookup by content hash — if this exact text was already
+       protected for this org, reuse the result instead of re-running
+       detection.
+    3. On a cache miss: detect + tokenise (same resilient, fail-open
+       pattern as /protect and /protect-document), then cache the result.
+    """
+    t0 = time.monotonic()
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+
+    pipeline = await db.get_pipeline(body.pipeline_id)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail={"error": "pipeline_not_found"})
+    if pipeline["org_id"] != key_record["org_id"]:
+        raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
+
+    org_id = pipeline["org_id"]
+    await quota_svc.check_and_increment(org_id)
+
+    policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
+    custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
+
+    allowed: List[AllowedChunk] = []
+    blocked: List[BlockedChunk] = []
+    cache_hits = 0
+    audit_entities_total = 0
+
+    for chunk in body.chunks:
+        # ── Step 1: access control ────────────────────────────────────
+        if chunk.allowed_roles and body.requester.role not in chunk.allowed_roles:
+            blocked.append(BlockedChunk(
+                id=chunk.id, reason="access_denied",
+                detail=f"requester role '{body.requester.role}' not in chunk's allowed_roles",
+            ))
+            continue
+
+        content_hash = hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+
+        # ── Step 2: cache lookup ──────────────────────────────────────
+        cached = await db.get_cached_chunk_protection(org_id, content_hash)
+        if cached:
+            cache_hits += 1
+            allowed.append(AllowedChunk(
+                id=chunk.id, protected_text=cached["protected_text"],
+                detections_count=cached["detections_count"], from_cache=True,
+            ))
+            audit_entities_total += cached["detections_count"]
+            continue
+
+        # ── Step 3: cache miss — detect + tokenise (fails open) ────────
+        try:
+            loop = asyncio.get_event_loop()
+            detections = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, detector.detect, chunk.text, body.options.use_nlp, custom_pattern_rules,
+                ),
+                timeout=settings.PROTECT_TIMEOUT_SECONDS * 5,
+                # 5x, not 20x like /protect-document: this endpoint is on
+                # the hot path of a live RAG query, not a background
+                # ingestion job — a much tighter bound is appropriate.
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            reason = "detector_timeout" if isinstance(e, asyncio.TimeoutError) else "detector_error"
+            print(f"[Resilience] /protect-retrieval chunk {chunk.id} degraded ({reason}): {e}")
+            # Fail CLOSED here, not open — unlike /protect-document (whose
+            # failure mode is returning the original document unmodified,
+            # safe because the caller already trusts that whole document),
+            # a single chunk failing detection in a batch must not leak
+            # potentially-unprotected text into an LLM prompt just because
+            # ITS neighbours in the same request succeeded. Block it and
+            # let the caller retry that one chunk, rather than silently
+            # passing raw content through.
+            blocked.append(BlockedChunk(id=chunk.id, reason=reason, detail=str(e)[:200]))
+            continue
+
+        for d in detections:
+            d.action = "tokenised" if body.options.mode.value == "tokenise" else body.options.mode.value
+
+        counters: Dict[str, int] = {}
+        protected_text = _apply_tokenization(chunk.text, detections, counters)
+
+        background_tasks.add_task(
+            db.upsert_chunk_protection_cache, org_id, content_hash, protected_text, len(detections),
+        )
+
+        allowed.append(AllowedChunk(
+            id=chunk.id, protected_text=protected_text,
+            detections_count=len(detections), from_cache=False,
+        ))
+        audit_entities_total += len(detections)
+
+    processing_ms = int((time.monotonic() - t0) * 1000)
+
+    background_tasks.add_task(db.insert_audit_log, {
+        "id": str(uuid.uuid4()),
+        "org_id": org_id, "pipeline_id": body.pipeline_id,
+        "event_type": "protect_retrieval",
+        "entity_type": "chunk_batch", "entity_category": "retrieval",
+        "action_taken": "tokenised", "severity": "info",
+        "prompt_hash": hashlib.sha256(
+            "".join(c.text for c in body.chunks).encode()
+        ).hexdigest(),
+        "metadata": {
+            "request_id": request_id, "requester_role": body.requester.role,
+            "chunks_in": len(body.chunks), "chunks_allowed": len(allowed),
+            "chunks_blocked": len(blocked), "cache_hits": cache_hits,
+            "total_detected": audit_entities_total,
+        },
+    })
+
+    return ProtectRetrievalResponse(
+        request_id=request_id,
+        allowed_chunks=allowed,
+        blocked_chunks=blocked,
+        stats={
+            "chunks_in": len(body.chunks),
+            "chunks_allowed": len(allowed),
+            "chunks_blocked": len(blocked),
+            "cache_hits": cache_hits,
+            "cache_hit_rate": round(cache_hits / len(body.chunks), 3) if body.chunks else 0.0,
+            "total_detected": audit_entities_total,
+            "processing_ms": processing_ms,
+        },
     )

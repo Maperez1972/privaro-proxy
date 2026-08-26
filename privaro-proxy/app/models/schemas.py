@@ -170,6 +170,66 @@ class ProtectDocumentResponse(BaseModel):
     degraded_reason: Optional[str] = None
 
 
+# ── /proxy/protect-retrieval (RAG Retrieval Guard, Fase 2) ─────────────────
+#
+# Added 2026-08-26 — Fase 2 of the RAG expansion plan ("Privaro Retrieval
+# Guard"). Defense in depth for retrieved chunks right before they enter the
+# LLM's context — catches PII that slipped past ingestion (unprotected
+# upload paths, migrated vector stores never run through Privaro Ingest)
+# AND enforces per-chunk access control based on the org's own metadata,
+# something Ingest alone can't do since it has no concept of "who is
+# asking" at index time.
+#
+# Deliberately does NOT include an optimize_context option — same
+# reasoning as ProtectDocumentRequest (Fase 1): Fase 0's audit found
+# Kompress can crash the whole process on documents/content above ~30K
+# characters, unresolved as of this endpoint. This one is in the request
+# path of every single RAG query (unlike ingestion, a one-time cost per
+# document), so the blast radius of that crash risk is much larger here,
+# not smaller — reinforces the same exclusion, doesn't relax it.
+class RetrievalChunkInput(BaseModel):
+    id: str
+    text: str
+    # Access control, opt-in: if omitted entirely, the chunk is treated as
+    # accessible to any requester (matches how most vector DBs behave today
+    # if the customer hasn't set up granular ACLs) — this endpoint adds
+    # PII protection unconditionally either way; access control only
+    # activates when the org actually tags chunks with it.
+    allowed_roles: Optional[List[str]] = None
+
+
+class RetrievalRequester(BaseModel):
+    user_id: Optional[str] = None
+    role: str = "developer"
+
+
+class ProtectRetrievalRequest(BaseModel):
+    pipeline_id: str
+    chunks: List[RetrievalChunkInput] = Field(..., min_length=1, max_length=200)
+    requester: RetrievalRequester = RetrievalRequester()
+    options: DocumentIngestOptions = DocumentIngestOptions()
+
+
+class AllowedChunk(BaseModel):
+    id: str
+    protected_text: str
+    detections_count: int
+    from_cache: bool = False
+
+
+class BlockedChunk(BaseModel):
+    id: str
+    reason: str
+    detail: Optional[str] = None
+
+
+class ProtectRetrievalResponse(BaseModel):
+    request_id: str
+    allowed_chunks: List[AllowedChunk]
+    blocked_chunks: List[BlockedChunk]
+    stats: Dict[str, Any]
+
+
 class ProtectOutputResponse(BaseModel):
     request_id: str
     protected_response: str
