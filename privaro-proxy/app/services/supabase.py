@@ -1366,3 +1366,47 @@ async def fail_ingestion_job(job_id: str, error: str) -> bool:
             },
         )
         return response.status_code in (200, 204)
+
+
+# ── Retrieval Guard — chunk protection cache (Fase 2 del plan de RAG) ─────
+#
+# Added 2026-08-26. Unlike ingestion (a one-time cost per document), this
+# endpoint sits in the critical path of EVERY RAG query -- re-running Tier
+# 1 + Tier 2 detection on the same chunk content every single time a user
+# asks a question would be wasteful and slow. Keyed by content hash, not
+# caller-provided chunk_id, so the same text re-indexed under a different
+# id still benefits from the cache.
+
+async def get_cached_chunk_protection(org_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_REST}/chunk_protection_cache",
+            headers=SUPABASE_HEADERS,
+            params={
+                "org_id": f"eq.{org_id}",
+                "content_hash": f"eq.{content_hash}",
+                "select": "protected_text,detections_count",
+                "limit": "1",
+            },
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data[0] if data else None
+        return None
+
+
+async def upsert_chunk_protection_cache(
+    org_id: str, content_hash: str, protected_text: str, detections_count: int,
+) -> bool:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.post(
+            f"{SUPABASE_REST}/chunk_protection_cache",
+            headers={**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            params={"on_conflict": "org_id,content_hash"},
+            json={
+                "org_id": org_id, "content_hash": content_hash,
+                "protected_text": protected_text, "detections_count": detections_count,
+                "last_used_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return response.status_code in (200, 201)
