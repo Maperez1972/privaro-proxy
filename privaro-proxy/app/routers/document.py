@@ -1,6 +1,23 @@
 """
 Document Protect Router — Phase 9
-POST /v1/proxy/protect-document — multipart/form-data
+
+FIXED 2026-09-20 (real production bug, confirmed by a live request to the
+old path returning 422): this used to be POST /v1/proxy/protect-document,
+the EXACT SAME path already registered by app/routers/proxy.py for
+Ingest's JSON/text protect_document() endpoint (Fase 1 of the RAG
+expansion). Since proxy.router is included before document.router in
+main.py, FastAPI/Starlette always dispatched to proxy.py's JSON handler
+for that path -- this multipart file-upload endpoint has been completely
+unreachable since it was deployed. Sending a real file to the old path
+in production confirmed this: HTTP 422 "Input should be a valid
+dictionary or object to extract fields from" (the JSON-Pydantic error
+you get when multipart hits a route that expects a JSON body).
+
+Moved to its own path below so both endpoints are reachable: JSON/text
+stays at /v1/proxy/protect-document, this file-upload version is now at
+/v1/proxy/protect-document/upload.
+
+POST /v1/proxy/protect-document/upload — multipart/form-data
 
 Accepts a file upload, extracts text, applies PII protection,
 and returns the protected text ready to send to an LLM.
@@ -38,7 +55,7 @@ router = APIRouter()
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
 
-@router.post("/protect-document")
+@router.post("/protect-document/upload")
 async def protect_document(
     background_tasks: BackgroundTasks,
     key_record: Dict[str, Any] = Depends(verify_api_key_or_internal),
