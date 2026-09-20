@@ -46,6 +46,7 @@ from app.services.auth import verify_api_key_or_internal
 from app.services import supabase as db
 from app.services import ibs
 from app.services import policy_engine as pe
+from app.services import quota as quota_svc
 from app.services.document_processor import extract_text
 from app.config import settings
 
@@ -113,6 +114,13 @@ async def protect_document(
             status_code=422,
             detail={"error": "empty_document", "detail": "No text could be extracted from the document"}
         )
+
+    # Quota was never enforced on this endpoint at all -- found during a
+    # pricing audit, right after finding this endpoint's route was
+    # unreachable in the first place. Weighted by extracted text length,
+    # same formula and rationale as the JSON/text protect-document
+    # endpoint in proxy.py -- see quota.py's module docstring.
+    await quota_svc.check_and_increment(org_id, units=quota_svc.units_for_chars(len(extracted_text)))
 
     # ── Step 4: Load policies ─────────────────────────────────────────────────
     policies = await db.get_policy_rules(org_id, pipeline_id=pipeline_id) or []

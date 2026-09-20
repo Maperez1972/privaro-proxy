@@ -1,6 +1,31 @@
 """
 quota.py — Request quota enforcement.
 
+v4 (2026-09): check_and_increment() now takes an optional `units`
+parameter instead of always counting 1. Added specifically because a
+single Privaro Ingest call could submit up to 2,000,000 characters of
+document text -- and up to this point it consumed exactly the same "1
+request" as a 50-character chat prompt, a real cost/billing mismatch
+found during a pricing audit (a customer ingesting documents in volume
+would cost far more to serve than their plan's request count would
+ever reflect). Retrieval Guard has the same issue in the other
+direction: one call can carry a whole batch of independent chunks.
+
+units_for_chars() defines the size-to-units conversion for Ingest in
+one place, so proxy.py and document.py's file-upload endpoint (which
+share the same characters-in, tokens-out shape) can't drift into two
+different formulas. Retrieval Guard doesn't need a similar helper --
+its natural unit is "one per chunk in the batch", computed inline at
+the call site.
+
+The RPC (increment_billing_requests) takes p_units with a server-side
+DEFAULT 1, so every OTHER call site in this codebase that still calls
+check_and_increment(org_id) with no units argument is completely
+unaffected by this change -- verified by hand-tracing the SQL for the
+units=1 case before shipping, and confirmed live against a real test
+org (small jump, a boundary-crossing jump, and an already-over-quota
+call) before touching any Python call site.
+
 v3 (2026-07): fires a usage_threshold (80%) / usage_overage (100%)
 notification the FIRST time each is crossed per billing cycle. The RPC
 (increment_billing_requests) does the crossing detection and dedup
@@ -20,12 +45,28 @@ are handled by pg_cron jobs in Supabase — nothing to do here.
 
 import asyncio
 import logging
+import math
 from app.services import supabase as db
 
 logger = logging.getLogger(__name__)
 
+# One billing unit per this many characters of document text, rounded up,
+# with a minimum of 1 -- so a tiny document still costs the same as it
+# always has, and a 2,000,000-character document costs 1,000 units rather
+# than 1. 2,000 chars is a generous stand-in for a typical protected chat
+# prompt (the thing "1 unit" has always implicitly meant on every other
+# endpoint), not a measured compute-cost figure -- it's a proportionality
+# choice, easy to retune from this one constant if real usage data later
+# says otherwise.
+INGEST_UNIT_CHARS = 2000
 
-async def check_and_increment(org_id: str) -> dict:
+
+def units_for_chars(char_count: int) -> int:
+    """Billing units for a document of this many characters."""
+    return max(1, math.ceil(char_count / INGEST_UNIT_CHARS))
+
+
+async def check_and_increment(org_id: str, units: int = 1) -> dict:
     """
     Atomically increment the org's billing account request counter.
 
@@ -36,7 +77,7 @@ async def check_and_increment(org_id: str) -> dict:
     try:
         result = await db.rpc(
             "increment_billing_requests",
-            {"p_org_id": org_id},
+            {"p_org_id": org_id, "p_units": units},
         )
     except Exception as e:
         logger.error(f"[Quota] RPC error for org {org_id}: {e}")
