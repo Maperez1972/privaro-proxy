@@ -1214,7 +1214,10 @@ async def protect_document(
 
     org_id = pipeline["org_id"]
 
-    await quota_svc.check_and_increment(org_id)
+    # Weighted by document size, not a flat 1 -- see quota.py's module
+    # docstring. A pasted 50-char snippet still costs 1 unit exactly like
+    # /proxy/protect always has; a 2,000,000-char document costs 1,000.
+    await quota_svc.check_and_increment(org_id, units=quota_svc.units_for_chars(len(body.document)))
 
     # ── Routing: sync vs. async job ──────────────────────────────────────────
     # Threshold based on Fase 0's real measurements, not a guess: Tier1+Tier2
@@ -1464,7 +1467,10 @@ async def protect_retrieval(
         raise HTTPException(status_code=403, detail={"error": "pipeline_org_mismatch"})
 
     org_id = pipeline["org_id"]
-    await quota_svc.check_and_increment(org_id)
+    # Weighted by batch size, not a flat 1 -- one call here can carry
+    # many independent chunks, each getting its own detection pass
+    # (or cache lookup). See quota.py's module docstring.
+    await quota_svc.check_and_increment(org_id, units=max(1, len(body.chunks)))
 
     policies = await db.get_policy_rules(org_id, pipeline_id=body.pipeline_id) or []
     custom_pattern_rules = [r for r in policies if r.get("custom_pattern")]
