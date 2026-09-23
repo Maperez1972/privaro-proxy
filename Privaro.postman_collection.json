@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Privaro API",
-    "description": "Privaro is a runtime data governance layer that sits between your application (or agents) and any LLM provider (OpenAI, Anthropic, Google, Azure OpenAI, local models). It detects sensitive data, tokenizes it reversibly, and lets you re-identify it safely outside the model. Source of truth: github.com/Maperez1972/privaro-proxy README. Docs: https://privaro.ai (dedicated docs site coming soon per that repo).",
+    "description": "Full, verified endpoint surface of the Privaro Proxy API (17 endpoints across Proxy, Relay, Agent and Document routers) — built directly from the FastAPI source code, not from documentation. Auth: X-Privaro-Key header (prvr_... key).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -14,49 +14,156 @@
   },
   "variable": [
     { "key": "base_url", "value": "https://api.privaro.ai/v1" },
-    { "key": "privaro_api_key", "value": "YOUR_API_KEY" },
+    { "key": "privaro_api_key", "value": "prvr_your_key_here" },
     { "key": "pipeline_id", "value": "your_pipeline_id" },
-    { "key": "agent_run_id", "value": "" }
+    { "key": "conversation_id", "value": "00000000-0000-0000-0000-000000000001" },
+    { "key": "agent_run_id", "value": "" },
+    { "key": "job_id", "value": "" }
   ],
   "item": [
     {
-      "name": "Protect",
+      "name": "Proxy",
       "item": [
         {
-          "name": "Protect a prompt (detect + tokenize)",
+          "name": "Detect (analysis only, no masking)",
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": {
-              "raw": "{{base_url}}/proxy/protect",
-              "host": ["{{base_url}}"],
-              "path": ["proxy", "protect"]
-            },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"prompt\": \"My name is John Doe and my IBAN is ES7620770024003102575766\",\n  \"pipeline_id\": \"{{pipeline_id}}\"\n}"
-            },
-            "description": "Detects PII in the prompt and returns protected_prompt with reversible tokens, plus a list of detections. Does not call an LLM — forward protected_prompt to your own LLM call. Example from the privaro-proxy README."
+            "url": { "raw": "{{base_url}}/proxy/detect", "host": ["{{base_url}}"], "path": ["proxy", "detect"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"prompt\": \"My name is John Doe and my IBAN is ES7620770024003102575766\"\n}" },
+            "description": "Detects PII without tokenizing, masking, or persisting anything."
           }
         },
         {
-          "name": "Protect an image/document (OCR + PII)",
+          "name": "Protect (core endpoint)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/protect", "host": ["{{base_url}}"], "path": ["proxy", "protect"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"prompt\": \"My name is John Doe and my IBAN is ES7620770024003102575766\",\n  \"conversation_id\": \"{{conversation_id}}\",\n  \"options\": {\n    \"mode\": \"tokenise\",\n    \"reversible\": true,\n    \"include_detections\": true\n  }\n}" },
+            "description": "conversation_id is REQUIRED whenever options.reversible is true (the default) — tokens are not unique across unrelated requests over time."
+          }
+        },
+        {
+          "name": "Protect Output (output-direction scan)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/protect-output", "host": ["{{base_url}}"], "path": ["proxy", "protect-output"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"response_text\": \"<paste your LLM's raw response here>\",\n  \"conversation_id\": \"{{conversation_id}}\"\n}" },
+            "description": "Requires output scanning enabled for the pipeline (Dashboard → Pipelines → Settings) — 403 otherwise. For customers who call the LLM themselves (not via /relay)."
+          }
+        },
+        {
+          "name": "Detokenize (bulk token reversal)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/detokenize", "host": ["{{base_url}}"], "path": ["proxy", "detokenize"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"text\": \"Contact [NM-0001] regarding IBAN [BK-0001]\",\n  \"conversation_id\": \"{{conversation_id}}\"\n}" },
+            "description": "Reverses every [XX-0001]-style token found in text, scoped to this org and conversation_id."
+          }
+        },
+        {
+          "name": "Protect Structured (field-aware)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/protect-structured", "host": ["{{base_url}}"], "path": ["proxy", "protect-structured"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"fields\": {\n    \"paciente\": \"María García\",\n    \"diagnostico\": \"Diabetes tipo 2\"\n  },\n  \"conversation_id\": \"{{conversation_id}}\"\n}" },
+            "description": "A field's NAME can force its entity_type via policy (field_name_pattern), regardless of content — e.g. 'diagnostico' is always treated as health data."
+          }
+        },
+        {
+          "name": "Protect Document (RAG ingest)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/protect-document", "host": ["{{base_url}}"], "path": ["proxy", "protect-document"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"document\": \"<full document text here>\",\n  \"document_id\": \"doc-001\",\n  \"options\": {\n    \"mode\": \"tokenise\",\n    \"reversible\": true,\n    \"use_nlp\": true,\n    \"chunk_size\": 512\n  }\n}" },
+            "description": "Protects the whole document BEFORE chunking. Large documents return status=processing + job_id instead of the full result — poll with the next request."
+          }
+        },
+        {
+          "name": "Get Document Job Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/proxy/protect-document/{{job_id}}", "host": ["{{base_url}}"], "path": ["proxy", "protect-document", "{{job_id}}"] },
+            "description": "Poll an async ingestion job started by Protect Document. Scoped to your org — another org's job_id returns 404."
+          }
+        },
+        {
+          "name": "Protect Retrieval (RAG guard, batch)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/proxy/protect-retrieval", "host": ["{{base_url}}"], "path": ["proxy", "protect-retrieval"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"chunks\": [\n    { \"id\": \"chunk-1\", \"text\": \"Client Jane Smith, account 12345\", \"allowed_roles\": [\"admin\", \"dpo\"] },\n    { \"id\": \"chunk-2\", \"text\": \"General product FAQ content\" }\n  ],\n  \"requester\": { \"role\": \"developer\" }\n}" },
+            "description": "Protects retrieved chunks right before they enter the LLM's context. Chunks with allowed_roles the requester lacks are blocked outright, not just detected."
+          }
+        },
+        {
+          "name": "Protect Image/Document (OCR)",
           "request": {
             "method": "POST",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/proxy/protect-image-document",
-              "host": ["{{base_url}}"],
-              "path": ["proxy", "protect-image-document"]
-            },
+            "url": { "raw": "{{base_url}}/proxy/protect-image-document", "host": ["{{base_url}}"], "path": ["proxy", "protect-image-document"] },
             "body": {
               "mode": "formdata",
               "formdata": [
                 { "key": "file", "type": "file", "src": [] },
-                { "key": "pipeline_id", "value": "{{pipeline_id}}", "type": "text" }
+                { "key": "pipeline_id", "value": "{{pipeline_id}}", "type": "text" },
+                { "key": "conversation_id", "value": "{{conversation_id}}", "type": "text" },
+                { "key": "return_redacted_image", "value": "true", "type": "text" }
               ]
             },
-            "description": "Runs OCR on the uploaded file and applies the same detection/tokenization pipeline as text prompts. Supports PDF, DOCX, CSV, Excel per the supported-inputs list."
+            "description": "OCRs (Tesseract) a photographed/scanned document and applies the same detection engine as /protect. Returns protected text + a redacted image with PII blacked out. Max 15MB, jpeg/png/webp/tiff."
+          }
+        },
+        {
+          "name": "Health Check (sample detection)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/proxy/test", "host": ["{{base_url}}"], "path": ["proxy", "test"] },
+            "description": "Runs a fixed sample string through both detector tiers (regex + NLP) — confirms the detector is live."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Relay",
+      "item": [
+        {
+          "name": "Complete (protect + call LLM + de-tokenize)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/relay/complete", "host": ["{{base_url}}"], "path": ["relay", "complete"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Soy Juan Pérez, ¿podéis confirmarme mi cita?\" }\n  ],\n  \"conversation_id\": \"{{conversation_id}}\"\n}" },
+            "description": "Privaro protects the messages, calls the LLM configured at /app/admin/providers for this pipeline, and returns an already de-tokenized response."
+          }
+        },
+        {
+          "name": "Stream (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": { "raw": "{{base_url}}/relay/stream", "host": ["{{base_url}}"], "path": ["relay", "stream"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Soy Juan Pérez, ¿podéis confirmarme mi cita?\" }\n  ],\n  \"conversation_id\": \"{{conversation_id}}\"\n}" },
+            "description": "Streamed version via SSE. Requires organizations.streaming_enabled (403 if disabled). Output-direction scanning here is audit-only, post-hoc."
+          }
+        },
+        {
+          "name": "List Providers",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/relay/providers", "host": ["{{base_url}}"], "path": ["relay", "providers"] }
           }
         }
       ]
@@ -69,33 +176,19 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": {
-              "raw": "{{base_url}}/agent/run/start",
-              "host": ["{{base_url}}"],
-              "path": ["agent", "run", "start"]
-            },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"agent_framework\": \"crewai\"\n}"
-            },
-            "description": "Opens an agent_run_id that scopes token consistency across the following calls (e.g. a LangChain or CrewAI agent with several steps). Save the returned agent_run_id into the {{agent_run_id}} collection variable for the next requests."
+            "url": { "raw": "{{base_url}}/agent/run/start", "host": ["{{base_url}}"], "path": ["agent", "run", "start"] },
+            "body": { "mode": "raw", "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"agent_framework\": \"crewai\"\n}" },
+            "description": "Save the returned agent_run_id into the {{agent_run_id}} collection variable before running the next requests."
           }
         },
         {
-          "name": "2. Protect a message in the run",
+          "name": "2. Protect a step",
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": {
-              "raw": "{{base_url}}/agent/protect",
-              "host": ["{{base_url}}"],
-              "path": ["agent", "protect"]
-            },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"prompt\": \"Review contract for Jane Smith, account 1234567890\"\n}"
-            },
-            "description": "Same detection/tokenization as /proxy/protect, scoped to agent_run_id so the same PII value maps to the same token across every step of the run."
+            "url": { "raw": "{{base_url}}/agent/protect", "host": ["{{base_url}}"], "path": ["agent", "protect"] },
+            "body": { "mode": "raw", "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Review contract for Jane Smith, account 1234567890\", \"step_type\": \"prompt\" }\n  ]\n}" },
+            "description": "role in (assistant, tool) or step_type in (tool_output, observation) is evaluated as direction=output against policy; user/system stays direction=input."
           }
         },
         {
@@ -103,16 +196,8 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": {
-              "raw": "{{base_url}}/agent/reveal",
-              "host": ["{{base_url}}"],
-              "path": ["agent", "reveal"]
-            },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"text\": \"<paste LLM output containing tokens like [NM-0001] here>\"\n}"
-            },
-            "description": "Recovers original values for tokens produced earlier in the same agent run — use before showing a final answer to the end user."
+            "url": { "raw": "{{base_url}}/agent/reveal", "host": ["{{base_url}}"], "path": ["agent", "reveal"] },
+            "body": { "mode": "raw", "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"text\": \"<paste text containing tokens like [NM-0001] here>\"\n}" }
           }
         },
         {
@@ -120,16 +205,8 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "url": {
-              "raw": "{{base_url}}/agent/run/end",
-              "host": ["{{base_url}}"],
-              "path": ["agent", "run", "end"]
-            },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\"\n}"
-            },
-            "description": "Closes the run. Further /agent/protect or /agent/reveal calls against this agent_run_id will fail after this."
+            "url": { "raw": "{{base_url}}/agent/run/end", "host": ["{{base_url}}"], "path": ["agent", "run", "end"] },
+            "body": { "mode": "raw", "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"status\": \"completed\"\n}" }
           }
         }
       ]
