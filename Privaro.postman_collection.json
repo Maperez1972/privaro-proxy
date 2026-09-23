@@ -1,0 +1,138 @@
+{
+  "info": {
+    "name": "Privaro API",
+    "description": "Privaro is a runtime data governance layer that sits between your application (or agents) and any LLM provider (OpenAI, Anthropic, Google, Azure OpenAI, local models). It detects sensitive data, tokenizes it reversibly, and lets you re-identify it safely outside the model. Source of truth: github.com/Maperez1972/privaro-proxy README. Docs: https://privaro.ai (dedicated docs site coming soon per that repo).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "X-Privaro-Key", "type": "string" },
+      { "key": "value", "value": "{{privaro_api_key}}", "type": "string" },
+      { "key": "in", "value": "header", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://api.privaro.ai/v1" },
+    { "key": "privaro_api_key", "value": "YOUR_API_KEY" },
+    { "key": "pipeline_id", "value": "your_pipeline_id" },
+    { "key": "agent_run_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Protect",
+      "item": [
+        {
+          "name": "Protect a prompt (detect + tokenize)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/proxy/protect",
+              "host": ["{{base_url}}"],
+              "path": ["proxy", "protect"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"My name is John Doe and my IBAN is ES7620770024003102575766\",\n  \"pipeline_id\": \"{{pipeline_id}}\"\n}"
+            },
+            "description": "Detects PII in the prompt and returns protected_prompt with reversible tokens, plus a list of detections. Does not call an LLM — forward protected_prompt to your own LLM call. Example from the privaro-proxy README."
+          }
+        },
+        {
+          "name": "Protect an image/document (OCR + PII)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/proxy/protect-image-document",
+              "host": ["{{base_url}}"],
+              "path": ["proxy", "protect-image-document"]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "file", "type": "file", "src": [] },
+                { "key": "pipeline_id", "value": "{{pipeline_id}}", "type": "text" }
+              ]
+            },
+            "description": "Runs OCR on the uploaded file and applies the same detection/tokenization pipeline as text prompts. Supports PDF, DOCX, CSV, Excel per the supported-inputs list."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Agent (multi-step runs)",
+      "item": [
+        {
+          "name": "1. Start agent run",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/agent/run/start",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "run", "start"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pipeline_id\": \"{{pipeline_id}}\",\n  \"agent_framework\": \"crewai\"\n}"
+            },
+            "description": "Opens an agent_run_id that scopes token consistency across the following calls (e.g. a LangChain or CrewAI agent with several steps). Save the returned agent_run_id into the {{agent_run_id}} collection variable for the next requests."
+          }
+        },
+        {
+          "name": "2. Protect a message in the run",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/agent/protect",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "protect"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"prompt\": \"Review contract for Jane Smith, account 1234567890\"\n}"
+            },
+            "description": "Same detection/tokenization as /proxy/protect, scoped to agent_run_id so the same PII value maps to the same token across every step of the run."
+          }
+        },
+        {
+          "name": "3. Reveal tokens back to real values",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/agent/reveal",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "reveal"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\",\n  \"text\": \"<paste LLM output containing tokens like [NM-0001] here>\"\n}"
+            },
+            "description": "Recovers original values for tokens produced earlier in the same agent run — use before showing a final answer to the end user."
+          }
+        },
+        {
+          "name": "4. End agent run",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/agent/run/end",
+              "host": ["{{base_url}}"],
+              "path": ["agent", "run", "end"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent_run_id\": \"{{agent_run_id}}\"\n}"
+            },
+            "description": "Closes the run. Further /agent/protect or /agent/reveal calls against this agent_run_id will fail after this."
+          }
+        }
+      ]
+    }
+  ]
+}
