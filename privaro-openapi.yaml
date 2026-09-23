@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Privaro API
+  description: |
+    Privaro sits between your applications and any LLM provider (OpenAI, Azure OpenAI,
+    Anthropic, Google, or local models) as a runtime data governance layer: it detects
+    personal data in prompts, replaces it with reversible tokens, and lets you re-identify
+    the original values safely outside the model.
+
+    **Source of truth for this spec:** the `privaro-proxy` repository README
+    (github.com/Maperez1972/privaro-proxy), which documents the actual REST API, plus
+    `/v1/proxy/protect-image-document` confirmed separately. The official SDKs
+    (`privaro-sdk-python`, `privaro-sdk-js`) wrap this API with a higher-level
+    `protect()` / `relay()` interface — if you're integrating via SDK rather than raw
+    HTTP, prefer the SDK docs. Verify field names and auth against your dashboard before
+    production use; this spec was assembled from repository documentation, not a live
+    schema export.
+  version: "1.0"
+  contact:
+    name: Privaro
+    url: https://privaro.ai/docs
+    email: partners@privaro.ai
+servers:
+  - url: https://api.privaro.ai/v1
+    description: Production
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Protect
+    description: Tokenize sensitive data before it reaches an LLM
+  - name: Agent
+    description: Multi-step agent runs — protect and reveal across a sequence of steps
+  - name: Documents
+    description: OCR + PII protection for uploaded images/documents
+
+paths:
+  /proxy/protect:
+    post:
+      tags: [Protect]
+      summary: Detect and tokenize PII in a prompt
+      description: >
+        Detects personally identifiable information in the given prompt and replaces it
+        with reversible tokens (e.g. "John Doe" -> "[NM-0001]", an IBAN -> "[BK-0001]").
+        Does not call an LLM — forward the returned protected_prompt to your own LLM call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt, pipeline_id]
+              properties:
+                prompt:
+                  type: string
+                  example: "My name is John Doe and my IBAN is ES7620770024003102575766"
+                pipeline_id:
+                  type: string
+                  description: Defines which policies apply to this request.
+      responses:
+        "200":
+          description: Prompt successfully scanned and tokenized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectResult"
+        "401":
+          $ref: "#/components/responses/AuthError"
+        "403":
+          $ref: "#/components/responses/PolicyBlock"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimit"
+
+  /agent/run/start:
+    post:
+      tags: [Agent]
+      summary: Start a multi-step agent run
+      description: >
+        Opens an agent_run_id that scopes token consistency across the following
+        /agent/protect and /agent/reveal calls in the same run (e.g. a LangChain or
+        CrewAI agent making several tool/LLM calls in sequence).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id]
+              properties:
+                pipeline_id:
+                  type: string
+                agent_framework:
+                  type: string
+                  example: "crewai"
+      responses:
+        "200":
+          description: Agent run created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_run_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthError"
+
+  /agent/protect:
+    post:
+      tags: [Agent]
+      summary: Protect a message within an active agent run
+      description: >
+        Same detection/tokenization as /proxy/protect, scoped to an agent_run_id so the
+        same PII value maps to the same token across every step of the run.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_run_id, prompt]
+              properties:
+                agent_run_id:
+                  type: string
+                prompt:
+                  type: string
+      responses:
+        "200":
+          description: Message protected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectResult"
+        "401":
+          $ref: "#/components/responses/AuthError"
+        "404":
+          description: agent_run_id not found or already ended.
+
+  /agent/reveal:
+    post:
+      tags: [Agent]
+      summary: Re-identify tokenized values within an agent run
+      description: >
+        Recovers original values for tokens produced earlier in the same agent run —
+        used to safely reveal the real data outside the model, e.g. before showing a
+        final answer to the end user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_run_id, text]
+              properties:
+                agent_run_id:
+                  type: string
+                text:
+                  type: string
+                  description: Text containing tokens (e.g. "[NM-0001]") to resolve back to real values.
+      responses:
+        "200":
+          description: Text with tokens resolved back to original values.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revealed:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthError"
+
+  /agent/run/end:
+    post:
+      tags: [Agent]
+      summary: End an agent run
+      description: Closes the agent_run_id. Further /agent/protect or /agent/reveal calls against it will fail.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_run_id]
+              properties:
+                agent_run_id:
+                  type: string
+      responses:
+        "200":
+          description: Run closed.
+        "401":
+          $ref: "#/components/responses/AuthError"
+
+  /proxy/protect-image-document:
+    post:
+      tags: [Documents]
+      summary: OCR + PII protection for an uploaded image or document
+      description: >
+        Runs OCR (Google Cloud Vision as primary engine) on an uploaded image/document
+        and applies the same detection and tokenization pipeline used for text.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                pipeline_id:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Document processed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectResult"
+        "401":
+          $ref: "#/components/responses/AuthError"
+        "413":
+          description: File too large.
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Privaro-Key
+      description: >
+        API key issued from the Privaro dashboard. Request access at https://privaro.ai.
+        Sent as the `X-Privaro-Key` header (not an Authorization/Bearer header).
+
+  schemas:
+    ProtectResult:
+      type: object
+      description: >
+        Response shape shown in the privaro-proxy repository's quickstart example.
+        The Python/JS SDKs expose a richer ProtectResult (risk_level, risk_score,
+        gdpr_compliant, etc.) client-side — treat those extra fields as SDK-computed
+        convenience, not confirmed raw API response fields, until verified.
+      properties:
+        protected_prompt:
+          type: string
+          description: The prompt with detected PII replaced by reversible tokens.
+          example: "My name is [NM-0001] and my IBAN is [BK-0001]"
+        detections:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                example: "full_name"
+          description: One entry per PII element detected (e.g. full_name, iban, email).
+        audit_log_id:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+  responses:
+    AuthError:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PipelineNotFound:
+      description: The given pipeline_id does not exist or is not accessible with this key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PolicyBlock:
+      description: Request blocked by an active policy rule (e.g. hard-block on a data category).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RateLimit:
+      description: Too many requests.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
