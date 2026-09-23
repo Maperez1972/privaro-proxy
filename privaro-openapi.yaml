@@ -2,20 +2,18 @@ openapi: 3.0.3
 info:
   title: Privaro API
   description: |
-    Privaro sits between your applications and any LLM provider (OpenAI, Azure OpenAI,
-    Anthropic, Google, or local models) as a runtime data governance layer: it detects
-    personal data in prompts, replaces it with reversible tokens, and lets you re-identify
-    the original values safely outside the model.
+    Privaro is a runtime data governance layer that sits between your application
+    (or agents) and any LLM provider. It detects personal/sensitive data, replaces
+    it with reversible tokens, and lets you re-identify the original values safely
+    outside the model.
 
-    **Source of truth for this spec:** the `privaro-proxy` repository README
-    (github.com/Maperez1972/privaro-proxy), which documents the actual REST API, plus
-    `/v1/proxy/protect-image-document` confirmed separately. The official SDKs
-    (`privaro-sdk-python`, `privaro-sdk-js`) wrap this API with a higher-level
-    `protect()` / `relay()` interface — if you're integrating via SDK rather than raw
-    HTTP, prefer the SDK docs. Verify field names and auth against your dashboard before
-    production use; this spec was assembled from repository documentation, not a live
-    schema export.
-  version: "1.0"
+    **Source of truth for this spec:** the actual FastAPI source code of
+    `privaro-proxy` (app/routers/*.py, app/models/schemas.py, app/services/auth.py),
+    read directly from the repository — not inferred from README documentation.
+    Field names, request/response shapes and auth are taken verbatim from the
+    Pydantic models. This is the full, real endpoint surface: 17 endpoints across
+    four routers (Proxy, Relay, Agent, Image/Document).
+  version: "0.3.0"
   contact:
     name: Privaro
     url: https://privaro.ai/docs
@@ -28,60 +26,525 @@ security:
   - ApiKeyAuth: []
 
 tags:
-  - name: Protect
-    description: Tokenize sensitive data before it reaches an LLM
+  - name: Proxy
+    description: Core PII detection, tokenization and reversal (prefix /proxy)
+  - name: Relay
+    description: Privaro calls your configured LLM on your behalf (prefix /relay)
   - name: Agent
-    description: Multi-step agent runs — protect and reveal across a sequence of steps
-  - name: Documents
-    description: OCR + PII protection for uploaded images/documents
+    description: Multi-step agent runs — protect and reveal across a sequence of steps (prefix /agent)
+  - name: Document
+    description: OCR + PII protection for uploaded images/scanned documents
 
 paths:
-  /proxy/protect:
+  # ── /proxy ────────────────────────────────────────────────────────────────
+
+  /proxy/detect:
     post:
-      tags: [Protect]
-      summary: Detect and tokenize PII in a prompt
-      description: >
-        Detects personally identifiable information in the given prompt and replaces it
-        with reversible tokens (e.g. "John Doe" -> "[NM-0001]", an IBAN -> "[BK-0001]").
-        Does not call an LLM — forward the returned protected_prompt to your own LLM call.
+      tags: [Proxy]
+      summary: Detect PII without masking (analysis mode)
+      description: Runs detection only — does not tokenize, mask, or persist anything. Useful for a dry-run risk check.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [prompt, pipeline_id]
+              required: [pipeline_id, prompt]
               properties:
-                prompt:
-                  type: string
-                  example: "My name is John Doe and my IBAN is ES7620770024003102575766"
                 pipeline_id:
                   type: string
-                  description: Defines which policies apply to this request.
+                prompt:
+                  type: string
+                  minLength: 1
+                  maxLength: 50000
       responses:
         "200":
-          description: Prompt successfully scanned and tokenized.
+          description: Detections found (nothing modified or stored).
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProtectResult"
-        "401":
-          $ref: "#/components/responses/AuthError"
+                type: object
+                properties:
+                  request_id: { type: string }
+                  detections:
+                    type: array
+                    items: { $ref: "#/components/schemas/Detection" }
+                  stats: { type: object }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/protect:
+    post:
+      tags: [Proxy]
+      summary: Detect + tokenize PII in a prompt (core endpoint)
+      description: >
+        Detects PII, tokenizes it per policy, persists an audit log and (if
+        options.reversible, the default) a reversible token vault entry.
+        Because tokens are not unique across unrelated requests over time,
+        conversation_id is REQUIRED whenever options.reversible is true
+        (the default) — pass options.reversible=false to make it optional.
+        Fails open (returns the original, unmodified prompt with degraded_mode=true)
+        rather than 500 on an internal detector timeout/error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProtectRequest"
+      responses:
+        "200":
+          description: Prompt scanned and tokenized (or passed through unmodified in degraded_mode).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectResponse"
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+        "422":
+          description: Validation error — most commonly a missing conversation_id while options.reversible is true, or an invalid (non-UUID) conversation_id.
+
+  /proxy/protect-output:
+    post:
+      tags: [Proxy]
+      summary: Scan an LLM response for leaked/hallucinated PII (output direction)
+      description: >
+        For customers who call /proxy/protect themselves and then make their OWN
+        LLM call elsewhere (as opposed to /relay/complete, where Privaro makes the
+        call and scans it inline). Requires the pipeline to have output scanning
+        enabled (dashboard: Pipelines → Settings → Output scanning) — returns 403
+        otherwise.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id, response_text]
+              properties:
+                pipeline_id: { type: string }
+                response_text: { type: string, minLength: 1, maxLength: 50000 }
+                options: { $ref: "#/components/schemas/ProxyOptions" }
+                conversation_id:
+                  type: string
+                  format: uuid
+                  description: Required if options.reversible is true (the default).
+      responses:
+        "200":
+          description: Response scanned.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  protected_response: { type: string }
+                  detections:
+                    type: array
+                    items: { $ref: "#/components/schemas/Detection" }
+                  stats: { type: object }
+                  audit_log_id: { type: string }
+                  gdpr_compliant: { type: boolean }
+                  scan_mode:
+                    type: string
+                    enum: [shadow, enforce]
+                    description: "shadow (default): detected but not masked, audit-only. enforce: actually masks the response."
+                  response_modified: { type: boolean }
         "403":
-          $ref: "#/components/responses/PolicyBlock"
+          description: Output scanning is not enabled for this pipeline (or org mismatch).
+        "401": { $ref: "#/components/responses/AuthError" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/detokenize:
+    post:
+      tags: [Proxy]
+      summary: Bulk, automated reversal of every Privaro token found in a text
+      description: >
+        Finds every [XX-0001]-style token in `text` and reverses all of them in
+        one call — for agentic write-back flows (e.g. an ERP copilot writing a
+        real value back to a database) as opposed to a human manually revealing
+        one token at a time in the dashboard. Strictly scoped to the caller's own
+        org and to the given conversation_id — tokens outside that scope are
+        reported in tokens_not_found, never silently substituted from elsewhere.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id, text, conversation_id]
+              properties:
+                pipeline_id: { type: string }
+                text: { type: string, minLength: 1, maxLength: 100000 }
+                conversation_id:
+                  type: string
+                  format: uuid
+                  description: Must match the conversation_id used when the tokens were created.
+      responses:
+        "200":
+          description: Reversal complete (partial matches are normal — see tokens_not_found).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  detokenized_text: { type: string }
+                  tokens_reversed: { type: integer }
+                  tokens_not_found:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/protect-structured:
+    post:
+      tags: [Proxy]
+      summary: Field-aware protection for structured/typed payloads
+      description: >
+        For structured records (e.g. ERP/CRM rows) rather than free text. A
+        field's NAME can force its entity_type via a policy rule
+        (field_name_pattern) even if the value's content wouldn't otherwise
+        match any pattern — e.g. a field literally named "diagnostico" is
+        treated as health data regardless of its content. conversation_id is
+        always required here (every tokenized value is persisted).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id, fields, conversation_id]
+              properties:
+                pipeline_id: { type: string }
+                fields:
+                  type: object
+                  additionalProperties: { type: string }
+                  example: { diagnostico: "Diabetes tipo 2", paciente: "María García" }
+                conversation_id:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Each field protected independently.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  protected_fields:
+                    type: object
+                    additionalProperties: { type: string }
+                  detections_by_field:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items: { $ref: "#/components/schemas/Detection" }
+                  stats: { type: object }
+                  audit_log_id: { type: string }
+        "400":
+          description: fields must not be empty.
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/protect-document:
+    post:
+      tags: [Proxy]
+      summary: Protect a whole document before RAG ingestion
+      description: >
+        Protects an entire document BEFORE it's chunked and embedded into a
+        vector store, so PII never sits in the vector DB or an embedding in
+        plain text. Chunking happens AFTER tokenization. Documents above a
+        size threshold are processed asynchronously — the response comes back
+        with status="processing" and a job_id to poll instead of the full result.
+        Does not support optimize_context (Kompress can crash on large inputs).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id, document]
+              properties:
+                pipeline_id: { type: string }
+                document: { type: string, minLength: 1, maxLength: 2000000 }
+                document_id:
+                  type: string
+                  description: Your own external reference for this document.
+                options:
+                  type: object
+                  properties:
+                    mode: { $ref: "#/components/schemas/DetectionMode" }
+                    reversible: { type: boolean, default: true }
+                    use_nlp: { type: boolean, default: true }
+                    chunk_size: { type: integer, default: 512, minimum: 64, maximum: 8192 }
+      responses:
+        "200":
+          description: Either the completed result, or a job_id if processing async (large documents).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectDocumentResponse"
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/protect-document/{job_id}:
+    get:
+      tags: [Proxy]
+      summary: Poll the status of an async document ingestion job
+      description: Scoped to the caller's own org — a job belonging to another org returns 404, never leaks existence.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job status (processing | completed | failed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProtectDocumentResponse"
         "404":
-          $ref: "#/components/responses/PipelineNotFound"
-        "429":
-          $ref: "#/components/responses/RateLimit"
+          description: Job not found for this org.
+        "401": { $ref: "#/components/responses/AuthError" }
+
+  /proxy/protect-retrieval:
+    post:
+      tags: [Proxy]
+      summary: Protect a batch of retrieved RAG chunks, with per-chunk access control
+      description: >
+        Defense-in-depth right before retrieved chunks enter an LLM's context —
+        catches PII that slipped past ingestion, and can block chunks the
+        requester isn't authorized to see (via each chunk's allowed_roles).
+        Results are cached by content hash per org, since this sits on the hot
+        path of every RAG query. A per-chunk detection failure fails CLOSED
+        (blocked, not passed through) — unlike /protect-document, which fails
+        open for the whole document.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline_id, chunks]
+              properties:
+                pipeline_id: { type: string }
+                chunks:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items:
+                    type: object
+                    required: [id, text]
+                    properties:
+                      id: { type: string }
+                      text: { type: string }
+                      allowed_roles:
+                        type: array
+                        items: { type: string }
+                        description: If omitted, the chunk is accessible to any requester.
+                requester:
+                  type: object
+                  properties:
+                    user_id: { type: string }
+                    role: { type: string, default: developer }
+                options:
+                  type: object
+                  properties:
+                    mode: { $ref: "#/components/schemas/DetectionMode" }
+                    use_nlp: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Chunks split into allowed (protected) and blocked (access-denied or failed).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  allowed_chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        protected_text: { type: string }
+                        detections_count: { type: integer }
+                        from_cache: { type: boolean }
+                  blocked_chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        reason: { type: string }
+                        detail: { type: string }
+                  stats: { type: object }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+
+  /proxy/protect-image-document:
+    post:
+      tags: [Document]
+      summary: OCR + PII protection for a photographed/scanned document
+      description: >
+        Accepts an image (DNI, contract, screenshot), OCRs it with Tesseract,
+        runs the same detection/policy engine as /proxy/protect, and returns
+        both the protected text and (by default) a redacted copy of the image
+        with PII regions blacked out. Tier-1 OCR only (Tesseract) as of this
+        version — accuracy on real phone photos, not just clean scans, is
+        still being measured (see ocr_quality in the response).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, pipeline_id]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                pipeline_id: { type: string }
+                conversation_id:
+                  type: string
+                  format: uuid
+                mode: { type: string, default: tokenise }
+                include_detections: { type: boolean, default: true }
+                reversible: { type: boolean, default: true }
+                return_redacted_image: { type: boolean, default: true }
+                extract_only:
+                  type: boolean
+                  default: false
+                  description: If true, returns only the raw OCR text — skips detection entirely.
+      responses:
+        "200":
+          description: >
+            Full protection result, or (if extract_only=true) just the raw
+            extracted text and OCR quality stats.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: string }
+                  filename: { type: string }
+                  extracted_text: { type: string, description: "Only present when extract_only=true." }
+                  extracted_chars: { type: integer }
+                  protected_text: { type: string, description: "Only present when extract_only=false." }
+                  redacted_image_base64: { type: string }
+                  detections:
+                    type: array
+                    items: { $ref: "#/components/schemas/Detection" }
+                  stats: { type: object }
+                  ocr_quality: { type: object }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "422":
+          description: OCR found no readable text in the image.
+        "413":
+          description: File exceeds the 15MB limit.
+
+  /proxy/test:
+    get:
+      tags: [Proxy]
+      summary: Health check with a live sample detection
+      description: Runs a fixed sample string through the hybrid detector (regex + NLP) and returns the result — useful to confirm both detector tiers are active.
+      responses:
+        "200":
+          description: Detector status and a sample detection.
+
+  # ── /relay ───────────────────────────────────────────────────────────────
+
+  /relay/complete:
+    post:
+      tags: [Relay]
+      summary: Protect + call your configured LLM + de-tokenize the response
+      description: >
+        Full-cycle relay: protects every message, calls the LLM configured for
+        the pipeline (customer's own provider key, set at /app/admin/providers,
+        decrypted only at request time), then de-tokenizes the response before
+        returning it. If the pipeline has output_scanning_enabled, also scans
+        the raw LLM response for newly-introduced PII (RAG leakage, model
+        memorization) before de-tokenizing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelayRequest"
+      responses:
+        "200":
+          description: LLM call completed; response de-tokenized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelayResponse"
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
+        "502":
+          description: llm_provider_error — the configured LLM call failed. Check /app/admin/providers.
+
+  /relay/stream:
+    post:
+      tags: [Relay]
+      summary: Streaming version of /relay/complete (SSE)
+      description: >
+        Same contract as /relay/complete but streams de-tokenized text deltas
+        as Server-Sent Events. Buffers internally to never split a [XX-0001]
+        token across two chunks. Gated by organizations.streaming_enabled
+        (403 if disabled for the org). Output-direction scanning here is
+        audit-only (post-hoc) — by the time a full response could be scanned,
+        every chunk has already been delivered to the client, so "enforce"
+        mode cannot mask anything retroactively; detections are logged with
+        action="leaked" in that case rather than silently downgraded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelayRequest"
+      responses:
+        "200":
+          description: 'text/event-stream of {"delta": "..."} chunks, ending with "[DONE]".'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "403":
+          description: Streaming is disabled for this organization — use /relay/complete instead.
+        "401": { $ref: "#/components/responses/AuthError" }
+
+  /relay/providers:
+    get:
+      tags: [Relay]
+      summary: List supported LLM providers and their available models
+      responses:
+        "200":
+          description: List of providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items: { type: object }
+
+  # ── /agent ───────────────────────────────────────────────────────────────
 
   /agent/run/start:
     post:
       tags: [Agent]
       summary: Start a multi-step agent run
-      description: >
-        Opens an agent_run_id that scopes token consistency across the following
-        /agent/protect and /agent/reveal calls in the same run (e.g. a LangChain or
-        CrewAI agent making several tool/LLM calls in sequence).
+      description: Opens an agent_run_id that scopes token consistency across the following /agent/protect and /agent/reveal calls (e.g. a LangChain or CrewAI agent with several tool/LLM steps).
       requestBody:
         required: true
         content:
@@ -90,11 +553,11 @@ paths:
               type: object
               required: [pipeline_id]
               properties:
-                pipeline_id:
-                  type: string
-                agent_framework:
-                  type: string
-                  example: "crewai"
+                pipeline_id: { type: string }
+                agent_name: { type: string }
+                agent_framework: { type: string, example: "crewai" }
+                external_run_id: { type: string }
+                metadata: { type: object }
       responses:
         "200":
           description: Agent run created.
@@ -103,50 +566,87 @@ paths:
               schema:
                 type: object
                 properties:
-                  agent_run_id:
-                    type: string
-        "401":
-          $ref: "#/components/responses/AuthError"
+                  agent_run_id: { type: string }
+                  pipeline_id: { type: string }
+                  status: { type: string, default: running }
+                  message: { type: string }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "403": { $ref: "#/components/responses/PipelineOrgMismatch" }
+        "404": { $ref: "#/components/responses/PipelineNotFound" }
 
   /agent/protect:
     post:
       tags: [Agent]
-      summary: Protect a message within an active agent run
+      summary: Protect a step within an active agent run
       description: >
-        Same detection/tokenization as /proxy/protect, scoped to an agent_run_id so the
-        same PII value maps to the same token across every step of the run.
+        Accepts one or more messages for this step (a prompt, tool outputs,
+        observations). Same PII value maps to the same token throughout the
+        whole run. Messages with role in (assistant, tool) or step_type in
+        (tool_output, observation) are evaluated as direction=output against
+        policy (so an org's output-scoped rules can fire on them); user/system
+        messages are direction=input.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [agent_run_id, prompt]
+              required: [agent_run_id, messages]
               properties:
-                agent_run_id:
-                  type: string
-                prompt:
-                  type: string
+                agent_run_id: { type: string }
+                messages:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: object
+                    required: [role, content]
+                    properties:
+                      role: { type: string, description: "user | assistant | tool | system" }
+                      content: { type: string, minLength: 1, maxLength: 100000 }
+                      step_type: { type: string, default: prompt, description: "prompt | tool_output | system | observation" }
+                      tool_name: { type: string }
+                step_index: { type: integer }
+                mode: { type: string, default: tokenise, description: "tokenise | anonymise | block" }
+                optimize_context: { type: boolean, default: false }
       responses:
         "200":
-          description: Message protected.
+          description: Step protected.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProtectResult"
-        "401":
-          $ref: "#/components/responses/AuthError"
+                type: object
+                properties:
+                  request_id: { type: string }
+                  agent_run_id: { type: string }
+                  step_index: { type: integer }
+                  protected_messages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        role: { type: string }
+                        content: { type: string }
+                        step_type: { type: string }
+                        pii_count: { type: integer }
+                        tokens_created: { type: integer }
+                  total_pii_detected: { type: integer }
+                  total_pii_masked: { type: integer }
+                  risk_score: { type: number, format: float }
+                  gdpr_compliant: { type: boolean }
+                  audit_step_id: { type: string }
+                  compression_stats: { type: object }
+        "401": { $ref: "#/components/responses/AuthError" }
         "404":
-          description: agent_run_id not found or already ended.
+          description: agent_run_not_found.
+        "409":
+          description: agent_run_not_active (the run was already ended).
 
   /agent/reveal:
     post:
       tags: [Agent]
-      summary: Re-identify tokenized values within an agent run
-      description: >
-        Recovers original values for tokens produced earlier in the same agent run —
-        used to safely reveal the real data outside the model, e.g. before showing a
-        final answer to the end user.
+      summary: Detokenize text using the token map of an agent run
+      description: Fetches every reversible token created within this agent_run_id, decrypts (AES-256-GCM), and replaces every [TYPE-XXXX] token found in `text` with its real value.
       requestBody:
         required: true
         content:
@@ -155,29 +655,29 @@ paths:
               type: object
               required: [agent_run_id, text]
               properties:
-                agent_run_id:
-                  type: string
+                agent_run_id: { type: string }
                 text:
                   type: string
-                  description: Text containing tokens (e.g. "[NM-0001]") to resolve back to real values.
+                  description: Text containing [TYPE-XXXX] tokens to resolve back to real values.
       responses:
         "200":
-          description: Text with tokens resolved back to original values.
+          description: Tokens resolved.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  revealed:
-                    type: string
-        "401":
-          $ref: "#/components/responses/AuthError"
+                  agent_run_id: { type: string }
+                  revealed_text: { type: string }
+                  tokens_replaced: { type: integer }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "404":
+          description: agent_run_not_found.
 
   /agent/run/end:
     post:
       tags: [Agent]
-      summary: End an agent run
-      description: Closes the agent_run_id. Further /agent/protect or /agent/reveal calls against it will fail.
+      summary: Close an agent run and finalize its counters
       requestBody:
         required: true
         content:
@@ -186,46 +686,26 @@ paths:
               type: object
               required: [agent_run_id]
               properties:
-                agent_run_id:
-                  type: string
+                agent_run_id: { type: string }
+                status: { type: string, default: completed, description: "completed | failed | cancelled" }
       responses:
         "200":
           description: Run closed.
-        "401":
-          $ref: "#/components/responses/AuthError"
-
-  /proxy/protect-image-document:
-    post:
-      tags: [Documents]
-      summary: OCR + PII protection for an uploaded image or document
-      description: >
-        Runs OCR (Google Cloud Vision as primary engine) on an uploaded image/document
-        and applies the same detection and tokenization pipeline used for text.
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file]
-              properties:
-                file:
-                  type: string
-                  format: binary
-                pipeline_id:
-                  type: string
-                  format: uuid
-      responses:
-        "200":
-          description: Document processed.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProtectResult"
-        "401":
-          $ref: "#/components/responses/AuthError"
-        "413":
-          description: File too large.
+                type: object
+                properties:
+                  agent_run_id: { type: string }
+                  status: { type: string }
+                  step_count: { type: integer }
+                  total_pii_detected: { type: integer }
+                  total_pii_masked: { type: integer }
+                  max_risk_score: { type: number, format: float }
+                  gdpr_compliant: { type: boolean }
+        "401": { $ref: "#/components/responses/AuthError" }
+        "404":
+          description: agent_run_not_found.
 
 components:
   securitySchemes:
@@ -234,64 +714,179 @@ components:
       in: header
       name: X-Privaro-Key
       description: >
-        API key issued from the Privaro dashboard. Request access at https://privaro.ai.
-        Sent as the `X-Privaro-Key` header (not an Authorization/Bearer header).
+        API key issued from the Privaro dashboard, always prefixed with `prvr_`
+        (requests with keys not starting with that prefix are rejected with
+        invalid_api_key_format before ever reaching the database). Confirmed
+        directly from app/services/auth.py.
 
   schemas:
-    ProtectResult:
+    DetectionMode:
+      type: string
+      enum: [tokenise, anonymise, block]
+      default: tokenise
+
+    ProxyOptions:
       type: object
-      description: >
-        Response shape shown in the privaro-proxy repository's quickstart example.
-        The Python/JS SDKs expose a richer ProtectResult (risk_level, risk_score,
-        gdpr_compliant, etc.) client-side — treat those extra fields as SDK-computed
-        convenience, not confirmed raw API response fields, until verified.
       properties:
-        protected_prompt:
+        mode: { $ref: "#/components/schemas/DetectionMode" }
+        include_detections: { type: boolean, default: true }
+        reversible:
+          type: boolean
+          default: true
+          description: When true, conversation_id becomes required on the request (see ProtectRequest).
+        agent_mode: { type: boolean, default: false }
+        optimize_context: { type: boolean, default: false }
+
+    ProtectRequest:
+      type: object
+      required: [pipeline_id, prompt]
+      properties:
+        pipeline_id: { type: string }
+        prompt: { type: string, minLength: 1, maxLength: 50000 }
+        options: { $ref: "#/components/schemas/ProxyOptions" }
+        conversation_id:
           type: string
-          description: The prompt with detected PII replaced by reversible tokens.
-          example: "My name is [NM-0001] and my IBAN is [BK-0001]"
+          format: uuid
+          description: >
+            Required when options.reversible is true (the default) — a token
+            like [NM-0001] is a per-request counter, not unique across
+            unrelated requests over time, so it cannot be reliably reversed
+            later without this. Set options.reversible=false to make it optional.
+
+    Detection:
+      type: object
+      properties:
+        type: { type: string, example: "full_name" }
+        severity: { type: string, example: "high" }
+        action: { type: string, example: "tokenised" }
+        token: { type: string, nullable: true, example: "[NM-0001]" }
+        start: { type: integer, nullable: true }
+        end: { type: integer, nullable: true }
+        confidence: { type: number, format: float, default: 1.0 }
+        detector: { type: string, default: regex, example: "regex | presidio" }
+        regulation_ref: { type: string, nullable: true }
+
+    ProtectResponse:
+      type: object
+      properties:
+        request_id: { type: string }
+        protected_prompt: { type: string }
         detections:
           type: array
+          items: { $ref: "#/components/schemas/Detection" }
+        stats: { type: object }
+        audit_log_id: { type: string, nullable: true }
+        gdpr_compliant: { type: boolean, default: true }
+        degraded_mode:
+          type: boolean
+          default: false
+          description: True if the detector failed/timed out — protected_prompt is then the ORIGINAL, unmodified prompt (fail-open).
+        degraded_reason: { type: string, nullable: true }
+        compression_stats: { type: object }
+
+    ProtectDocumentResponse:
+      type: object
+      properties:
+        request_id: { type: string }
+        status: { type: string, description: "completed | processing | failed" }
+        job_id: { type: string, nullable: true }
+        estimated_seconds: { type: integer, nullable: true }
+        protected_document: { type: string, nullable: true }
+        chunks:
+          type: array
+          nullable: true
           items:
             type: object
             properties:
-              type:
-                type: string
-                example: "full_name"
-          description: One entry per PII element detected (e.g. full_name, iban, email).
-        audit_log_id:
-          type: string
+              index: { type: integer }
+              text: { type: string }
+              char_start: { type: integer }
+              char_end: { type: integer }
+        detections:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/Detection" }
+        stats: { type: object, nullable: true }
+        degraded_mode: { type: boolean, default: false }
+        degraded_reason: { type: string, nullable: true }
+
+    RelayMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, description: "user | assistant | system" }
+        content: { type: string, minLength: 1, maxLength: 50000 }
+
+    RelayRequest:
+      type: object
+      required: [pipeline_id, messages]
+      properties:
+        pipeline_id: { type: string }
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/RelayMessage" }
+        provider: { type: string, description: "Overrides the pipeline's configured provider." }
+        model: { type: string, description: "Overrides the pipeline's configured model." }
+        options:
+          type: object
+          properties:
+            mode: { $ref: "#/components/schemas/DetectionMode" }
+            detokenise_response: { type: boolean, default: true }
+            include_detections: { type: boolean, default: true }
+            max_tokens: { type: integer, default: 2048 }
+            temperature: { type: number, format: float, default: 0.7 }
+            system_prompt: { type: string, nullable: true }
+            optimize_context: { type: boolean, default: false }
+        conversation_id: { type: string, format: uuid, nullable: true }
+
+    RelayResponse:
+      type: object
+      properties:
+        request_id: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        protected_messages:
+          type: array
+          items: { type: object }
+        pii_detected: { type: integer }
+        pii_masked: { type: integer }
+        risk_score: { type: number, format: float }
+        gdpr_compliant: { type: boolean }
+        response: { type: string, description: "De-tokenized, ready to display." }
+        response_raw: { type: string, nullable: true }
+        audit_log_id: { type: string, nullable: true }
+        tokens_replaced: { type: integer, default: 0 }
+        usage: { type: object }
+        processing_ms: { type: integer }
+        compression_stats: { type: object }
+        output_pii_detected: { type: integer, default: 0 }
+        output_pii_masked: { type: integer, default: 0 }
+        output_pii_leaked: { type: integer, default: 0 }
+        output_scan_mode: { type: string, nullable: true }
+        output_response_modified: { type: boolean, default: false }
+        output_audit_log_id: { type: string, nullable: true }
 
     ErrorResponse:
       type: object
       properties:
-        error:
-          type: string
-        message:
-          type: string
+        error: { type: string }
+        message: { type: string }
 
   responses:
     AuthError:
-      description: Missing or invalid API key.
+      description: Missing X-Privaro-Key header, invalid format (must start with prvr_), key not found/revoked, or expired.
       content:
         application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
     PipelineNotFound:
-      description: The given pipeline_id does not exist or is not accessible with this key.
+      description: pipeline_not_found — the given pipeline_id does not exist.
       content:
         application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    PolicyBlock:
-      description: Request blocked by an active policy rule (e.g. hard-block on a data category).
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    PipelineOrgMismatch:
+      description: pipeline_org_mismatch — the pipeline exists but does not belong to the caller's org.
       content:
         application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    RateLimit:
-      description: Too many requests.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
