@@ -43,8 +43,8 @@ PROVIDERS = {
     },
     "gemini": {
         "name": "Google Gemini",
-        "default_model": "gemini-1.5-pro",
-        "models": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],
+        "default_model": "gemini-3.8-flash",
+        "models": ["gemini-3.8-flash", "gemini-3-pro", "gemini-2.5-pro", "gemini-2.5-flash"],
     },
 }
 
@@ -243,27 +243,49 @@ async def _call_mistral(
 
 async def _call_gemini(
     model: str, messages: List[Dict], api_key: str,
-    max_tokens: int = 2048, temperature: float = 0.7, **kwargs,
+    max_tokens: int = 2048, temperature: float = 0.7,
+    system: Optional[str] = None, thinking_level: Optional[str] = None, **kwargs,
 ) -> Dict:
+    """
+    Google Gemini (generateContent).
+
+    NOTE (Oct 2026 deprecation): Gemini ignores and will soon reject
+    temperature / top_p / top_k and thinking_budget. We never send them.
+    `temperature` is accepted only for interface parity and dropped here.
+    Reasoning depth is controlled with thinking_level
+    ("minimal" | "low" | "medium" | "high"); omitted = model default.
+    """
+    sys_msg = system or next((m["content"] for m in messages if m["role"] == "system"), None)
     contents = [
-        {"role": "user" if m["role"] in ("user", "system") else "model",
+        {"role": "user" if m["role"] == "user" else "model",
          "parts": [{"text": m["content"]}]}
-        for m in messages
+        for m in messages if m["role"] != "system"
     ]
+    generation_config: Dict[str, Any] = {"maxOutputTokens": max_tokens}
+    if thinking_level in ("minimal", "low", "medium", "high"):
+        generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+
+    body: Dict[str, Any] = {"contents": contents, "generationConfig": generation_config}
+    if sys_msg:
+        body["systemInstruction"] = {"parts": [{"text": sys_msg}]}
+
     model_id = model or PROVIDERS["gemini"]["default_model"]
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}",
-            json={"contents": contents,
-                  "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature}}
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent",
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=body,
         )
         if resp.status_code != 200:
             raise LLMRouterError(f"Gemini error {resp.status_code}: {resp.text[:300]}",
                                  "gemini", resp.status_code)
         data = resp.json()
         usage = data.get("usageMetadata", {})
+        parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+        # Skip thought-summary parts; concatenate the answer text
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         return {
-            "content": data["candidates"][0]["content"]["parts"][0]["text"],
+            "content": text,
             "model": model_id, "provider": "gemini",
             "usage": {"input_tokens": usage.get("promptTokenCount", 0),
                       "output_tokens": usage.get("candidatesTokenCount", 0)},
