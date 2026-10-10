@@ -67,6 +67,12 @@ def _resolve_provider(provider_name: str) -> str:
     return PROVIDER_ALIASES.get(p, p)
 
 
+def _stored_names(canonical: str) -> List[str]:
+    """All provider names that may be stored in llm_providers for a canonical provider."""
+    names = {canonical} | {alias for alias, c in PROVIDER_ALIASES.items() if c == canonical}
+    return sorted(names)
+
+
 def _decrypt_api_key(encrypted_b64: str) -> str:
     """
     Decrypt a customer API key stored in llm_providers.api_key_encrypted.
@@ -111,7 +117,10 @@ async def get_customer_api_key(org_id: str, provider: str) -> str:
     }
     params = {
         "org_id": f"eq.{org_id}",
-        "provider": f"eq.{provider_canonical}",
+        # Frontend stores Gemini rows as "google"; router canonical is "gemini".
+        # Match every stored alias of the canonical provider (fix 2026-10-10:
+        # Gemini pipelines were 503-ing with "No active gemini provider").
+        "provider": "in.(" + ",".join(_stored_names(provider_canonical)) + ")",
         "is_active": "eq.true",
         "select": "id,provider,api_key_encrypted,api_key_hint,available_models",
         "limit": "1",
