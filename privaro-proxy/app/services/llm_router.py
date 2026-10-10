@@ -95,7 +95,14 @@ def _decrypt_api_key(encrypted_b64: str) -> str:
 
 
 async def get_customer_api_key(org_id: str, provider: str) -> str:
+    """Backward-compatible wrapper: decrypted API key only."""
+    return (await get_customer_provider_config(org_id, provider))["api_key"]
+
+
+async def get_customer_provider_config(org_id: str, provider: str) -> Dict[str, Optional[str]]:
     """
+    Returns {"api_key": <decrypted>, "default_model": <connection model or None>}.
+
     Fetch and decrypt the customer's API key for a provider from Supabase.
     
     Looks up llm_providers table:
@@ -122,7 +129,7 @@ async def get_customer_api_key(org_id: str, provider: str) -> str:
         # Gemini pipelines were 503-ing with "No active gemini provider").
         "provider": "in.(" + ",".join(_stored_names(provider_canonical)) + ")",
         "is_active": "eq.true",
-        "select": "id,provider,api_key_encrypted,api_key_hint,available_models",
+        "select": "id,provider,api_key_encrypted,api_key_hint,available_models,default_model",
         "limit": "1",
     }
     
@@ -150,7 +157,10 @@ async def get_customer_api_key(org_id: str, provider: str) -> str:
             provider_canonical, 503
         )
     
-    return _decrypt_api_key(row["api_key_encrypted"])
+    return {
+        "api_key": _decrypt_api_key(row["api_key_encrypted"]),
+        "default_model": row.get("default_model") or None,
+    }
 
 
 # ── Provider call implementations ─────────────────────────────────────────────
@@ -332,8 +342,11 @@ async def route(
     """
     provider = _resolve_provider(provider)
     
-    # Fetch customer API key from Supabase (decrypted in-memory)
-    api_key = await get_customer_api_key(org_id, provider)
+    # Fetch customer API key from Supabase (decrypted in-memory).
+    # Model fallback: request/pipeline model > connection default_model > router default.
+    cfg = await get_customer_provider_config(org_id, provider)
+    api_key = cfg["api_key"]
+    model = model or cfg["default_model"]
 
     CALLERS = {
         "anthropic": _call_anthropic,
@@ -481,7 +494,9 @@ async def route_stream(
             f"Use /v1/relay/complete (non-streaming) for this provider instead.",
             provider, 400
         )
-    api_key = await get_customer_api_key(org_id, provider)
+    cfg = await get_customer_provider_config(org_id, provider)
+    api_key = cfg["api_key"]
+    model = model or cfg["default_model"]
     async for chunk in caller(
         model=model, messages=messages, api_key=api_key,
         max_tokens=max_tokens, temperature=temperature, system=system,
